@@ -21,6 +21,12 @@ and pass it with `--body-file`, preserving actual newlines.
 When a skill says "publish to the issue tracker", create a GitHub issue.
 When it says "fetch the relevant ticket", read the corresponding issue.
 
+## Ticket acceptance and closure
+
+1. Before implementation, check that the environments and data required by the acceptance criteria are available. Surface any gap early. The selected test level determines the scope of new tests.
+2. After verification, update the issue checklist and record what ran and where. If the user agrees to change a criterion, record the revised criterion and any assumptions in the issue.
+3. Close the issue when all agreed criteria are checked. Read back the issue state before reporting completion. If a criterion remains open, report it with the evidence still needed.
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.**
