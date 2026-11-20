@@ -8,7 +8,7 @@ If the sandbox proxy blocks a `gh` read, use the GitHub connector. If a write is
 
 - Create: `gh issue create --title "..." --body-file <file>`.
 - Read: `gh issue view <number> --json number,title,body,labels,comments`.
-- Read a linked decision comment by the numeric ID after `#issuecomment-` in its URL. Use `gh api 'repos/{owner}/{repo}/issues/comments/<comment-id>' --jq .body` to fetch that comment alone. Fetch the parent spec sections relevant to the ticket when its acceptance criteria depend on them.
+- Read a linked decision comment by the numeric ID after `#issuecomment-` in its URL. Use `gh api 'repos/{owner}/{repo}/issues/comments/<comment-id>' --jq .body` to fetch that comment alone. If the request fails, fetch comments for the linked issue with the GitHub connector and select that ID. Fetch the parent spec sections relevant to the ticket when its acceptance criteria depend on them.
 - List: `gh issue list --state open --json number,title,body,labels,comments`.
   Add label and state filters as needed.
 - Edit: `gh issue edit <number> --title "..." --body-file <file>`.
