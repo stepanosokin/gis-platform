@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { register, signIn } from './access-client.mjs';
+import { auth, register, signIn } from './access-client.mjs';
 
 async function executeQgis(code) {
   const source = process.env.GIS_QGIS_MCP_SOURCE ??
@@ -50,8 +50,8 @@ async function executeQgis(code) {
   }
 }
 
-test('an open QGIS connection refreshes private collections after login and reads their features', async () => {
-  const email = 'qgis-reader@example.test';
+async function checkDiscovery(header, getValue) {
+  const email = `qgis-${header.toLowerCase()}@example.test`;
   const password = 'local-QGIS-fixture-password';
   await register(email, password);
   const grant = spawnSync(process.execPath, ['dist/cli.js', 'access', 'grant', 'private-places', '--email', email, '--json'],
@@ -62,7 +62,7 @@ test('an open QGIS connection refreshes private collections after login and read
 
   const file = join(process.env.GIS_TEST_RESULTS, 'qgis-session.json');
   const script = new URL('qgis-discovery.py', import.meta.url);
-  const fixture = { url: `${process.env.GIS_TEST_PUBLIC_URL}/features`, cookie: await signIn(email, password) };
+  const fixture = { url: `${process.env.GIS_TEST_PUBLIC_URL}/features`, header, value: await getValue(await signIn(email, password)) };
   await writeFile(file, JSON.stringify(fixture), { mode: 0o600 });
   try {
     const source = JSON.stringify(fileURLToPath(script));
@@ -71,8 +71,18 @@ test('an open QGIS connection refreshes private collections after login and read
     assert.deepEqual(report.before, ['places']);
     assert.deepEqual(report.after, ['places', 'private-places', 'registered-places']);
     assert.equal(report.features, 3);
-    console.log(`QGIS ${report.version}: private collection appeared in the same dialog; ${report.features} features read.`);
+    console.log(`QGIS ${report.version}, ${header}: private collection appeared in the same dialog; ${report.features} features read.`);
   } finally {
     await rm(file, { force: true });
   }
-});
+}
+
+test('an open QGIS connection refreshes private collections after login and reads their features', () =>
+  checkDiscovery('Cookie', (cookie) => cookie));
+
+test('an open QGIS connection discovers and reads private collections with a named Bearer token', () =>
+  checkDiscovery('Authorization', async (cookie) => {
+    const response = await auth('tokens/create', { name: 'QGIS Desktop' }, cookie);
+    assert.equal(response.status, 201);
+    return `Bearer ${(await response.json()).secret}`;
+  }));

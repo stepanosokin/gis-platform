@@ -37,7 +37,7 @@ def run_discovery(fixture):
     config.setName(name)
     config.setMethod("APIHeader")
     config.setVersion(1)
-    config.setConfig("Cookie", fixture["cookie"])
+    config.setConfig(fixture["header"], fixture["value"])
     widget = None
     try:
         settings.setValue(key + "/url", fixture["url"])

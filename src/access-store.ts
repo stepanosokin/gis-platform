@@ -1,4 +1,4 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import type { AccessChange } from './admin-command.js';
 import { CliError } from './cli-result.js';
 import type { Publication } from './config.js';
@@ -29,6 +29,7 @@ export async function prepareAccessStore(pool: Pool) {
       user_id text NOT NULL,
       publication_id text
     );
+    ALTER TABLE access_audit ADD COLUMN IF NOT EXISTS token_id text;
   `);
 }
 
@@ -39,8 +40,8 @@ function reader(user: AccessUser, administrators: ReadonlySet<string>) {
   };
 }
 
-export async function readPublicationReader(pool: Pool, userId: string, administrators: ReadonlySet<string>) {
-  const { rows: [user] } = await pool.query<AccessUser>(
+export async function readPublicationReader(database: Pool | PoolClient, userId: string, administrators: ReadonlySet<string>) {
+  const { rows: [user] } = await database.query<AccessUser>(
     `SELECT id, email, active, "emailVerified", ${grantsForUser} FROM "user" AS u WHERE id = $1`, [userId]);
   return user ? reader(user, administrators) : null;
 }

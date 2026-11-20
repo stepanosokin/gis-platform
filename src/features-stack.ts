@@ -65,9 +65,20 @@ function caddyConfig(config: FeaturesConfig) {
   const protectedIds = publications.filter(([, publication]) => publication.access !== 'public').map(([id]) => id);
   const publicIds = publications.filter(([, publication]) => publication.access === 'public').map(([id]) => id);
   const collectionRoute = (ids: string[]) => `collections/(${ids.join('|')})(/(schema|queryables|items(/.+)?))?`;
+  const allCollections = collectionRoute(publications.map(([id]) => id));
+  const journal = `
+	log
+	@loggedFeatures path_regexp ^/features/(openapi|collections|${allCollections})$
+	@unloggedFeatures not path_regexp ^/features/(openapi|collections|${allCollections})$
+	@loggedPublication path_regexp loggedPublication ^/features/${allCollections}$
+	log_skip @unloggedFeatures
+	log_append @loggedFeatures requestId {http.request.uuid}
+	log_append @loggedPublication publicationId {http.regexp.loggedPublication.1}
+	header @loggedFeatures >X-Request-Id {http.request.uuid}
+`;
   const publicRoutes = ['conformance', 'static/.+'];
-  if (!protectedIds.length) publicRoutes.push('openapi', 'collections');
-  if (publicIds.length) publicRoutes.push(collectionRoute(publicIds));
+  if (!config.auth) publicRoutes.push('openapi', 'collections');
+  if (!config.auth && publicIds.length) publicRoutes.push(collectionRoute(publicIds));
 
   const featuresHtmlPolicy = config.auth ? `
 				header_down Content-Security-Policy "script-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
@@ -78,26 +89,45 @@ function caddyConfig(config: FeaturesConfig) {
 				header_up -Authorization
 				header_down Cache-Control no-store${featuresHtmlPolicy}
 			}`;
-  const protectedRoutes = protectedIds.length ? `
+  const metadataRoutes = config.auth ? `
 	@metadata {
 		method GET HEAD
 		path /features/openapi /features/collections
 	}
 	handle @metadata {
-		reverse_proxy access:3000
-	}
-	@protected {
-		method GET HEAD
-		path_regexp publication ^/features/${collectionRoute(protectedIds)}$
-	}
-	handle @protected {
-		route {
-			forward_auth access:3000 {
-				uri /internal/authorize/{http.regexp.publication.1}
+		route {${protectedIds.length ? '' : '\n\t\t\tvars public_auth_pending true'}
+			reverse_proxy access:3000 {
+				header_up X-GIS-Request-Id {http.request.uuid}
 			}
+		}
+	}
+` : '';
+  function publicationRoutes(ids: string[], allowAnonymousFallback: boolean) {
+    if (!ids.length) return '';
+    const matcher = allowAnonymousFallback ? 'publicPublication' : 'protectedPublication';
+    return `
+	@${matcher} {
+		method GET HEAD
+		path_regexp ${matcher} ^/features/${collectionRoute(ids)}$
+	}
+	handle @${matcher} {
+		route {${allowAnonymousFallback ? '\n\t\t\tvars public_auth_pending true' : ''}
+			forward_auth access:3000 {
+				uri /internal/authorize/{http.regexp.${matcher}.1}
+				header_up X-GIS-Request-Id {http.request.uuid}
+			}${allowAnonymousFallback ? '\n\t\t\tvars public_auth_pending false' : ''}
 			${proxyFeatures}
 		}
 	}
+`;
+  }
+  const publicAuthFallback = config.auth && (publicIds.length || !protectedIds.length) ? `
+		@publicAuthUnavailable vars public_auth_pending true
+		handle @publicAuthUnavailable {
+			route {
+				${proxyFeatures}
+			}
+		}
 ` : '';
   const accounts = config.auth ? `
 	@accounts path /account /account/* /api/auth/*
@@ -114,11 +144,20 @@ function caddyConfig(config: FeaturesConfig) {
 ` : '';
   return `{
 	admin off${tlsOptions}
+	log {
+		format filter {
+			wrap json
+			request delete
+			resp_headers delete
+		}
+	}
 }
 
 ${site} {${certificate}
+${journal}
 ${accounts}
-${protectedRoutes}
+${metadataRoutes}
+${config.auth ? publicationRoutes(protectedIds, false) + publicationRoutes(publicIds, true) : ''}
 	@features {
 		method GET HEAD
 		path_regexp ^/features(/?|/(${publicRoutes.join('|')}))$
@@ -133,9 +172,12 @@ ${protectedRoutes}
 		respond 404
 	}
 	handle_errors 5xx {
-		header Cache-Control no-store
-		header Content-Type application/json
-		respond \`{"code":"ServiceUnavailable"}\` 503
+		header X-Request-Id {http.request.uuid}${publicAuthFallback}
+		handle {
+			header Cache-Control no-store
+			header Content-Type application/json
+			respond \`{"code":"ServiceUnavailable"}\` 503
+		}
 	}
 }
 `;

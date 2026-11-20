@@ -155,7 +155,7 @@ test('the catalog, OpenAPI and related URLs reflect the current session', async 
   assert.ok(operation.responses['401'].headers['WWW-Authenticate']);
   assert.ok(operation.responses['503']);
   assert.equal(api.components.securitySchemes.session.in, 'cookie');
-  assert.deepEqual(operation.security, [{ session: [] }]);
+  assert.deepEqual(operation.security, [{ session: [] }, { bearer: [] }]);
   assert.equal(api.paths['/collections/places/items'].get.security, undefined);
   for (const id of ['places', 'registered-places']) {
     const itemsPage = await features(`/features/collections/${id}/items?f=html`, cookie);

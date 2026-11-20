@@ -7,6 +7,7 @@ import { changeAccess, listUsers } from './access-store.js';
 import { parseAdminCommand, requiredPermission, type AdminPermission } from './admin-command.js';
 import { CliError } from './cli-result.js';
 import type { Publication } from './config.js';
+import { listPersonalTokens, revokePersonalToken } from './personal-tokens.js';
 
 interface AdminSettings {
   operators: Record<string, AdminPermission[]>;
@@ -39,7 +40,19 @@ export async function startAdminServer(pool: Pool, settings: AdminSettings) {
       throw new CliError('FORBIDDEN', 4, 'This local account has no permission for this command.');
     }
     let result;
-    if ('user' in command) {
+    if (command.operation === 'tokens list' || command.operation === 'tokens revoke') {
+      const column = command.user.field === 'email' ? 'email' : 'id';
+      const { rows: [user] } = await pool.query<{ id: string }>(`SELECT id FROM "user" WHERE ${column} = $1`,
+        [command.user.value]);
+      if (!user) throw new CliError('NOT_FOUND', 3, 'User not found.');
+      result = command.operation === 'tokens list'
+        ? { code: 'OK', data: { userId: user.id, tokens: await listPersonalTokens(pool, user.id) } }
+        : await revokePersonalToken(pool, command.tokenId, user.id, actor);
+      if (command.operation === 'tokens revoke' && result.code === 'OK') {
+        console.info(JSON.stringify({ event: 'access.change', actor, operation: command.operation,
+          userId: user.id, tokenId: command.tokenId }));
+      }
+    } else if ('user' in command) {
       result = await changeAccess(pool, actor, command, settings.publications);
     } else if (command.operation === 'users list') {
       const users = await listUsers(pool, settings.publications, settings.publicationTitles, settings.administratorEmails);

@@ -2,7 +2,7 @@
 
 ## Текущая реализация
 
-CLI поддерживает `config validate`, `config plan` и `config apply` для публикаций из одного источника GeoJSON через OGC API — Features во всех трёх режимах доступа. Для управления доступом доступны `users list`, `users block`, `users unblock`, `access grant` и `access revoke`. Команды выполняются из корня репозитория. [Локальный запуск](README.md#локальная-публикация-geojson) · [Регистрация и доступ](README.md#регистрация-и-доступ)
+CLI поддерживает `config validate`, `config plan` и `config apply` для публикаций из одного источника GeoJSON через OGC API — Features во всех трёх режимах доступа. Для управления доступом доступны `users list`, `users block`, `users unblock`, `access grant`, `access revoke`, `tokens list` и `tokens revoke`. Команды выполняются из корня репозитория. [Локальный запуск](README.md#локальная-публикация-geojson) · [Регистрация и доступ](README.md#регистрация-и-доступ)
 
 ```sh
 npm ci
@@ -36,7 +36,7 @@ node dist/cli.js config plan examples/features.yaml
 - Используйте отдельный центр сертификации для CLI. Сертификат сервера должен содержать `IP:127.0.0.1` в SAN и быть пригоден для серверной аутентификации. Для каждой локальной учётной записи выпустите отдельный клиентский сертификат с `clientAuth` и `CN`, совпадающим с именем записи в `operators`.
 - Защитите каждый закрытый ключ правами ОС. У пользователя или агента должен быть доступ к своему ключу. Ключ центра сертификации храните отдельно. Удаление учётной записи из `operators` вступает в силу после применения конфига.
 - Для локальной учётной записи задайте `GIS_ADMIN_PORT`, `GIS_ADMIN_CA_FILE`, `GIS_ADMIN_CERT_FILE` и `GIS_ADMIN_KEY_FILE`. В PowerShell используйте `$env:GIS_ADMIN_PORT = '8444'` и тот же синтаксис для путей. Административный порт публикуется на `127.0.0.1`.
-- `diagnostics` разрешает `status` и `doctor` для проверки компонента доступа и его подключения к PostgreSQL. `users-read` разрешает `users list`. `access-write` разрешает блокировку, разблокировку, выдачу и отзыв разрешений. Для применения YAML действуют права ОС на рабочий каталог и Docker. Доступ к Docker нужен владельцу развёртывания.
+- `diagnostics` разрешает `status` и `doctor` для проверки компонента доступа и его подключения к PostgreSQL. `users-read` разрешает `users list` и `tokens list`. `access-write` разрешает блокировку, разблокировку, выдачу и отзыв разрешений, а также `tokens revoke`. Для применения YAML действуют права ОС на рабочий каталог и Docker. Доступ к Docker нужен владельцу развёртывания.
 
 ```sh
 node dist/cli.js users list --json
@@ -44,13 +44,19 @@ node dist/cli.js access grant parks-features --email reader@example.org
 node dist/cli.js users block --user-id user-8
 node dist/cli.js users unblock --user-id user-8
 node dist/cli.js access revoke parks-features --user-id user-8
+node dist/cli.js tokens list --email reader@example.org --json
+node dist/cli.js tokens revoke token-17 --email reader@example.org
 ```
 
 В JSON команды `users list` массив `data.users` содержит `id`, `email`, `name`, `registeredAt`, `status` и доступные `publications`. Статусы — `active`, `unverified` и `blocked`. У публикации `anonymous: true` означает доступ без действующей идентификации.
 
 `access grant` с результатом `OK` подтверждает запись разрешения. Для проверки готовности пользователя к подключению найдите в `users list --json` его запись со статусом `active` и нужным ID в `publications`. При статусе `unverified` пользователь сначала подтверждает email. В режиме разработки письмо доступно в Mailpit на порту, заданном в `auth.mailpit_port`.
 
+`tokens list --json` возвращает `data.userId` и массив `data.tokens` с ID, именами, датами создания и истечения и признаком `enabled`. Чтобы отозвать токен, передайте его ID и укажите владельца через `--email` или `--user-id`. Отзыв действует со следующего запроса. Пользователь создаёт токен в своём веб-сеансе и получает секрет один раз. [Подключение QGIS с токеном](README.md#персональный-токен-для-qgis)
+
 Событие успешного изменения записывается в PostgreSQL вместе с изменением. Владелец развёртывания может посмотреть события `access.change` командой `docker compose logs access` с параметрами своего проекта. Событие содержит имя из проверенного клиентского сертификата, команду и ID затронутых объектов.
+
+Журнал `caddy` содержит итоговый HTTP-код, ID запроса из `X-Request-Id` и ID отдельной публикации, если он есть. События `publication.request` в журнале `access` содержат тот же ID запроса, код решения о допуске и ID публикации. Для подтверждённой идентификации событие содержит ID пользователя и, при Bearer-аутентификации, ID токена. Секреты и данные недействительного токена в журнал не записываются.
 
 ### Обновление локального alpha-стенда
 

@@ -13,7 +13,7 @@ interface LinkedCatalog {
 }
 
 interface OpenApi {
-  paths: Record<string, { get?: { security?: { session: string[] }[]; responses: Record<string, unknown> } }>;
+  paths: Record<string, { get?: { security?: Record<string, string[]>[]; responses: Record<string, unknown> } }>;
   tags?: { name: string }[];
   components: {
     parameters?: { resourceId?: { schema?: { default?: string } } };
@@ -22,14 +22,14 @@ interface OpenApi {
 }
 
 const errors = {
-  401: ['Unauthorized', 'An active session is required.'],
+  401: ['Unauthorized', 'An active session or a valid Bearer token is required.'],
   403: ['Forbidden', 'This account cannot access this resource.'],
   503: ['ServiceUnavailable', 'Access or publication is temporarily unavailable.'],
 } as const;
 
 export function featuresError(res: Response, status: keyof typeof errors) {
   const [code, description] = errors[status];
-  if (status === 401) res.set('WWW-Authenticate', 'Session realm="GIS Platform"');
+  if (status === 401) res.set('WWW-Authenticate', 'Session realm="GIS Platform", Bearer realm="GIS Platform"');
   res.status(status).json({ code, description });
 }
 
@@ -47,7 +47,7 @@ function annotateOpenApi(api: OpenApi, publications: Map<string, Publication['ac
     if (publications.get(id) === 'public') return true;
     hasProtectedPaths = true;
     if (entry.get) {
-      entry.get.security = [{ session: [] }];
+      entry.get.security = [{ session: [] }, { bearer: [] }];
       for (const [status, [code, description]] of Object.entries(errors)) {
         entry.get.responses[status] = {
           description,
@@ -64,7 +64,11 @@ function annotateOpenApi(api: OpenApi, publications: Map<string, Publication['ac
   api.tags = api.tags?.filter(({ name }, index) => (index === 0 && name === 'server') || canRead(publications, name, reader));
   const resourceId = api.components.parameters?.resourceId?.schema;
   if (resourceId?.default && !canRead(publications, resourceId.default, reader)) delete resourceId.default;
-  if (hasProtectedPaths) (api.components.securitySchemes ??= {}).session = { type: 'apiKey', in: 'cookie', name: cookieName };
+  if (hasProtectedPaths) {
+    const schemes = api.components.securitySchemes ??= {};
+    schemes.session = { type: 'apiKey', in: 'cookie', name: cookieName };
+    schemes.bearer = { type: 'http', scheme: 'bearer' };
+  }
 }
 
 async function upstreamDocument<T>(name: 'openapi' | 'collections', format: 'json' | 'jsonld' = 'json') {
@@ -91,16 +95,16 @@ function requestedFormat(req: Request, supported: (keyof typeof mediaTypes)[]) {
 }
 
 export function mountFeaturesMetadata(app: Express, modes: Record<string, Publication['access']>, cookieName: string,
-  readReader: (req: Request) => Promise<PublicationReader | null>) {
+  readReader: (req: Request, res: Response) => Promise<PublicationReader | null>) {
   const publications = new Map(Object.entries(modes));
   app.use(['/features/openapi', '/features/collections'], (_req, res, next) => {
-    res.vary('Cookie').vary('Accept');
+    res.vary('Cookie').vary('Authorization').vary('Accept');
     next();
   });
   app.get('/features/collections', async (req, res) => {
     const representation = requestedFormat(req, ['json', 'html', 'jsonld']);
     if (!representation) return res.status(400).json({ code: 'InvalidParameterValue', description: 'Invalid format.' });
-    const reader = await readReader(req);
+    const reader = await readReader(req, res);
     if (representation === 'jsonld') {
       const catalog = await upstreamDocument<LinkedCatalog>('collections', 'jsonld');
       catalog.dataset = catalog.dataset.filter(({ '@id': url }) => {
@@ -121,7 +125,7 @@ export function mountFeaturesMetadata(app: Express, modes: Record<string, Public
   app.get('/features/openapi', async (req, res) => {
     const representation = requestedFormat(req, ['json', 'html', 'yaml']);
     if (!representation) return res.status(400).json({ code: 'InvalidParameterValue', description: 'Invalid format.' });
-    const reader = await readReader(req);
+    const reader = await readReader(req, res);
     const api = await upstreamDocument<OpenApi>('openapi');
     annotateOpenApi(api, publications, reader, cookieName);
     if (representation === 'yaml') return res.type('application/yaml').send(stringify(api));

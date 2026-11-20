@@ -2,13 +2,34 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { auth, register, request, session, signIn } from './access-client.mjs';
+import { setTimeout } from 'node:timers/promises';
+import { auth, cookieFrom, emailLink, register, request, session, signIn } from './access-client.mjs';
 
 const gateway = process.env.GIS_TEST_PUBLIC_URL;
 const privateCollection = '/features/collections/private-places';
 const items = `${privateCollection}/items/central?f=json`;
 const publicItems = '/features/collections/places/items/central?f=json';
 const password = 'private-password-16';
+
+test('a signed-in user can create a named token and read a private publication with Bearer', async () => {
+  const email = 'token-owner@example.test';
+  await register(email, password);
+  const cookie = await signIn(email, password);
+  cli(['access', 'grant', 'private-places', '--email', email]);
+  const created = await auth('tokens/create', { name: 'QGIS' }, cookie);
+  assert.equal(created.status, 201);
+  assert.equal(created.headers.get('cache-control'), 'no-store');
+  const { id, name, secret } = await created.json();
+  assert.ok(id && typeof secret === 'string' && secret.length > 32);
+  assert.equal(name, 'QGIS');
+  const list = await request('/api/auth/tokens', { headers: { Cookie: cookie } });
+  const listing = await list.text();
+  assert.equal(listing.includes(secret), false);
+  assert.deepEqual(JSON.parse(listing).tokens.map(({ id, name }) => ({ id, name })), [{ id, name }]);
+  const feature = await request(items, { headers: { Authorization: `Bearer ${secret}` } });
+  assert.equal(feature.status, 200);
+  assert.equal((await feature.json()).id, 'central');
+});
 
 function cli(args, expected = 'OK', exitCode = 0, environment = {}) {
   const result = spawnSync(process.execPath, ['dist/cli.js', ...args, '--json'], {
@@ -44,6 +65,200 @@ function operator(name) {
 
 function publications(user) {
   return user.publications.map(({ id }) => id);
+}
+
+const bearer = (secret) => ({ headers: { Authorization: `Bearer ${secret}` } });
+const day = 24 * 60 * 60 * 1000;
+
+async function createToken(cookie, name) {
+  const response = await auth('tokens/create', { name }, cookie);
+  assert.equal(response.status, 201);
+  return response.json();
+}
+
+async function tokens(cookie) {
+  const response = await request('/api/auth/tokens', { headers: { Cookie: cookie } });
+  assert.equal(response.status, 200);
+  return (await response.json()).tokens;
+}
+
+test('Bearer expiry moves on admission and current grants govern data and metadata', async () => {
+  const email = 'token-sliding@example.test';
+  await register(email, password);
+  const cookie = await signIn(email, password);
+  const { id, secret, createdAt, expiresAt } = await createToken(cookie, 'Expiry');
+  assert.ok(Math.abs(Date.parse(expiresAt) - Date.parse(createdAt) - 90 * day) < 1000);
+  await setTimeout(20);
+  assert.equal((await request(items, bearer(secret))).status, 403);
+  assert.equal((await tokens(cookie)).find((token) => token.id === id).expiresAt, expiresAt);
+  cli(['access', 'grant', 'private-places', '--email', email]);
+  const admitted = await request(items, bearer(secret));
+  assert.equal(admitted.status, 200);
+  const extended = (await tokens(cookie)).find((token) => token.id === id).expiresAt;
+  assert.ok(Date.parse(extended) > Date.parse(expiresAt));
+  assert.ok(Math.abs(Date.parse(extended) - Date.now() - 90 * day) < 5000);
+  const catalog = await request('/features/collections?f=json', bearer(secret));
+  assert.deepEqual((await catalog.json()).collections.map(({ id }) => id),
+    ['registered-places', 'places', 'private-places']);
+  const api = await request('/features/openapi?f=json', bearer(secret));
+  const openapi = await api.json();
+  assert.deepEqual(openapi.paths['/collections/private-places/items'].get.security, [{ session: [] }, { bearer: [] }]);
+  assert.deepEqual(openapi.components.securitySchemes.bearer, { type: 'http', scheme: 'bearer' });
+  assert.equal(openapi.paths['/collections/other-private/items'], undefined);
+  // The linked catalog is filtered by the same rights as collection data.
+  const linkedCatalog = await request('/features/collections?f=jsonld', bearer(secret));
+  assert.equal(linkedCatalog.status, 200);
+  assert.deepEqual((await linkedCatalog.json()).dataset.map((entry) => new URL(entry['@id']).pathname),
+    ['/features/collections/registered-places', '/features/collections/places', privateCollection]);
+  cli(['access', 'revoke', 'private-places', '--email', email]);
+  assert.equal((await request(items, bearer(secret))).status, 403);
+  assert.equal((await request('/features/collections/registered-places/items?f=json', bearer(secret))).status, 200);
+  const beforePublic = (await tokens(cookie))[0].expiresAt;
+  await setTimeout(20);
+  assert.equal((await request(publicItems, bearer(secret))).status, 200);
+  const afterPublic = (await tokens(cookie))[0].expiresAt;
+  assert.ok(Date.parse(afterPublic) > Date.parse(beforePublic));
+  assert.equal((await request(publicItems)).status, 200);
+  assert.equal((await request(publicItems, bearer('invalid'))).status, 200);
+  assert.equal((await tokens(cookie))[0].expiresAt, afterPublic);
+
+  // Place the existing key in the past without changing the host clock or the 90-day policy.
+  assert.match(id, /^[A-Za-z0-9_-]+$/);
+  compose('exec', '-T', 'postgres', 'psql', '-U', 'gis', '-d', 'gis', '-c',
+    `UPDATE apikey SET "expiresAt" = clock_timestamp() - interval '1 second' WHERE id = '${id}';`);
+  const expired = (await tokens(cookie))[0].expiresAt;
+  assert.equal((await request(publicItems, bearer(secret))).status, 200);
+  assert.equal((await request(items, bearer(secret))).status, 401);
+  assert.equal((await tokens(cookie))[0].expiresAt, expired);
+});
+
+test('own and operator revocation affect one token and cannot be undone by concurrent use', async () => {
+  const email = 'token-revocation@example.test';
+  const outsider = 'token-outsider@example.test';
+  for (const account of [email, outsider]) await register(account, password);
+  const cookie = await signIn(email, password);
+  const otherCookie = await signIn(outsider, password);
+  const { userId } = cli(['access', 'grant', 'private-places', '--email', email]);
+  const page = await request('/account/tokens', { headers: { Cookie: cookie } });
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /Personal tokens/);
+  const first = await createToken(cookie, 'First');
+  const second = await createToken(cookie, 'Second');
+  const api = await request('/api/auth/tokens', bearer(first.secret));
+  assert.equal(api.status, 401);
+  assert.equal(await (await request('/api/auth/get-session', bearer(first.secret))).json(), null);
+  const foreign = await request('/api/auth/tokens/create', {
+    method: 'POST', headers: { Cookie: cookie, Origin: 'https://other.example.test', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Cross-origin' }),
+  });
+  assert.equal(foreign.status, 403);
+  for (const [body, status] of [['{', 400], [JSON.stringify({ name: 'x'.repeat(4096) }), 413]]) {
+    const invalid = await request('/api/auth/tokens/create', {
+      method: 'POST', headers: { Cookie: cookie, Origin: gateway, 'Content-Type': 'application/json' }, body,
+    });
+    assert.equal(invalid.status, status);
+  }
+  assert.equal((await auth('tokens/revoke', { id: first.id }, otherCookie)).status, 404);
+  const listing = cli(['tokens', 'list', '--user-id', userId], 'OK', 0, operator('reader')).tokens;
+  assert.deepEqual(new Set(listing.map(({ id }) => id)), new Set([first.id, second.id]));
+  assert.equal(JSON.stringify(listing).includes(first.secret), false);
+  cli(['tokens', 'revoke', second.id, '--email', email], 'FORBIDDEN', 4, operator('reader'));
+  cli(['tokens', 'revoke', second.id, '--email', outsider], 'NOT_FOUND', 3, operator('writer'));
+  const competing = [request(items, bearer(first.secret)), auth('tokens/revoke', { id: first.id }, cookie)];
+  const [read, revoked] = await Promise.all(competing);
+  assert.ok([200, 401].includes(read.status));
+  assert.equal(revoked.status, 204);
+  assert.equal((await request(items, bearer(first.secret))).status, 401);
+  assert.equal((await request(publicItems, bearer(first.secret))).status, 200);
+  assert.equal((await request(items, bearer(second.secret))).status, 200);
+  const beforeBlock = (await tokens(cookie)).find(({ id }) => id === second.id).expiresAt;
+  const pending = request(items, bearer(second.secret));
+  cli(['users', 'block', '--user-id', userId]);
+  assert.ok([200, 403].includes((await pending).status));
+  assert.equal((await request(items, bearer(second.secret))).status, 403);
+  const blocked = () => cli(['tokens', 'list', '--email', email]).tokens.find(({ id }) => id === second.id).expiresAt;
+  const expiryWhileBlocked = blocked();
+  assert.ok(Date.parse(expiryWhileBlocked) >= Date.parse(beforeBlock));
+  assert.equal((await request(publicItems, bearer(second.secret))).status, 200);
+  assert.equal(blocked(), expiryWhileBlocked);
+  cli(['users', 'unblock', '--user-id', userId]);
+  const concurrent = request(items, bearer(second.secret));
+  cli(['tokens', 'revoke', second.id, '--user-id', userId], 'OK', 0, operator('writer'));
+  assert.ok([200, 401].includes((await concurrent).status));
+  assert.equal((await request(items, bearer(second.secret))).status, 401);
+  cli(['tokens', 'revoke', second.id, '--email', email], 'NO_CHANGE');
+});
+
+test('password change and recovery invalidate all tokens and older web sessions', async () => {
+  const email = 'token-recovery@example.test';
+  const changed = 'next-password-17';
+  const recovered = 'recovered-password-17';
+  const registered = '/features/collections/registered-places/items?f=json';
+  await register(email, password);
+  const current = await signIn(email, password);
+  const other = await signIn(email, password);
+  const beforeChange = await Promise.all([createToken(current, 'One'), createToken(other, 'Two')]);
+  assert.equal((await auth('change-password', { currentPassword: 'wrong-password', newPassword: changed }, current)).status, 400);
+  for (const { secret } of beforeChange) assert.equal((await request(registered, bearer(secret))).status, 200);
+  const update = await auth('change-password', { currentPassword: password, newPassword: changed }, current);
+  assert.equal(update.status, 200);
+  const kept = cookieFrom(update);
+  for (const { secret } of beforeChange) assert.equal((await request(registered, bearer(secret))).status, 401);
+  assert.equal(await session(other), null);
+  assert.equal(await session(current), null);
+  assert.ok((await session(kept)).user);
+
+  const beforeRecovery = await createToken(kept, 'After password change');
+  const otherAfterChange = await signIn(email, changed);
+  assert.equal((await auth('request-password-reset', { email })).status, 200);
+  const link = await emailLink(email, '/account/reset-password');
+  const reset = await auth('reset-password', { token: new URL(link).searchParams.get('token'), newPassword: recovered });
+  assert.equal(reset.status, 200);
+  assert.equal((await request(registered, bearer(beforeRecovery.secret))).status, 401);
+  assert.equal(await session(kept), null);
+  assert.equal(await session(otherAfterChange), null);
+  const fresh = await createToken(await signIn(email, recovered), 'After recovery');
+  assert.equal((await request(registered, bearer(fresh.secret))).status, 200);
+});
+
+test('publication request records correlate stable IDs without logging credentials or invalid identities', async () => {
+  const email = 'token-audit@example.test';
+  await register(email, password);
+  const cookie = await signIn(email, password);
+  const { userId } = cli(['access', 'grant', 'private-places', '--email', email]);
+  const { id, secret } = await createToken(cookie, 'Audited');
+  const claims = 'caller-supplied-id';
+  const admitted = await request(items, { headers: { Authorization: `Bearer ${secret}`, 'X-GIS-Request-Id': claims } });
+  assert.equal(admitted.status, 200);
+  const rejected = await request('/features/collections/other-private?f=json', bearer(secret));
+  assert.equal(rejected.status, 403);
+  const publicAccess = await request(publicItems, bearer(secret));
+  assert.equal(publicAccess.status, 200);
+  const fake = 'fake-token-that-must-never-appear-in-request-records';
+  const fallback = await request(publicItems, { headers: { Authorization: `Bearer ${fake}`, Cookie: cookie } });
+  assert.equal(fallback.status, 200);
+  const ids = [admitted, rejected, publicAccess, fallback].map((response) => response.headers.get('x-request-id'));
+  for (const requestId of ids) assert.match(requestId, /^[0-9a-f-]{36}$/i);
+  assert.equal(new Set(ids).size, ids.length);
+  const output = compose('logs', '--no-color', '--no-log-prefix', 'access', 'caddy');
+  for (const value of [secret, cookie, fake, claims]) assert.equal(output.includes(value), false);
+  const byId = new Map(output.split(/\r?\n/).filter((line) => line.startsWith('{"event":"publication.request"'))
+    .map((line) => JSON.parse(line)).map(({ requestId, event, ...entry }) => [requestId, entry]));
+  assert.deepEqual(byId.get(ids[0]), { publicationId: 'private-places', userId, tokenId: id, status: 200 });
+  assert.deepEqual(byId.get(ids[1]), { publicationId: 'other-private', userId, tokenId: id, status: 403 });
+  assert.deepEqual(byId.get(ids[2]), { publicationId: 'places', userId, tokenId: id, status: 200 });
+  assert.deepEqual(byId.get(ids[3]), { publicationId: 'places', status: 200 });
+  const gatewayLog = gatewayRecords(output);
+  for (const [index, [publicationId, status]] of [['private-places', 200], ['other-private', 403],
+    ['places', 200], ['places', 200]].entries()) {
+    assert.equal(gatewayLog.get(ids[index])?.publicationId, publicationId);
+    assert.equal(gatewayLog.get(ids[index])?.status, status);
+  }
+});
+
+function gatewayRecords(log) {
+  return new Map(log.split(/\r?\n/).filter((line) => line.includes('"logger":"http.log.access"'))
+    .map((line) => JSON.parse(line)).map((entry) => [entry.requestId, entry]));
 }
 
 test('anonymous visitors receive 401 for a private publication and cannot see it in shared descriptions', async () => {
@@ -93,7 +308,7 @@ test('personal grants and revocations apply to the next request for exactly one 
   const api = await request('/features/openapi?f=json', options);
   const openapi = await api.json();
   const operation = openapi.paths['/collections/private-places/items'].get;
-  assert.deepEqual(operation.security, [{ session: [] }]);
+  assert.deepEqual(operation.security, [{ session: [] }, { bearer: [] }]);
   assert.ok(operation.responses['401'].headers['WWW-Authenticate']);
   assert.ok(operation.responses['403']);
   assert.ok(operation.responses['503']);
@@ -232,15 +447,28 @@ test('a grant survives access service recreation and dependency outages fail clo
   for (const service of ['postgres', 'access']) {
     compose('stop', service);
     try {
+      const deniedIds = [];
       for (const requestOptions of [options, undefined]) {
         for (const path of [items, '/features/collections?f=json', '/features/openapi?f=json']) {
           const unavailable = await request(path, requestOptions);
           assert.equal(unavailable.status, 503, `${service}: ${path}`);
           assert.equal(unavailable.headers.get('cache-control'), 'no-store');
           assert.equal((await unavailable.json()).code, 'ServiceUnavailable');
+          if (path === items) {
+            const requestId = unavailable.headers.get('x-request-id');
+            assert.match(requestId, /^[0-9a-f-]{36}$/i, `${service}: ${path}`);
+            deniedIds.push(requestId);
+          }
         }
       }
-      assert.equal((await request(publicItems, options)).status, 200);
+      const publicResponse = await request(publicItems, options);
+      assert.equal(publicResponse.status, 200);
+      const log = gatewayRecords(compose('logs', '--no-color', '--no-log-prefix', 'caddy'));
+      for (const id of deniedIds) {
+        assert.equal(log.get(id)?.publicationId, 'private-places');
+        assert.equal(log.get(id)?.status, 503);
+      }
+      assert.equal(log.get(publicResponse.headers.get('x-request-id'))?.publicationId, 'places');
       cli(['users', 'list'], 'FAILED', 1);
     } finally {
       compose('up', '-d', '--wait', service);

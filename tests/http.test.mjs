@@ -19,7 +19,11 @@ async function getJson(path) {
 }
 
 test('the applied public GeoJSON publication returns the expected feature through Caddy', async () => {
-  const feature = await getJson(`${collection}/items/central?f=json`);
+  const response = await get(`${collection}/items/central?f=json`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.match(response.headers.get('x-request-id'), /^[0-9a-f-]{36}$/i);
+  const feature = await response.json();
   assert.equal(feature.type, 'Feature');
   assert.equal(feature.id, 'central');
   assert.deepEqual(feature.geometry, { type: 'Point', coordinates: [37.62, 55.75] });

@@ -15,7 +15,7 @@ function success(code: string, data: Record<string, unknown>, message: string) {
 }
 
 async function main() {
-  if (group === 'status' || group === 'doctor' || group === 'users' || group === 'access') {
+  if (group === 'status' || group === 'doctor' || group === 'users' || group === 'access' || group === 'tokens') {
     const result = await runAdminCommand(commandArguments);
     success(result.code, result.data, formatAdminResult(result));
     return;
@@ -64,6 +64,13 @@ function formatAdminResult({ code, data }: Awaited<ReturnType<typeof runAdminCom
     }).join('\n') || 'No users.';
   }
   if (typeof data.currentVersion === 'string') return `Access ready (version ${data.currentVersion}).`;
+  if (group === 'tokens') {
+    if (command === 'revoke') return code === 'NO_CHANGE' ? 'Token already revoked.' : 'Token revoked.';
+    const tokens = data.tokens as { id: string; name: string; expiresAt: string; enabled: boolean }[];
+    return tokens.map((token) => [token.id, token.name.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' '),
+      token.expiresAt, token.enabled ? (Date.parse(token.expiresAt) > Date.now() ? 'active' : 'expired') : 'revoked']
+      .join('\t')).join('\n') || 'No tokens.';
+  }
   return code === 'NO_CHANGE' ? 'No change.' : 'Access updated.';
 }
 
