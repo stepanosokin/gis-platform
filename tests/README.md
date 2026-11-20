@@ -19,13 +19,14 @@ npm test
 | Динамические публикации внешнего PostGIS через CLI и Caddy | `npm test -- --postgis` |
 | Файловые источники Features и CRS через CLI и Caddy | `npm test -- --features-files` |
 | Растровые публикации Maps через CLI и Caddy | `npm test -- --maps` |
+| Динамические тайлы MVT и TileJSON через Martin, CLI и Caddy | `npm test -- --mvt` |
 | Все сценарии регистрации и доступа | `npm test -- --access` |
 | Один сценарий регистрации и доступа | `npm test -- --access HTTPS` |
 | Закрытые публикации и локальный CLI | `npm test -- --private` |
 | Один сценарий закрытых публикаций | `npm test -- --private 'personal grants'` |
 | Обнаружение закрытого слоя в открытом QGIS через QGIS MCP | `npm test -- --qgis` |
 
-Последний аргумент после `--access`, `--private`, `--versions`, `--providers`, `--features-files` или `--maps` задаёт фильтр Node.js по имени теста. Путь к результатам указан в строке `Results:`. Раннер сохраняет вывод каждой команды после её завершения.
+Последний аргумент после `--access`, `--private`, `--versions`, `--providers`, `--features-files`, `--maps` или `--mvt` задаёт фильтр Node.js по имени теста. Путь к результатам указан в строке `Results:`. Раннер сохраняет вывод каждой команды после её завершения.
 
 При разборе нестабильного теста повторите сценарий отдельно. Разные временные проекты Compose используют общий `dist/` рабочей копии и общий тег тестового образа Docker. Отдельный прогон исключает пересборку этих файлов и образа другим прогоном.
 
@@ -120,6 +121,20 @@ npm test
 
 - После изменений интеграции Better Auth сначала запустите `npm test -- --private 'signed-in user can create'`. Если выдача возвращает `503`, проверьте настройки плагина и миграции. В #17 внутренние метаданные с ID сеанса требовали `enableMetadata`, чтобы триггер PostgreSQL мог проверить сеанс при создании токена. После успешной выдачи проверьте подключение из QGIS.
 - После изменений маршрутов или журнала Caddy запустите `npm test -- --private 'publication request records|dependency outages'`. Сверьте `X-Request-Id` ответа с `requestId` в JSON-журнале Caddy для обычного запроса и для `503`, который формирует сам Caddy при остановленном `access`. В закреплённой сборке поле `logger` содержит `http.log.access`. Самостоятельный ответ Caddy об ошибке проходит через `handle_errors`, где нужно выставить `X-Request-Id`.
+
+## MapLibre GL JS
+
+Сценарий MVT создаёт временную БД, которой управляет тест, и отдельный проект Compose. HTTP-проверка декодирует тайлы, сверяет версию слоя MVT, положение точки, режим чтения подключения и видимость изменений в ранее пустом тайле.
+
+Для браузерной проверки укажите `GIS_TEST_CHROME` с путём к Chrome или Chromium и `GIS_TEST_MAPLIBRE_DIST` с путём к каталогу `dist` сборки MapLibre GL JS 6.19.0. Подготовьте сборку командами из корня репозитория.
+
+```sh
+mkdir -p test_results/maplibre-6.19.0
+npm pack maplibre-gl@6.19.0 --pack-destination test_results/maplibre-6.19.0
+tar -xf test_results/maplibre-6.19.0/maplibre-gl-6.19.0.tgz -C test_results/maplibre-6.19.0 package/dist
+```
+
+Укажите `test_results/maplibre-6.19.0/package/dist` в `GIS_TEST_MAPLIBRE_DIST` и запустите `npm test -- --mvt` или полный `npm test`. Тест запускает скрытый браузер с временным профилем и проверяет отрисованную точку после запросов к TileJSON и тайлам с другого origin. Запросы используют Bearer-токен тестового пользователя. После изменения свойства точки и COMMIT тест повторяет запросы к тому же источнику в том же браузере. Оба результата сохраняются в `mvt-browser.json`.
 
 ## QGIS Desktop
 

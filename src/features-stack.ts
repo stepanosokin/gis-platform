@@ -11,9 +11,10 @@ import { setTimeout } from 'node:timers/promises';
 import { checkServerIdentity, createSecureContext } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { parse } from 'yaml';
+import { parse, stringify } from 'yaml';
 import { mapBboxDescription, mapRelation, mapSize } from './maps-profile.js';
-import { builtInProviderId, hasGeoJson, needsMetadataService, pinnedImage, postgisSource, providerRoot, publicationEntries, publicationUrl,
+import { checkTileJson, martinConfig, martinService, runMartin } from './martin-profile.js';
+import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataService, pinnedImage, postgisSource, providerRoot, publicationEntries, publicationUrl,
   crs84, rasterFile, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
 
 const run = promisify(execFile);
@@ -120,6 +121,10 @@ function pygeoapiSource(config: FeaturesConfig, publication: Publication) {
 
 export function providerConfigurationChanged(candidate: FeaturesConfig, previous: FeaturesConfig | null,
   id = builtInProviderId(candidate)) {
+  if (id && candidate.providers?.[id]?.type === 'martin') {
+    return !previous || JSON.stringify(martinConfig(candidate, id)) !== JSON.stringify(martinConfig(previous, id)) ||
+      JSON.stringify(candidate.providers[id].postgis) !== JSON.stringify(previous.providers?.[id]?.postgis);
+  }
   return !previous || (id !== undefined && (
     ((hasGeoJson(candidate, id) || hasGeoJson(previous, id)) && candidate.sourcePath !== previous.sourcePath) ||
     JSON.stringify(usedFileSources(candidate, id)) !== JSON.stringify(usedFileSources(previous, id)) ||
@@ -135,20 +140,27 @@ function caddyConfig(config: FeaturesConfig) {
   const protectedIds = publications.filter(([, publication]) => publication.access !== 'public').map(([id]) => id);
   const publicIds = publications.filter(([, publication]) => publication.access === 'public').map(([id]) => id);
   const collectionRoute = (ids: string[], protocol?: Publication['protocol']) =>
+    protocol === 'mvt' ? `(${ids.join('|')})(/[0-9]{1,2}/[0-9]{1,10}/[0-9]{1,10})?` :
     `collections/(${ids.join('|')})${protocol === 'maps' ? '(/map)?' : protocol === 'features'
       ? '(/(schema|queryables|items(/.+)?))?' : '(/(map|schema|queryables|items(/.+)?))?'}`;
-  const allCollections = publications.length ? collectionRoute(publications.map(([id]) => id)) : '';
+  const ogcIds = publications.filter(([, publication]) => publication.protocol !== 'mvt').map(([id]) => id);
+  const mvtIds = publications.filter(([, publication]) => publication.protocol === 'mvt').map(([id]) => id);
+  const allCollections = ogcIds.length ? collectionRoute(ogcIds) : '';
+  const allTiles = mvtIds.length ? `/mvt/${collectionRoute(mvtIds, 'mvt')}` : '';
   const roots = config.providers ? [...new Set(Object.keys(config.providers).map((id) => providerRoot(config, id)))] : ['/features'];
   const rootPattern = roots.length ? `(?:${roots.join('|')})` : '/features';
-  const loggedRoutes = ['openapi', 'collections', ...(allCollections ? [allCollections] : [])].join('|');
+  const loggedRoutes = `${rootPattern}/(${['openapi', 'collections', ...(allCollections ? [allCollections] : [])].join('|')})`;
+  const logged = [loggedRoutes, allTiles].filter(Boolean).join('|');
   const journal = `
 	log
-	@loggedFeatures path_regexp ^${rootPattern}/(${loggedRoutes})$
-	@unloggedFeatures not path_regexp ^${rootPattern}/(${loggedRoutes})$
+	@loggedFeatures path_regexp ^(?:${logged})$
+	@unloggedFeatures not path_regexp ^(?:${logged})$
 	log_skip @unloggedFeatures
 	log_append @loggedFeatures requestId {http.request.uuid}${allCollections ? `
 	@loggedPublication path_regexp loggedPublication ^${rootPattern}/${allCollections}$
 	log_append @loggedPublication publicationId {http.regexp.loggedPublication.1}` : ''}
+	${allTiles ? `@loggedMvt path_regexp loggedMvt ^${allTiles}$
+	log_append @loggedMvt publicationId {http.regexp.loggedMvt.1}` : ''}
 	header @loggedFeatures >X-Request-Id {http.request.uuid}
 `;
   const publicRoutes = ['conformance', 'static/.+'];
@@ -306,9 +318,10 @@ function managedGatewayRoutes(config: FeaturesConfig,
   for (const [root, ids] of byRoot) {
     const rootIndex = routes.length;
     const entries = publications.filter(([, publication]) => ids.includes(publication.provider));
+    const mvt = root === '/mvt';
     const metadata = config.auth ? 'access' : 'metadata';
     const managedConformance = entries.some(([, publication]) => vectorFile(config, publication.source));
-    routes.push(`
+    if (!mvt) routes.push(`
 	@metadata${rootIndex} {
 		method GET HEAD
 		path ${root}/collections ${root}/openapi${managedConformance ? ` ${root}/conformance` : ''}
@@ -325,6 +338,12 @@ function managedGatewayRoutes(config: FeaturesConfig,
       const instance = config.providers?.[id];
       const api = instance?.image ? instance.api : undefined;
       const maps = api?.protocol === 'maps';
+      const { host, protocol } = new URL(config.publicUrl);
+      const canonical = mvt ? `
+				header_up Host ${host}
+				header_up X-Forwarded-Host ${host}
+				header_up X-Forwarded-Proto ${protocol.slice(0, -1)}
+				header_up -Forwarded` : '';
       const mapPath = `${root}/collections/*/map`;
       const mapRequest = maps ? `forward_auth ${mapPath} metadata:3000 {
 				uri /internal/validate-map
@@ -333,11 +352,12 @@ function managedGatewayRoutes(config: FeaturesConfig,
 			}
 			request_header ${mapPath} Accept image/png
 			` : '';
+      const base = api?.base_path === '/' ? '' : api?.base_path ?? '';
       const proxy = (postgis = false) => `${mapRequest}uri strip_prefix ${root}
-			${api && api.base_path !== '/' ? `rewrite * ${api.base_path}{http.request.uri.path}` : ''}
+			${base || mvt ? `rewrite * ${base}{http.request.uri.path}${mvt ? '?' : ''}` : ''}
 			reverse_proxy ${serviceName(config, id)}:${api?.port ?? 80} {
 				header_up -Cookie
-				header_up -Authorization
+				header_up -Authorization${canonical}
 				header_down Cache-Control no-store${htmlPolicy}${postgis || maps ? `
 				@sourceFailure status 5xx
 				handle_response @sourceFailure {
@@ -346,7 +366,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
 					respond \`{"code":"ServiceUnavailable"}\` 503
 				}` : ''}
 			}`;
-      if (id === ids[0]) {
+      if (!mvt && id === ids[0]) {
         routes.push(`
 	@root${rootIndex} {
 		method GET HEAD
@@ -359,6 +379,37 @@ function managedGatewayRoutes(config: FeaturesConfig,
 	}
 `);
       }
+      const cors = mvt ? config.cors?.allowed_origins : undefined;
+      if (cors?.length) {
+        const visible = entries.filter(([, entry]) => entry.provider === id).map(([key]) => key);
+        if (visible.length) {
+          const name = `cors${routes.length}`;
+          const path = `path_regexp ^${root}/${collectionRoute(visible, 'mvt')}$`;
+          const origins = `header_regexp Origin ^(?:${cors.map((value) => value.replaceAll('.', '\\.')).join('|')})$`;
+          routes.push(`
+	@${name} {
+		${path}
+		${origins}
+	}
+	header @${name} {
+		Access-Control-Allow-Origin {http.request.header.Origin}
+		+Vary Origin
+	}
+	@${name}Preflight {
+		${path}
+		method OPTIONS
+		${origins}
+		header_regexp Access-Control-Request-Method ^(GET|HEAD)$
+	}
+	header @${name}Preflight {
+		Access-Control-Allow-Methods "GET, HEAD"
+		Access-Control-Allow-Headers Authorization
+		Cache-Control no-store
+	}
+	respond @${name}Preflight 204
+`);
+        }
+      }
       function addPublicationRoute(anonymous: boolean, postgis: boolean, match: (name: string) => string) {
         const name = `provider${routes.length}`;
         const upstream = proxy(postgis);
@@ -367,7 +418,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
 		${match(name)}
 	}
 	handle @${name} {
-		route {${config.auth ? `${anonymous ? `\n			vars public_provider ${name}` : ''}
+		route {${mvt ? '\n			header >Cache-Control no-store' : ''}${config.auth ? `${anonymous ? `\n			vars public_provider ${name}` : ''}
 			forward_auth access:3000 {
 				uri /internal/authorize/{http.regexp.${name}.1}
 				header_up X-GIS-Request-Id {http.request.uuid}
@@ -391,7 +442,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
           if (!visible.length) continue;
           addPublicationRoute(anonymous, postgis, (name) => `method GET HEAD
 		path_regexp ${name} ^${root}/${collectionRoute(visible, api?.protocol ?? 'features')}$`);
-          if (postgis) addPublicationRoute(anonymous, true, (name) => `method POST
+          if (postgis && !mvt) addPublicationRoute(anonymous, true, (name) => `method POST
 		header_regexp Content-Type (?i)^application/json(?:\\s*;.*)?$
 		path_regexp ${name} ^${root}/collections/(${visible.join('|')})/items$`);
         }
@@ -634,6 +685,14 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
       ? [{ source: secret, target: 'postgis_password' }] : undefined;
     const native = service === 'pygeoapi' ? directory : join(directory, service);
     await mkdir(native, { recursive: true });
+    if (provider.type === 'martin') {
+      if (!managedProviderRuns(config, id)) continue;
+      await writeFile(join(native, 'martin.yaml'), stringify(martinConfig(config, id)));
+      await writeFile(join(native, 'run.sh'), runMartin);
+      if (connection) secrets[secret] = { file: escapeCompose(passwordFile!) };
+      services[service] = martinService(provider, escapeCompose(await nativeProviderDirectory(directory, service)), connection);
+      continue;
+    }
     const files = usedFileSources(config, id);
     const vectorFiles = files.some(([key]) => vectorFile(config, key));
     const fileMounts = (await Promise.all(files.map(async ([key, file]) => {
@@ -795,12 +854,29 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
   const providers = Object.keys(config.providers ?? {});
   const entries = publicationEntries(config);
   for (const id of providers) {
+    const instance = config.providers?.[id];
     const root = providerRoot(config, id);
     const url = new URL(root, config.publicUrl).href;
     const service = serviceName(config, id);
     const publications = entries.filter(([, pub]) => pub.provider === id);
     const native = service === 'pygeoapi' ? directory : join(directory, service);
     const mounted = await nativeProviderDirectory(directory, service);
+    if (instance?.type === 'martin') {
+      if (publications.length && mounted === native) {
+        try {
+          const output = await compose(config, directory, 'run', '--rm', '--no-deps', '-T', service,
+            '--check', ...publications.map(([key]) => key));
+          const documents = output.trim().split('\n');
+          for (const [index, [key, publication]] of publications.entries()) {
+            checkTileJson(documents[index] ?? '', `http://127.0.0.1:${instance.api.port}${root}/${key}`, key,
+              postgisSource(config, publication.source)!.id_field);
+          }
+        } catch {
+          throw new FeaturesPreflightError(`Martin provider '${id}' failed to open its PostGIS sources. Check connectivity, access and source definitions.`);
+        }
+      }
+      continue;
+    }
     let api: FeaturesOpenApi;
     if (mounted !== native) {
       api = checkOpenApi(await readFile(join(mounted, 'openapi.json'), 'utf8'), url, publications);
@@ -1087,7 +1163,7 @@ export async function publicationGrantRemoval({ config, directory }: Revision, p
 function stackServices(config: FeaturesConfig) {
   const providers = [
     ...(builtInProviderId(config) ? ['pygeoapi'] : []),
-    ...Object.entries(config.providers ?? {}).filter(([, provider]) => provider.image).map(([id]) => serviceName(config, id)),
+    ...Object.keys(config.providers ?? {}).filter((id) => managedProviderRuns(config, id)).map((id) => serviceName(config, id)),
   ];
   return [...providers, ...(config.auth ? ['access', 'postgres', ...(config.auth.mode === 'development' ? ['mailpit'] : [])] : []),
     ...(needsMetadataService(config) ? ['metadata'] : [])];
@@ -1098,13 +1174,25 @@ export async function featuresStackRunning(config: FeaturesConfig, directory: st
   return ['caddy', ...stackServices(config)].every((service) => running.includes(service));
 }
 
-export async function startFeaturesStack(config: FeaturesConfig, revisionDirectory: string) {
+export async function startFeaturesStack(config: FeaturesConfig, revisionDirectory: string, confirmed?: FeaturesConfig) {
   const origin = new URL(config.publicUrl);
   const certificate = config.tls ? await readFile(config.tls.cert_file) : undefined;
-  await compose(config, revisionDirectory, 'up', '-d', '--no-deps', 'caddy');
+  const confirmedMartin = new Set(Object.entries(config.providers ?? {}).filter(([id, provider]) =>
+    provider.type === 'martin' && managedProviderRuns(config, id) &&
+    JSON.stringify(confirmed?.providers?.[id]) === JSON.stringify(provider) &&
+    !providerConfigurationChanged(config, confirmed ?? null, id)).map(([id]) => id));
+  const optionalServices = [...confirmedMartin].map((id) => serviceName(config, id));
+  const requiredServices = stackServices(config).filter((service) => !optionalServices.includes(service));
+  await compose(config, revisionDirectory, 'up', '-d', '--no-deps',
+    ...(!requiredServices.length && !optionalServices.length ? ['--remove-orphans'] : []), 'caddy');
   if (!builtInProviderId(config)) await compose(config, revisionDirectory, 'rm', '-sf', 'pygeoapi');
-  await compose(config, revisionDirectory, 'up', '-d', '--remove-orphans',
-    '--wait', '--wait-timeout', '65', ...(config.auth || config.providers ? ['--build'] : []), ...stackServices(config));
+  if (optionalServices.length) {
+    await compose(config, revisionDirectory, 'up', '-d', '--no-deps', '--remove-orphans', ...optionalServices);
+  }
+  if (requiredServices.length) {
+    await compose(config, revisionDirectory, 'up', '-d', '--remove-orphans',
+      '--wait', '--wait-timeout', '65', ...(config.auth || config.providers ? ['--build'] : []), ...requiredServices);
+  }
 
   const collections = publicationEntries(config).map(([id, publication]) => ({
     id, ...publication, url: publicationUrl(config, id, publication),
@@ -1124,17 +1212,28 @@ export async function startFeaturesStack(config: FeaturesConfig, revisionDirecto
     try {
       const gate = await probeCollection(origin, '/features/collections?f=json', certificate);
       if (gate.status !== 503 || gate.cacheControl !== 'no-store') throw new Error('The gateway is not closed.');
-      for (const { id, provider, protocol, access, url } of collections) {
-        const path = new URL(url).pathname + '?f=json';
+      for (const { id, provider, protocol, source, access, url } of collections) {
+        const mvt = protocol === 'mvt';
+        const path = new URL(url).pathname + (mvt ? '' : '?f=json');
+        if (confirmedMartin.has(provider)) {
+          if (access !== 'public') await internal(path, 401);
+          continue;
+        }
         let body = await internal(path, access === 'public' ? 200 : 401);
+        let tileJsonUrl = url;
         if (config.providers && access !== 'public') {
           const instance = config.providers[provider];
           const api = instance?.image ? instance.api : undefined;
           const base = api?.base_path === '/' ? '' : api?.base_path ?? '';
-          body = await internal(`${base}/collections/${id}?f=json`, 200,
-            `http://${serviceName(config, provider)}:${api?.port ?? 80}`);
+          const nativeOrigin = `http://${serviceName(config, provider)}:${api?.port ?? 80}`;
+          body = await internal(`${base}${mvt ? `/${id}` : `/collections/${id}?f=json`}`, 200, nativeOrigin);
+          tileJsonUrl = nativeOrigin + path;
         }
         if (body) {
+          if (mvt) {
+            checkTileJson(body, tileJsonUrl, id, postgisSource(config, source)!.id_field);
+            continue;
+          }
           const collection = JSON.parse(body) as { id?: string; links?: { rel: string; href: string }[] };
           const [relation, suffix] = protocol === 'maps' ? [mapRelation, 'map?f=png'] : ['items', 'items?f=json'];
           if (collection.id !== id || !collection.links?.some(({ rel, href }) =>
@@ -1146,6 +1245,7 @@ export async function startFeaturesStack(config: FeaturesConfig, revisionDirecto
       const roots = new Set(Object.keys(config.providers ?? {}).map((id) => providerRoot(config, id)));
       if (!roots.size) roots.add('/features');
       for (const root of roots) {
+        if (root === '/mvt') continue;
         const visible = publicationEntries(config).filter(([, { access, provider }]) =>
           access === 'public' && providerRoot(config, provider) === root);
         const api = checkOpenApi(await internal(`${root}/openapi?f=json`, 200), new URL(root, origin).href, visible);

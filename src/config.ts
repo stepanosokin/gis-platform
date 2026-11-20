@@ -8,22 +8,23 @@ import type { AdminPermission } from './admin-command.js';
 export interface Publication {
   source: string;
   provider: string;
-  protocol: 'features' | 'maps';
+  protocol: 'features' | 'maps' | 'mvt';
   access: 'public' | 'registered' | 'private';
   title: string;
   description: string;
   extent: [number, number, number, number];
   time_field?: string;
+  mvt_properties?: string[];
   crs?: string[];
   freshness?: { max_delay_seconds: number };
 }
 
-interface PygeoapiProvider {
-  type: 'pygeoapi';
+interface ProviderConnection {
   postgis?: { host: string; port?: number; database: string; user: string; password_file: string };
 }
 
-export interface ManagedProvider extends PygeoapiProvider {
+export interface ManagedProvider extends ProviderConnection {
+  type: 'pygeoapi' | 'martin';
   image: string;
   digest?: string;
   api: {
@@ -39,7 +40,7 @@ export interface ManagedProvider extends PygeoapiProvider {
   volumes?: Record<string, string>;
 }
 
-export type Provider = (PygeoapiProvider & { image?: undefined }) | ManagedProvider;
+export type Provider = (ProviderConnection & { type: 'pygeoapi'; image?: undefined }) | ManagedProvider;
 
 export interface PostgisSource {
   type: 'postgis';
@@ -64,7 +65,10 @@ interface PlatformConfig {
   providers: Record<string, Provider>;
   publications: Record<string, Publication>;
   auth?: AuthConfig;
+  cors?: CorsConfig;
 }
+
+interface CorsConfig { allowed_origins: string[] }
 
 interface SmtpConfig {
   host: string;
@@ -104,6 +108,7 @@ export type FeaturesConfig = {
   providers?: Record<string, Provider>;
   auth?: AuthConfig;
   tls?: TlsConfig;
+  cors?: CorsConfig;
 } & (
   { publicationId: string; publication: Publication; additionalPublications?: Record<string, Publication> } |
   { publicationId: null; sourceId: string; providerId: string }
@@ -170,6 +175,7 @@ export function usedFileSources(config: FeaturesConfig, provider?: string) {
 
 export function needsMetadataService(config: FeaturesConfig) {
   return config.providers !== undefined &&
+    (Object.keys(config.providers).length === 0 || Object.values(config.providers).some((provider) => provider.type === 'pygeoapi')) &&
     (!config.auth || publicationEntries(config).some(([, publication]) => publication.protocol === 'maps') ||
       publicationEntries(config).every(([, publication]) => publication.access === 'public'));
 }
@@ -183,8 +189,15 @@ export function providerRoot(config: FeaturesConfig, id: string) {
   return config.providers?.[id]?.image ? config.providers[id].api.public_root : '/features';
 }
 
+export function managedProviderRuns(config: FeaturesConfig, id: string) {
+  const provider = config.providers?.[id];
+  return Boolean(provider?.image && (provider.type !== 'martin' ||
+    publicationEntries(config).some(([, publication]) => publication.provider === id)));
+}
+
 export function publicationUrl(config: FeaturesConfig, id: string, publication: Publication) {
-  return new URL(`${providerRoot(config, publication.provider)}/collections/${id}`, config.publicUrl).href;
+  const root = providerRoot(config, publication.provider);
+  return new URL(`${root}${publication.protocol === 'mvt' ? '' : '/collections'}/${id}`, config.publicUrl).href;
 }
 
 export function imageReference(image: string) {
@@ -217,6 +230,7 @@ export function serializeFeaturesConfig(config: FeaturesConfig) {
     providers: config.providers ?? { [builtInProviderId(config)!]: { type: 'pygeoapi' } },
     publications: Object.fromEntries(publicationEntries(config)),
     auth: config.auth,
+    cors: config.cors,
   };
   return stringify(snapshot);
 }
@@ -242,6 +256,10 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   }
 
   const providers = Object.entries(config.providers);
+  const cors = config.cors;
+  if (cors?.allowed_origins.some((origin) => URL.parse(origin)?.origin !== origin)) {
+    throw new Error('CORS origins must be canonical HTTP(S) origins without a path.');
+  }
   const sources = Object.entries(config.sources);
   const geojsonSources = sources.filter((entry): entry is [string, Extract<Source, { type: 'geojson' }>] =>
     entry[1].type === 'geojson');
@@ -271,6 +289,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       provider.postgis.password_file = resolve(directory, provider.postgis.password_file);
       provider.postgis.port ??= 5432;
     }
+    if (provider.type === 'martin' && (!provider.image || !provider.postgis)) {
+      throw new Error(`Martin provider '${id}' requires an image, API and PostGIS connection.`);
+    }
     if (!provider.image && !Object.hasOwn(provider, 'image')) {
       roots.add('/features');
       continue;
@@ -279,6 +300,14 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     const { digest } = imageReference(provider.image);
     if (digest && provider.digest && digest !== provider.digest) throw new Error(`Provider '${id}' has conflicting digests.`);
     const { public_root: root } = provider.api;
+    if (provider.type === 'martin') {
+      if (provider.api.protocol !== 'mvt' || root !== '/mvt' || provider.api.readiness !== '/health' ||
+          provider.environment || provider.volumes) {
+        throw new Error(`Martin provider '${id}' requires protocol mvt, public_root /mvt and readiness /health.`);
+      }
+    } else if (provider.api.protocol === 'mvt' || root === '/mvt') {
+      throw new Error(`Provider '${id}': /mvt and protocol mvt require Martin.`);
+    }
     if (provider.api.protocol === 'maps' && (root !== '/maps' || provider.postgis)) {
       throw new Error(`Maps provider '${id}' requires public_root /maps and file sources.`);
     }
@@ -309,10 +338,11 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   if (new Set(providersAtMaps).size > 1) throw new Error("Providers at '/maps' must use the same protocol.");
 
   const entries = Object.entries(config.publications).map((
-    [id, { source, provider, protocol, access, title, description, extent, time_field, freshness, crs }],
+    [id, { source, provider, protocol, access, title, description, extent, time_field, freshness, crs, mvt_properties }],
   ): [string, Publication] => [id, {
     source, provider, protocol, access, title, description, extent,
     ...(time_field !== undefined && { time_field }), ...(freshness && { freshness }), ...(crs && { crs }),
+    ...(mvt_properties && { mvt_properties }),
   }]);
   const sourceTypes = new Map<string, 'file' | 'postgis'>();
   for (const [id, publication] of entries) {
@@ -328,6 +358,17 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Publication '${id}' uses a protocol unsupported by provider '${provider}'.`);
     }
     const sourceConfig = config.sources[source]!;
+    if (protocol === 'mvt') {
+      if (sourceConfig.type !== 'postgis' || publication.crs || time_field) {
+        throw new Error(`Publication '${id}': MVT requires PostGIS and uses Web Mercator without CRS or time overrides.`);
+      }
+      if (['catalog', 'config', 'font', 'health', 'help', 'index', 'manifest', 'metrics', 'refresh',
+        'reload', 'sprite', 'status'].includes(id)) {
+        throw new Error(`Publication '${id}': this ID is reserved by Martin.`);
+      }
+    } else if (publication.mvt_properties) {
+      throw new Error(`Publication '${id}': mvt_properties is only supported for MVT.`);
+    }
     const raster = sourceConfig.type === 'geotiff' || sourceConfig.type === 'cog';
     if (raster !== (protocol === 'maps')) {
       throw new Error(`Publication '${id}' has a source type unsupported by protocol '${protocol}'.`);
@@ -394,6 +435,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       ...(others.length > 0 && { additionalPublications: Object.fromEntries(others) }) }
       : { publicationId: null, sourceId, providerId }),
     ...(auth && { auth }),
+    ...(cors && { cors }),
     ...(tls && { tls: { cert_file: resolve(directory, tls.cert_file), key_file: resolve(directory, tls.key_file) } }),
   };
 }

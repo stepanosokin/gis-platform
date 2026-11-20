@@ -177,6 +177,21 @@ async function runMapsTests() {
   }
 }
 
+async function runMvtTests() {
+  run('build-mvt-cli', process.execPath, ['node_modules/typescript/bin/tsc']);
+  const name = `${project}-mvt`;
+  const filter = mode === '--mvt' && process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
+  try {
+    console.log(run('test-mvt', process.execPath, ['--test', ...filter, 'tests/mvt.test.mjs'], {
+      COMPOSE_PROJECT_NAME: name, GIS_STATE_DIR: join(results, 'mvt-state'),
+      GIS_TEST_PUBLIC_URL: `http://localhost:${await freePort()}`, GIS_TEST_CONFIG: join(results, 'mvt.yaml'),
+      GIS_TEST_MAILPIT: `http://localhost:${await freePort()}`,
+    }));
+  } finally {
+    removeTestVolumes(name);
+  }
+}
+
 function removeTestVolumes(projectName) {
   const output = run(`${projectName}-volumes`, 'docker', ['volume', 'ls', '-q',
     '--filter', `label=com.docker.compose.project=${projectName}`]);
@@ -285,6 +300,10 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
 }
 
 console.log(`Results: ${results}`);
+if (mode === '--mvt') {
+  await runMvtTests();
+  process.exit(0);
+}
 if (mode === '--maps') {
   await runMapsTests();
   process.exit(0);
@@ -325,6 +344,7 @@ if (!mode) {
   await runPostgisTests();
   await runFeaturesFilesTests();
   await runMapsTests();
+  await runMvtTests();
   await runAccessTests();
   const qgis = process.env.GIS_QGIS_MCP !== '0' &&
     (process.env.GIS_QGIS_MCP === '1' || await qgisPluginIsListening());

@@ -3,7 +3,7 @@ import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promis
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { builtInProviderId, hasGeoJson, needsMetadataService, postgisSource, publicationEntries, publicationUrl, providerRoot,
+import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataService, postgisSource, publicationEntries, publicationUrl, providerRoot,
   fileSource, serializeFeaturesConfig, usedFileSources, vectorFile, type FeaturesConfig, type Publication } from './config.js';
 import { pinProviderImages } from './provider-images.js';
 import { archiveLegacyOpenApi, closeGateway, compose, featuresStackRunning, openGateway, prepareFeaturesStack, providerConfigurationChanged,
@@ -204,7 +204,8 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   const next = new Map(publicationEntries(config));
   const fileChanged = changedSource || current?.sourcePath !== config.sourcePath;
   const platformChanged = current?.publicUrl !== config.publicUrl ||
-    JSON.stringify(current?.auth) !== JSON.stringify(config.auth) || JSON.stringify(current?.tls) !== JSON.stringify(config.tls);
+    JSON.stringify(current?.auth) !== JSON.stringify(config.auth) || JSON.stringify(current?.tls) !== JSON.stringify(config.tls) ||
+    JSON.stringify(current?.cors) !== JSON.stringify(config.cors);
   const outcomes = [...new Set([...previous.keys(), ...next.keys()])].map((id) => {
     const before = previous.get(id);
     const after = next.get(id);
@@ -245,7 +246,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     services: changed ? ['caddy', ...((builtIn || (current && builtInProviderId(current))) &&
       ((builtIn && dataChanged(builtIn)) || !currentPlan?.yaml ||
         providerConfigurationChanged(config, current)) ? ['pygeoapi'] : []),
-      ...[...restarted].filter((id) => config.providers?.[id]?.image || current?.providers?.[id]?.image)
+      ...[...restarted].filter((id) => managedProviderRuns(config, id) || (current && managedProviderRuns(current, id)))
         .map((id) => `provider-${id}`),
       ...(needsMetadataService(config) ? ['metadata'] : []),
       ...(config.auth || current?.auth ? ['access'] : []),
@@ -299,7 +300,7 @@ async function restoreStack(state: ActiveState, candidate: Plan, current: Plan |
       const previous = revision(current);
       if (!current.yaml) await prepareFeaturesStack(previous, { useArchivedOpenApi: true });
       await closeGateway(previous.directory);
-      await startFeaturesStack(current.config, previous.directory);
+      await startFeaturesStack(current.config, previous.directory, candidate.config);
       await openGateway(previous.directory);
     } else {
       await compose(candidate.config, directory, 'down', '--remove-orphans');
@@ -322,7 +323,7 @@ function affectedRoutes(candidate: FeaturesConfig, current: FeaturesConfig | nul
     config.publicUrl,
     `${config.publicUrl}/collections`,
     `${config.publicUrl}/openapi`,
-    ...[...new Set(Object.keys(config.providers ?? {}).map((id) => providerRoot(config, id)))].flatMap((root) =>
+    ...[...new Set(Object.keys(config.providers ?? {}).map((id) => providerRoot(config, id)))].filter((root) => root !== '/mvt').flatMap((root) =>
       ['', '/collections', '/openapi'].map((suffix) => new URL(root + suffix, config.publicUrl).href)),
     ...publicationEntries(config).map(([id, publication]) => publicationUrl(config, id, publication)),
     ...(config.auth ? ['/account', '/api/auth'].map((path) => new URL(path, config.publicUrl).href) : []),
@@ -360,7 +361,7 @@ async function resumeProviderOpen(state: ActiveState, candidate: Plan, previous:
   try {
     await checkProviderEdit(candidate);
     await closeGateway(directory);
-    await startFeaturesStack(config, directory);
+    await startFeaturesStack(config, directory, previous?.config);
     await finishOpen(state, candidate);
   } catch {
     const saved = await readFile(candidate.edit!.filename, 'utf8').catch(() => null);
@@ -436,7 +437,7 @@ async function finalizeRemoval(state: ActiveState, plan: Plan, current: Plan | n
     }
     if (resume) {
       await closeGateway(candidate.directory);
-      await startFeaturesStack(plan.config, candidate.directory);
+      await startFeaturesStack(plan.config, candidate.directory, current?.config);
     }
     await openGateway(candidate.directory);
     await writeJson(activeFile, settled({ ...state, planId: plan.planId, previousVersion: state.planId }, plan.planId, { code: 'OK' }));
@@ -455,7 +456,7 @@ async function finalizeRemoval(state: ActiveState, plan: Plan, current: Plan | n
   }
 }
 
-async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null) {
+async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null, { restart = false } = {}) {
   const candidate = revision(plan);
   const cleanup = await grantCleanup(plan, current);
   await writeJson(activeFile, { ...state, pendingPlanId: plan.planId, phase: 'preflight' });
@@ -483,7 +484,7 @@ async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null
   try {
     await closeGateway(candidate.directory);
     if (current) await secureGateway(revision(current), !current.yaml);
-    await startFeaturesStack(plan.config, candidate.directory);
+    await startFeaturesStack(plan.config, candidate.directory, restart ? undefined : current?.config);
     if (!cleanup) await openConfirmedVersion(pending, plan);
     else await writeJson(activeFile, { ...pending, phase: 'finalize' });
   } catch {
@@ -582,7 +583,7 @@ export async function applyPlan(planId: string) {
           (await fileContentChanges(liveFileHashes, current.planId)).size > 0);
       if (!sourceChangedAfterPlanning && !fileChangedAfterPlanning && plan.config.providers &&
           !await featuresStackRunning(current.config, revision(current).directory)) {
-        await activatePlan(state, plan, current);
+        await activatePlan(state, plan, current, { restart: true });
         return resultFor(await readActive(), plan);
       }
       const outcome = sourceChangedAfterPlanning || fileChangedAfterPlanning
