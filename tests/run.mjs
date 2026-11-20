@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:net';
+import { createConnection, createServer } from 'node:net';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -42,6 +42,20 @@ async function freePort() {
   const { port } = server.address();
   await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   return port;
+}
+
+async function qgisPluginIsListening() {
+  const port = Number(process.env.QGIS_MCP_PORT ?? 9876);
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: '127.0.0.1', port });
+    const finish = (listening) => {
+      socket.destroy();
+      resolve(listening);
+    };
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+    socket.setTimeout(500, () => finish(false));
+  });
 }
 
 function cli(name, args, environment = stackEnvironment) {
@@ -105,7 +119,7 @@ function makeAdminCertificates() {
   `]);
 }
 
-async function runAccessTests(suite = 'access') {
+async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = false } = {}) {
   run(`build-${suite}-cli`, process.execPath, ['node_modules/typescript/bin/tsc']);
   const accessProject = `${project}-${suite}`;
   const accessEnvironment = { COMPOSE_PROJECT_NAME: accessProject, GIS_STATE_DIR: join(results, `${suite}-state`) };
@@ -151,7 +165,7 @@ async function runAccessTests(suite = 'access') {
   try {
     assert.equal(cli(`apply-${suite}`, ['apply', plan.planId], accessEnvironment).code, 'OK');
     const filter = process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
-    console.log(run(`test-${suite}`, process.execPath, ['--test', ...filter, `tests/${suite}.test.mjs`], {
+    const environment = {
       ...accessEnvironment,
       GIS_TEST_PUBLIC_URL: `http://localhost:${port}`,
       GIS_TEST_MAILPIT: `http://localhost:${mailPort}`,
@@ -170,7 +184,11 @@ async function runAccessTests(suite = 'access') {
         GIS_TEST_CLI_IMAGE: image,
         GIS_TEST_RESULTS: results,
       }),
-    }));
+    };
+    if (qgis) console.log(run('test-qgis', process.execPath, ['--test', 'tests/qgis.test.mjs'], environment));
+    if (!desktopOnly) {
+      console.log(run(`test-${suite}`, process.execPath, ['--test', ...filter, `tests/${suite}.test.mjs`], environment));
+    }
   } finally {
     run(`${suite}-down`, 'docker', ['compose', '-p', accessProject, '-f', 'compose.yaml', '-f', 'compose.auth.yaml',
       '-f', 'compose.mailpit.yaml', 'down', '--remove-orphans', '--volumes']);
@@ -180,6 +198,10 @@ async function runAccessTests(suite = 'access') {
 console.log(`Results: ${results}`);
 if (mode === '--access') {
   await runAccessTests(mode.slice(2));
+  process.exit(0);
+}
+if (mode === '--qgis') {
+  await runAccessTests('private', { qgis: true, desktopOnly: true });
   process.exit(0);
 }
 run('build-test-image', 'docker', ['build', '-f', 'tests/Dockerfile', '-t', image, '.']);
@@ -196,5 +218,8 @@ if (mode !== '--smoke') {
 if (mode !== '--cli') await runHttpTests();
 if (!mode) {
   await runAccessTests();
-  await runAccessTests('private');
+  const qgis = process.env.GIS_QGIS_MCP !== '0' &&
+    (process.env.GIS_QGIS_MCP === '1' || await qgisPluginIsListening());
+  if (!qgis) console.log('QGIS desktop check skipped. Run npm test -- --qgis to require it.');
+  await runAccessTests('private', { qgis });
 }
