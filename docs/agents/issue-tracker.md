@@ -2,7 +2,7 @@
 
 Issues and specs live in GitHub Issues for `stepanosokin/gis-platform`.
 Use the `gh` CLI from this repository; infer the repo from `git remote -v`.
-If the sandbox proxy blocks `gh`, use the GitHub connector to read the issue and its comments.
+If the sandbox proxy blocks a `gh` read, use the GitHub connector. If a write is blocked by the proxy or the connector returns `403 Resource not accessible by integration`, retry with local `gh` using sandbox network permission.
 
 ## Conventions
 
@@ -24,7 +24,7 @@ When it says "fetch the relevant ticket", read the corresponding issue.
 ## Ticket acceptance and closure
 
 1. Before implementation, check that the environments and data required by the acceptance criteria are available. Surface any gap early. The selected test level determines the scope of new tests.
-2. After verification, update the issue checklist and record what ran and where. If the user agrees to change a criterion, record the revised criterion and any assumptions in the issue.
+2. After verification, update the issue checklist and record what ran and where. If a local substitute represents an external service, record what the local check proved and what remains for the target environment. If the user agrees to change a criterion, record the revised criterion and any assumptions in the issue.
 3. Close the issue when all agreed criteria are checked. Read back the issue state before reporting completion. If a criterion remains open, report it with the evidence still needed.
 
 ## Pull requests as a triage surface
