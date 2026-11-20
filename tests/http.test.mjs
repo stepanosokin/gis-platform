@@ -50,6 +50,19 @@ test('the public catalog and OpenAPI 3.0 use the external Features URL', async (
   assert.match(api.openapi, /^3\.0\./);
   assert.deepEqual(api.servers.map(({ url }) => url), [`${canonical}/features`]);
   assert.ok(api.paths['/collections/places/items']);
+
+  const html = new URL(details.links.find(({ rel, type }) => rel === 'items' && type === 'text/html').href);
+  assert.equal(html.origin, canonical);
+  const itemsPage = await get(html.pathname + html.search);
+  assert.equal(itemsPage.status, 200);
+  assert.match(itemsPage.headers.get('content-type'), /^text\/html/);
+  const stylesheet = /href="([^"]*\/static\/css\/default\.css)"/.exec(await itemsPage.text());
+  assert.ok(stylesheet);
+  const css = new URL(stylesheet[1], canonical);
+  assert.equal(css.origin, canonical);
+  const cssResponse = await get(css.pathname);
+  assert.equal(cssResponse.status, 200);
+  await cssResponse.body?.cancel();
 });
 
 test('the next page link returns the second page for the same publication', async () => {
@@ -59,12 +72,12 @@ test('the next page link returns the second page for the same publication', asyn
   assert.equal(next.origin, canonical);
   assert.equal(next.pathname, `${collection}/items`);
   const second = await getJson(next.pathname + next.search);
-  assert.deepEqual(second.features.map(({ id }) => id), ['east']);
+  assert.deepEqual(second.features.map(({ id }) => id), ['area/east']);
 });
 
 test('a feature is found by its ID and an absent feature returns 404', async () => {
-  const found = await getJson(`${collection}/items/east?f=json`);
-  assert.equal(found.id, 'east');
+  const found = await getJson(`${collection}/items/${encodeURIComponent('area/east')}?f=json`);
+  assert.equal(found.id, 'area/east');
   assert.equal(found.properties.name, 'East');
 
   const absent = await get(`${collection}/items/missing?f=json`);

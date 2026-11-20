@@ -22,6 +22,11 @@ interface Plan {
   config: FeaturesConfig;
 }
 
+interface ActiveState {
+  planId: string | null;
+  pendingPlanId?: string;
+}
+
 const stateDirectory = resolve(process.env.GIS_STATE_DIR ??
   fileURLToPath(new URL('../.gis-platform', import.meta.url)));
 const activeFile = join(stateDirectory, 'active.json');
@@ -42,12 +47,11 @@ async function writeJson(filename: string, value: unknown) {
   }
 }
 
-async function readActive() {
+async function readActive(): Promise<ActiveState> {
   try {
-    const { planId } = JSON.parse(await readFile(activeFile, 'utf8')) as { planId: string };
-    return planId;
+    return JSON.parse(await readFile(activeFile, 'utf8')) as ActiveState;
   } catch (error) {
-    if (missing(error)) return null;
+    if (missing(error)) return { planId: null };
     throw error;
   }
 }
@@ -69,7 +73,7 @@ function publicationUrl(config: FeaturesConfig) {
 }
 
 export async function createPlan(config: FeaturesConfig) {
-  const baseVersion = await readActive();
+  const { planId: baseVersion } = await readActive();
   const current = baseVersion ? (await readPlan(baseVersion)).config : null;
   const fingerprint = createHash('sha256').update(JSON.stringify({ baseVersion, config })).digest('hex');
   const planId = `plan-${fingerprint}`;
@@ -91,34 +95,40 @@ export async function createPlan(config: FeaturesConfig) {
   };
 }
 
+async function restoreStack(candidate: Plan, current: Plan | null) {
+  const directory = planDirectory(candidate.planId);
+  try {
+    if (current) {
+      await compose(candidate.config, directory, 'stop', 'caddy');
+      await startFeaturesStack(current.config, planDirectory(current.planId));
+    } else {
+      await compose(candidate.config, directory, 'down', '--volumes');
+    }
+    await writeJson(activeFile, { planId: current?.planId ?? null });
+  } catch (error) {
+    await compose(candidate.config, directory, 'stop', 'caddy').catch(() => {});
+    throw new CliError('RECOVERY_INCOMPLETE', 7, String(error), {
+      planId: candidate.planId,
+      currentVersion: current?.planId ?? null,
+    });
+  }
+}
+
 async function activatePlan(plan: Plan, current: Plan | null) {
   const directory = planDirectory(plan.planId);
-  const previousDirectory = current && planDirectory(current.planId);
   try {
     await prepareFeaturesStack(plan.config, directory);
+    await writeJson(activeFile, { planId: current?.planId ?? null, pendingPlanId: plan.planId });
   } catch (error) {
     throw new CliError('APPLY_FAILED', 6, String(error), { planId: plan.planId });
   }
 
   try {
-    if (current && previousDirectory) await compose(current.config, previousDirectory, 'stop', 'caddy');
+    if (current) await compose(current.config, planDirectory(current.planId), 'stop', 'caddy');
     await startFeaturesStack(plan.config, directory);
     await writeJson(activeFile, { planId: plan.planId });
   } catch (error) {
-    try {
-      if (current && previousDirectory) {
-        await compose(plan.config, directory, 'stop', 'caddy');
-        await startFeaturesStack(current.config, previousDirectory);
-      } else {
-        await compose(plan.config, directory, 'down', '--volumes');
-      }
-    } catch (recoveryError) {
-      await compose(plan.config, directory, 'stop', 'caddy').catch(() => {});
-      throw new CliError('RECOVERY_INCOMPLETE', 7, `${error}\nRecovery: ${recoveryError}`, {
-        planId: plan.planId,
-        currentVersion: current?.planId ?? null,
-      });
-    }
+    await restoreStack(plan, current);
     throw new CliError('APPLY_FAILED', 6, String(error), { planId: plan.planId });
   }
 }
@@ -136,7 +146,9 @@ export async function applyPlan(planId: string) {
   }
 
   try {
-    const active = await readActive();
+    const { planId: active, pendingPlanId } = await readActive();
+    const current = active ? await readPlan(active) : null;
+    if (pendingPlanId) await restoreStack(await readPlan(pendingPlanId), current);
     const data = { planId, currentVersion: active, url: publicationUrl(plan.config) };
     if (active === planId) return { code: 'NO_CHANGE', data };
     if (plan.baseVersion !== active) {
@@ -144,7 +156,6 @@ export async function applyPlan(planId: string) {
         planId, baseVersion: plan.baseVersion, currentVersion: active,
       });
     }
-    const current = active ? await readPlan(active) : null;
     if (current && JSON.stringify(current.config) === JSON.stringify(plan.config)) {
       return { code: 'NO_CHANGE', data };
     }

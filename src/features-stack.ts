@@ -19,6 +19,10 @@ function pygeoapiConfig(config: FeaturesConfig) {
       encoding: 'utf-8',
       languages: ['en-US'],
       limits: { default_items: 20, max_items: 100 },
+      map: {
+        url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
+      },
       admin: false,
     },
     logging: { level: 'INFO' },
@@ -58,7 +62,7 @@ function caddyConfig(publicationId: string) {
 :80 {
 	@features {
 		method GET HEAD
-		path_regexp ^/features(/?|/(openapi|conformance|collections(/${publicationId}(/(schema|queryables|items(/[^/]+)?))?)?))$
+		path_regexp ^/features(/?|/(openapi|conformance|static/.+|collections(/${publicationId}(/(schema|queryables|items(/.+)?))?)?))$
 	}
 	handle @features {
 		uri strip_prefix /features

@@ -36,7 +36,7 @@ export async function readFeaturesConfig(filename: string): Promise<FeaturesConf
   const document = parseDocument(await readFile(filename, 'utf8'));
   if (document.errors.length) throw new Error(document.errors[0]?.message);
 
-  const config: unknown = document.toJS({ maxAliasCount: 0 });
+  const config: unknown = document.toJS();
   if (!validate(config)) {
     const errors = (validate.errors ?? []).map(({ instancePath, message, params }) => {
       const field = params.additionalProperty ?? params.missingProperty;
@@ -45,16 +45,23 @@ export async function readFeaturesConfig(filename: string): Promise<FeaturesConf
     throw new Error(errors.join('; '));
   }
 
-  const [[publicationId, publication]] = Object.entries(config.publications) as [[string, Publication]];
-  const source = Object.hasOwn(config.sources, publication.source) && config.sources[publication.source];
-  if (!source) throw new Error(`Publication '${publicationId}' references unknown source '${publication.source}'.`);
-  if (!Object.hasOwn(config.providers, publication.provider)) {
-    throw new Error(`Publication '${publicationId}' references unknown provider '${publication.provider}'.`);
+  const entry = Object.entries(config.publications)[0];
+  if (!entry) throw new Error('Expected one publication.');
+  const [publicationId, { source, provider, protocol, access, title, description, extent }] = entry;
+  const sourceConfig = Object.hasOwn(config.sources, source) && config.sources[source];
+  if (!sourceConfig) throw new Error(`Publication '${publicationId}' references unknown source '${source}'.`);
+  if (!Object.hasOwn(config.providers, provider)) {
+    throw new Error(`Publication '${publicationId}' references unknown provider '${provider}'.`);
   }
-  const [west, south, east, north] = publication.extent;
+  const [west, south, east, north] = extent;
   if (west > east || south > north) throw new Error(`Publication '${publicationId}' has an invalid extent.`);
 
   const { host, port } = config.server;
-  const publicUrl = new URL(`/features`, `http://${host}:${port}`).href;
-  return { port, publicUrl, sourcePath: resolve(dirname(filename), source.path), publicationId, publication };
+  return {
+    port,
+    publicUrl: new URL('/features', `http://${host}:${port}`).href,
+    sourcePath: resolve(dirname(filename), sourceConfig.path),
+    publicationId,
+    publication: { source, provider, protocol, access, title, description, extent },
+  };
 }
