@@ -299,21 +299,17 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
   }
 }
 
+const providerSuites = new Map([
+  ['--postgis', runPostgisTests],
+  ['--features-files', runFeaturesFilesTests],
+  ['--maps', runMapsTests],
+  ['--mvt', runMvtTests],
+]);
+
 console.log(`Results: ${results}`);
-if (mode === '--mvt') {
-  await runMvtTests();
-  process.exit(0);
-}
-if (mode === '--maps') {
-  await runMapsTests();
-  process.exit(0);
-}
-if (mode === '--features-files') {
-  await runFeaturesFilesTests();
-  process.exit(0);
-}
-if (mode === '--postgis') {
-  await runPostgisTests();
+const selectedProviderSuite = providerSuites.get(mode);
+if (selectedProviderSuite) {
+  await selectedProviderSuite();
   process.exit(0);
 }
 if (mode === '--access') {
@@ -341,10 +337,7 @@ if (mode !== '--smoke') {
 }
 if (mode !== '--cli') await runHttpTests();
 if (!mode) {
-  await runPostgisTests();
-  await runFeaturesFilesTests();
-  await runMapsTests();
-  await runMvtTests();
+  for (const runSuite of providerSuites.values()) await runSuite();
   await runAccessTests();
   const qgis = process.env.GIS_QGIS_MCP !== '0' &&
     (process.env.GIS_QGIS_MCP === '1' || await qgisPluginIsListening());
