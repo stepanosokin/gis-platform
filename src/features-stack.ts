@@ -5,7 +5,7 @@ import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { get as getHttp } from 'node:http';
 import { get as getHttps } from 'node:https';
 import { isIP } from 'node:net';
-import { basename, join } from 'node:path';
+import { basename, extname, join } from 'node:path';
 import { text } from 'node:stream/consumers';
 import { setTimeout } from 'node:timers/promises';
 import { checkServerIdentity, createSecureContext } from 'node:tls';
@@ -13,11 +13,13 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { parse } from 'yaml';
 import { builtInProviderId, hasGeoJson, needsPublicMetadata, pinnedImage, postgisSource, providerRoot, publicationEntries, publicationUrl,
-  type FeaturesConfig, type Publication } from './config.js';
+  crs84, usedVectorFiles, vectorFile, type FeaturesConfig, type Publication, type VectorFileSource } from './config.js';
 
 const run = promisify(execFile);
 const composeFile = (name: string) => fileURLToPath(new URL(`../${name}`, import.meta.url));
 const postgisPlugin = 'gis_postgis.PostGISProvider';
+const vectorFilePlugin = 'gis_vector_files.VectorFileProvider';
+const parquetImage = 'gis-platform-pygeoapi-parquet:0.24.0-arrow-23.0.1';
 let project: string | undefined;
 
 export async function resolveComposeProject() {
@@ -63,11 +65,11 @@ function pygeoapiConfig(config: FeaturesConfig, instance = builtInProviderId(con
       publication.provider === instance).map(([id, publication]) => [id, {
         type: 'collection',
         title: publication.title,
-        description: publication.description,
+        description: publicationDescription(config, publication),
         keywords: [],
         links: [],
         extents: {
-          spatial: { bbox: publication.extent, crs: 'http://www.opengis.net/def/crs/OGC/1.3/CRS84' },
+          spatial: { bbox: publication.extent, crs: crs84 },
           ...(publication.time_field && { temporal: { begin: null, end: null } }),
         },
         providers: [pygeoapiSource(config, publication)],
@@ -75,9 +77,23 @@ function pygeoapiConfig(config: FeaturesConfig, instance = builtInProviderId(con
   };
 }
 
+function publicationDescription(config: FeaturesConfig, publication: Publication) {
+  if (!vectorFile(config, publication.source)) return publication.description;
+  const datetime = publication.time_field ? 'datetime is supported.' : 'datetime is unavailable.';
+  return `${publication.description} Filters: bbox and attribute equality are supported. ${datetime} CQL2 is unavailable.`;
+}
+
 function pygeoapiSource(config: FeaturesConfig, publication: Publication) {
+  const file = vectorFile(config, publication.source);
+  if (file) return {
+    type: 'feature', name: vectorFilePlugin, id_field: file.id_field, time_field: publication.time_field,
+    crs: publication.crs,
+    ...(file.type !== 'geoparquet' && { layer: file.layer }),
+    data: { path: vectorFileMount(publication.source, basename(file.path)),
+      driver: { geopackage: 'GPKG', shapefile: 'ESRI Shapefile', geoparquet: 'Parquet' }[file.type] },
+  };
   const source = postgisSource(config, publication.source);
-  if (!source) return { type: 'feature', name: 'GeoJSON', data: '/source/data.geojson', id_field: 'id' };
+  if (!source) return { type: 'feature', name: 'GeoJSON', data: '/source/data.geojson', id_field: 'id', crs: publication.crs };
   const connection = config.providers?.[publication.provider]?.postgis;
   if (!connection) throw new Error('The PostGIS connection is missing.');
   const { host, port, database, user } = connection;
@@ -89,6 +105,7 @@ function pygeoapiSource(config: FeaturesConfig, publication: Publication) {
     id_field: source.id_field,
     geom_field: source.geometry_field,
     time_field: publication.time_field,
+    crs: publication.crs,
     options: { connect_timeout: 3, options: '-c default_transaction_read_only=on' },
   };
 }
@@ -97,6 +114,7 @@ export function providerConfigurationChanged(candidate: FeaturesConfig, previous
   id = builtInProviderId(candidate)) {
   return !previous || (id !== undefined && (
     ((hasGeoJson(candidate, id) || hasGeoJson(previous, id)) && candidate.sourcePath !== previous.sourcePath) ||
+    JSON.stringify(usedVectorFiles(candidate, id)) !== JSON.stringify(usedVectorFiles(previous, id)) ||
     candidate.providers?.[id]?.postgis?.password_file !== previous.providers?.[id]?.postgis?.password_file)) ||
     JSON.stringify(pygeoapiConfig(candidate, id)) !== JSON.stringify(pygeoapiConfig(previous, id));
 }
@@ -278,10 +296,11 @@ function managedGatewayRoutes(config: FeaturesConfig, collectionRoute: (ids: str
     const rootIndex = routes.length;
     const entries = publications.filter(([, publication]) => ids.includes(publication.provider));
     const metadata = config.auth ? 'access' : 'metadata';
+    const managedConformance = entries.some(([, publication]) => vectorFile(config, publication.source));
     routes.push(`
 	@metadata${rootIndex} {
 		method GET HEAD
-		path ${root}/collections ${root}/openapi
+		path ${root}/collections ${root}/openapi${managedConformance ? ` ${root}/conformance` : ''}
 	}
 	handle @metadata${rootIndex} {
 		route {${metadataFallback ? '\n			vars public_metadata true' : ''}
@@ -311,7 +330,7 @@ function managedGatewayRoutes(config: FeaturesConfig, collectionRoute: (ids: str
         routes.push(`
 	@root${rootIndex} {
 		method GET HEAD
-		path ${root} ${root}/ ${root}/conformance ${root}/static/*
+		path ${root} ${root}/ ${root}/static/*${managedConformance ? '' : ` ${root}/conformance`}
 	}
 	handle @root${rootIndex} {
 		route {
@@ -372,6 +391,8 @@ interface Revision {
   directory: string;
 }
 
+export class FeaturesPreflightError extends Error {}
+
 export async function sourceFingerprint(path: string) {
   const hash = createHash('sha256');
   try {
@@ -380,6 +401,39 @@ export async function sourceFingerprint(path: string) {
   } catch {
     return null;
   }
+}
+
+function vectorFileMount(id: string, filename: string) {
+  return `/source/${id}/${filename}`;
+}
+
+function vectorFileParts(id: string, source: VectorFileSource) {
+  const extension = extname(source.path);
+  const base = source.path.slice(0, -extension.length);
+  const extensions = source.type === 'shapefile' ? ['.shp', '.dbf', '.shx', '.prj', '.cpg'] : [extension];
+  return extensions.map((suffix) => ({
+    path: base + suffix, target: vectorFileMount(id, basename(base) + suffix), optional: suffix === '.cpg',
+  }));
+}
+
+type SourceMount = { type: 'bind'; source: string; target: string; read_only: true; bind: { create_host_path: false } };
+
+export async function vectorFileFingerprints(config: FeaturesConfig) {
+  const entries = await Promise.all(usedVectorFiles(config).map(async ([id, source]) => {
+    const parts = await Promise.all(vectorFileParts(id, source).map(async ({ path, optional }) =>
+      ({ path, optional, hash: await sourceFingerprint(path) })));
+    const hash = parts.every((part) => part.hash || part.optional)
+      ? createHash('sha256').update(JSON.stringify(parts)).digest('hex') : null;
+    return [id, hash] as const;
+  }));
+  return Object.fromEntries(entries);
+}
+
+export async function savedVectorFileFingerprints(directory: string): Promise<Record<string, string | null>> {
+  return readFile(join(directory, 'vector-files.json'), 'utf8').then(JSON.parse).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') throw error;
+    return {};
+  });
 }
 
 export async function savedSourceFingerprint(directory: string) {
@@ -397,7 +451,8 @@ export async function archiveLegacyOpenApi({ config, directory }: Revision) {
 }
 
 export async function prepareFeaturesStack({ config, directory: revisionDirectory }: Revision,
-  options: { previous?: Revision; sourceHash?: string | null; useArchivedOpenApi?: boolean } = {}) {
+  options: { previous?: Revision; sourceHash?: string | null; vectorHashes?: Record<string, string | null>;
+    useArchivedOpenApi?: boolean } = {}) {
   const { previous, useArchivedOpenApi } = options;
   await mkdir(revisionDirectory, { recursive: true, mode: 0o700 });
   await rm(join(revisionDirectory, 'provider-directory'), { force: true });
@@ -408,6 +463,27 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
   if ((options.sourceHash && sourceHash && sourceHash !== options.sourceHash) ||
       (options.sourceHash === null && sameSource && sourceHash && previousHash && sourceHash !== previousHash)) {
     throw new Error('The GeoJSON source changed after planning.');
+  }
+  const vectorHashes = await vectorFileFingerprints(config);
+  const previousVectorHashes = previous ? await savedVectorFileFingerprints(previous.directory) : {};
+  const offlineFiles = new Set<string>();
+  for (const [id, hash] of Object.entries(vectorHashes)) {
+    const expected = options.vectorHashes?.[id];
+    if (!hash) {
+      const unchanged = previous && expected === null && Object.hasOwn(previousVectorHashes, id) &&
+        publicationEntries(config).filter(([, publication]) => publication.source === id).every(([, { provider }]) =>
+          !providerConfigurationChanged(config, previous.config, provider) &&
+          usedVectorFiles(config, provider).every(([key]) => Object.hasOwn(previousVectorHashes, key) &&
+            (vectorHashes[key] === previousVectorHashes[key] || options.vectorHashes?.[key] === null && !vectorHashes[key])));
+      if (!unchanged) throw new FeaturesPreflightError(`Vector file source '${id}' or its sidecar is unavailable.`);
+      offlineFiles.add(id);
+    } else if (options.vectorHashes && hash !== (expected ?? previousVectorHashes[id])) {
+      throw new FeaturesPreflightError(`Vector file source '${id}' changed after planning. Create a new plan.`);
+    }
+  }
+  for (const id of offlineFiles) vectorHashes[id] = previousVectorHashes[id]!;
+  if (Object.keys(vectorHashes).length) {
+    await writeFile(join(revisionDirectory, 'vector-files.json'), JSON.stringify(vectorHashes));
   }
   if (config.tls) {
     const cert = new X509Certificate(await readFile(config.tls.cert_file));
@@ -462,8 +538,14 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
   await writeFile(join(revisionDirectory, 'Caddyfile'), caddyConfig(config));
   if (config.providers) {
     await reuseManagedArtifacts(config, revisionDirectory, previous,
-      sameSource && (!sourceHash || sourceHash === previousHash) && (!options.sourceHash || options.sourceHash === previousHash));
-    await writeProviderCompose(config, revisionDirectory);
+      sameSource && (!sourceHash || sourceHash === previousHash) && (!options.sourceHash || options.sourceHash === previousHash),
+      vectorHashes, previousVectorHashes);
+    const archived = offlineFiles.size && previous
+      ? JSON.parse(await readFile(join(previous.directory, 'compose.providers.json'), 'utf8')) as {
+        services: Record<string, { volumes?: SourceMount[] }>;
+      }
+      : undefined;
+    await writeProviderCompose(config, revisionDirectory, offlineFiles, archived?.services);
   }
   await compose(config, revisionDirectory, 'config', '--quiet');
   await compose(config, revisionDirectory, 'run', '--rm', '--no-deps', '-T', '--entrypoint', 'caddy', 'caddy',
@@ -506,7 +588,8 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
   if (sourceHash) await writeFile(join(revisionDirectory, 'source.sha256'), sourceHash);
 }
 
-async function writeProviderCompose(config: FeaturesConfig, directory: string) {
+async function writeProviderCompose(config: FeaturesConfig, directory: string,
+  offlineFiles: Set<string>, priorServices?: Record<string, { volumes?: SourceMount[] }>) {
   const services: Record<string, unknown> = {};
   const volumes: Record<string, object> = {};
   const secrets: Record<string, { file: string }> = {};
@@ -523,19 +606,41 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string) {
     const secret = `postgis-${id}`;
     const passwordFile = provider.postgis?.password_file;
     const connection = passwordFile && publicationEntries(config).some(([, publication]) =>
-      publication.provider === id && postgisSource(config, publication.source)) ? {
-        environment: { PYTHONPATH: '/etc/pygeoapi/gis' + (provider.image && provider.environment?.PYTHONPATH
-            ? `:${escapeCompose(provider.environment.PYTHONPATH)}` : '') },
-        secrets: [{ source: secret, target: 'postgis_password' }],
-      } : undefined;
+      publication.provider === id && postgisSource(config, publication.source))
+      ? [{ source: secret, target: 'postgis_password' }] : undefined;
     const native = service === 'pygeoapi' ? directory : join(directory, service);
     await mkdir(native, { recursive: true });
+    const files = usedVectorFiles(config, id);
+    const fileMounts = (await Promise.all(files.map(async ([key, file]) => {
+      if (offlineFiles.has(key)) {
+        return priorServices?.[service]?.volumes?.filter(({ target }) => target.startsWith(`/source/${key}/`)) ?? [];
+      }
+      const parts = vectorFileParts(key, file);
+      return (await Promise.all(parts.map(async ({ path, target, optional }): Promise<SourceMount[]> => {
+        if (optional && !await sourceFingerprint(path)) return [];
+        return [{ type: 'bind', source: escapeCompose(path), target: escapeCompose(target), read_only: true,
+          bind: { create_host_path: false } }];
+      }))).flat();
+    }))).flat();
+    const pluginEnvironment = connection || files.length ? {
+      PYTHONPATH: '/etc/pygeoapi/gis' + (provider.image && provider.environment?.PYTHONPATH
+        ? `:${escapeCompose(provider.environment.PYTHONPATH)}` : ''),
+    } : undefined;
+    if (files.length) {
+      await copyFile(fileURLToPath(new URL('../src/gis_vector_files.py', import.meta.url)), join(native, 'gis_vector_files.py'));
+    }
     if (connection) {
       secrets[secret] = { file: escapeCompose(passwordFile!) };
       await copyFile(fileURLToPath(new URL('../src/gis_postgis.py', import.meta.url)), join(native, 'gis_postgis.py'));
     }
     if (!provider.image) {
-      if (connection) services[service] = connection;
+      if (connection || files.length) services[service] = {
+        environment: pluginEnvironment, volumes: fileMounts, secrets: connection,
+        ...(files.some(([, file]) => file.type === 'geoparquet') && {
+          image: parquetImage,
+          build: { context: '.', dockerfile: 'Dockerfile.pygeoapi' },
+        }),
+      };
       continue;
     }
     const { port, scheme, base_path: base, readiness } = provider.api;
@@ -552,7 +657,7 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string) {
         ...Object.fromEntries(Object.entries(provider.environment ?? {}).map(([name, value]) => [name, escapeCompose(value)])),
         PYGEOAPI_CONFIG: '/etc/pygeoapi/gis/pygeoapi.yml',
         PYGEOAPI_OPENAPI: '/etc/pygeoapi/gis/openapi.json',
-        ...connection?.environment,
+        ...pluginEnvironment,
         ...(base !== '/' && { SCRIPT_NAME: base }),
       },
       entrypoint: ['/venv/bin/gunicorn'],
@@ -565,8 +670,9 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string) {
           ? [{ type: 'bind', source: '${GIS_SOURCE_FILE}', target: '/source/data.geojson', read_only: true,
             bind: { create_host_path: false } }] : []),
         ...namedVolumes,
+        ...fileMounts,
       ],
-      ...(connection && { secrets: connection.secrets }),
+      ...(connection && { secrets: connection }),
       healthcheck: {
         test: ['CMD', '/venv/bin/python', '-c',
           `from urllib.request import urlopen; urlopen('${scheme}://127.0.0.1:${port}${base === '/' ? '' : base}${readiness}', timeout=2).read()`],
@@ -578,34 +684,52 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string) {
 }
 
 const checkGeoJson = `/venv/bin/python -c "from pygeoapi.provider.geojson import GeoJSONProvider; GeoJSONProvider({'name': 'GeoJSON', 'type': 'feature', 'data': '/source/data.geojson', 'id_field': 'id'}).query(limit=1)" >/dev/null`;
-const checkPostgis = `/venv/bin/python - <<'PY'
+const checkSourcePlugins = `/venv/bin/python - <<'PY'
 import json
 import os
+import sys
+from pygeoapi.crs import DEFAULT_CRS, get_crs
 from pygeoapi.plugin import load_plugin
+from pyproj import Transformer
+from pyproj.exceptions import ProjError
 
 with open(os.environ['PYGEOAPI_CONFIG']) as config:
     resources = json.load(config)['resources']
-for resource in resources.values():
+for identifier, resource in resources.items():
     definition = resource['providers'][0]
-    if definition['name'] != '${postgisPlugin}':
-        continue
-    provider = load_plugin('provider', definition)
-    if provider.time_field:
-        time_field = provider.fields.get(provider.time_field, {})
-        if time_field.get('format') != 'date-time':
-            raise ValueError('PostGIS time_field must reference a timestamp column.')
-    provider.query(limit=1, bbox=resource['extents']['spatial']['bbox'])
+    for index, uri in enumerate(definition.get('crs', [])):
+        try:
+            source = get_crs(DEFAULT_CRS)
+            target = get_crs(uri)
+            if len(target.axis_info) != 2 or not (target.is_geographic or target.is_projected):
+                raise ValueError("Expected a two-dimensional geographic or projected CRS.")
+            west, south, east, north = resource['extents']['spatial']['bbox']
+            center = ((west + east) / 2, (south + north) / 2)
+            projected = Transformer.from_crs(source, target).transform(*center, errcheck=True)
+            Transformer.from_crs(target, source).transform(*projected, errcheck=True)
+        except (ValueError, ProjError):
+            sys.exit(f"GIS_UNSUPPORTED_CRS {identifier} {index}")
+    if definition['name'] == '${vectorFilePlugin}':
+        load_plugin('provider', definition).validate_source()
+    if definition['name'] == '${postgisPlugin}':
+        provider = load_plugin('provider', definition)
+        if provider.time_field:
+            time_field = provider.fields.get(provider.time_field, {})
+            if time_field.get('format') != 'date-time':
+                raise ValueError('PostGIS time_field must reference a timestamp column.')
+        provider.query(limit=1, bbox=resource['extents']['spatial']['bbox'])
 PY`;
 const generateOpenApi = '/venv/bin/pygeoapi openapi generate "$PYGEOAPI_CONFIG" -f json -of /tmp/openapi.json >/dev/null';
 
 async function reuseManagedArtifacts(config: FeaturesConfig, directory: string, previous: Revision | undefined,
-  sameSourceContent: boolean) {
+  sameSourceContent: boolean, vectorHashes: Record<string, string | null>, previousVectorHashes: Record<string, string | null>) {
   for (const [id, provider] of Object.entries(config.providers ?? {})) {
     const service = serviceName(config, id);
     const draft = service === 'pygeoapi' ? directory : join(directory, service);
     await mkdir(draft, { recursive: true });
     await rm(join(draft, 'provider-directory'), { force: true });
     if (!previous || (hasGeoJson(config, id) && !sameSourceContent) ||
+        usedVectorFiles(config, id).some(([key]) => vectorHashes[key] !== previousVectorHashes[key]) ||
         providerConfigurationChanged(config, previous.config, id)) continue;
     const prior = previous.config.providers?.[id];
     const exists = provider.image ? prior?.image && JSON.stringify(prior) === JSON.stringify(provider)
@@ -626,7 +750,8 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
     const root = providerRoot(config, id);
     const url = new URL(root, config.publicUrl).href;
     const service = serviceName(config, id);
-    const collectionIds = entries.filter(([, pub]) => pub.provider === id).map(([key]) => key);
+    const publications = entries.filter(([, pub]) => pub.provider === id);
+    const collectionIds = publications.map(([key]) => key);
     const native = service === 'pygeoapi' ? directory : join(directory, service);
     const mounted = await nativeProviderDirectory(directory, service);
     let api: FeaturesOpenApi;
@@ -635,20 +760,41 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
     } else {
       const geojson = hasGeoJson(config, id);
       if (geojson && !sourceHash) throw new Error('The GeoJSON source is unavailable.');
-      const postgis = entries.some(([, publication]) =>
-        publication.provider === id && postgisSource(config, publication.source));
+      const checkPlugins = publications.some(([, publication]) => publication.crs ||
+        postgisSource(config, publication.source) || vectorFile(config, publication.source));
+      if (!config.providers?.[id]?.image && usedVectorFiles(config, id).some(([, file]) => file.type === 'geoparquet')) {
+        await compose(config, directory, 'build', service);
+      }
       const output = await compose(config, directory, 'run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', service,
-        '-ec', [...(geojson ? [checkGeoJson] : []), ...(postgis ? [checkPostgis] : []),
-          generateOpenApi, 'cat /tmp/openapi.json'].join('\n'));
+        '-ec', [...(geojson ? [checkGeoJson] : []), ...(checkPlugins ? [checkSourcePlugins] : []),
+          generateOpenApi, 'cat /tmp/openapi.json'].join('\n')).catch((error: unknown) => {
+        if (error instanceof Error && 'stderr' in error && typeof error.stderr === 'string') {
+          const failure = /^GIS_UNSUPPORTED_CRS ([a-z][a-z0-9-]*) (\d+)\r?$/m.exec(error.stderr);
+          const publication = failure && publications.find(([key]) => key === failure[1]);
+          const crs = publication && publication[1].crs?.[Number(failure[2])];
+          if (crs) throw new FeaturesPreflightError(`Publication '${publication[0]}': CRS ${crs} is unsupported by provider '${id}'.`);
+        }
+        throw error;
+      });
       api = checkOpenApi(output, url, collectionIds);
     }
     await writeFile(join(native, 'openapi.json'), JSON.stringify(api));
-    for (const [publicationId, publication] of entries.filter(([, publication]) => publication.provider === id)) {
+    for (const [publicationId, publication] of publications) {
       const collection = `/collections/${publicationId}`;
       const items = api.paths?.[`${collection}/items`];
       if (!items) continue;
       if (!postgisSource(config, publication.source)) {
         delete items.post;
+        if (vectorFile(config, publication.source) && items.get) {
+          items.get.parameters = items.get.parameters?.flatMap((parameter) => {
+            const name = parameter.name ?? parameter.$ref?.split('/').at(-1);
+            if (name === 'sortby') return [];
+            if (name !== 'bbox') return [parameter];
+            const bbox = parameter.$ref ? api.components?.parameters?.bbox : parameter;
+            return bbox ? [{ ...bbox, description: 'Four coordinates in the axis order of bbox-crs.',
+              schema: { ...bbox.schema, minItems: 4, maxItems: 4 } }] : [parameter];
+          });
+        }
         continue;
       }
       items.get?.parameters?.push(
@@ -685,11 +831,13 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
     } };
   }
   const roots = Object.fromEntries(Object.entries(documents).map(([root, { url, api }]) => [
-    root, { url, api, collections: entries.filter(([, publication]) => providerRoot(config, publication.provider) === root)
-      .map(([id, { title, description, extent, time_field }]) => ({
-        id, title, description, extent: {
-          spatial: { bbox: [extent], crs: 'http://www.opengis.net/def/crs/OGC/1.3/CRS84' },
-          ...(time_field && { temporal: { interval: [[null, null]] } }),
+    root, { url, api, conformsTo: fileConformance(config, root),
+      collections: entries.filter(([, publication]) => providerRoot(config, publication.provider) === root)
+      .map(([id, publication]) => ({
+        id, title: publication.title, description: publicationDescription(config, publication),
+        crs: publication.crs ?? [crs84], storageCrs: crs84, extent: {
+          spatial: { bbox: [publication.extent], crs: crs84 },
+          ...(publication.time_field && { temporal: { interval: [[null, null]] } }),
         },
         links: ['json', 'html', 'jsonld'].map((format) => ({
           rel: 'self', href: `${url}/collections/${id}?f=${format}`,
@@ -699,6 +847,19 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
   ]));
   await writeFile(join(directory, 'features.json'), JSON.stringify(roots));
   if (savedHash) await writeFile(join(directory, 'source.sha256'), savedHash);
+}
+
+function fileConformance(config: FeaturesConfig, root: string) {
+  const publications = publicationEntries(config).filter(([, publication]) => providerRoot(config, publication.provider) === root);
+  if (!publications.some(([, publication]) => vectorFile(config, publication.source))) return undefined;
+  const base = 'http://www.opengis.net/spec';
+  const features = ['core', 'oas30', 'html', 'geojson'].map((name) => `${base}/ogcapi-features-1/1.0/conf/${name}`);
+  features.push(`${base}/ogcapi-features-2/1.0/conf/crs`,
+    `${base}/ogcapi-features-3/1.0/conf/queryables`, `${base}/ogcapi-features-3/1.0/conf/queryables-query-parameters`);
+  if (publications.some(([, publication]) => postgisSource(config, publication.source))) {
+    features.push(`${base}/cql2/1.0/conf/basic-cql2`, `${base}/cql2/1.0/conf/cql2-text`, `${base}/cql2/1.0/conf/cql2-json`);
+  }
+  return features;
 }
 
 async function nativeProviderDirectory(directory: string, service = 'pygeoapi') {
@@ -711,7 +872,7 @@ async function nativeProviderDirectory(directory: string, service = 'pygeoapi') 
 export async function compose(config: FeaturesConfig, revisionDirectory: string, ...args: string[]) {
   const files = [composeFile('compose.yaml')];
   const builtIn = builtInProviderId(config);
-  if (config.publicationId === null || (config.postgisSources && (!builtIn || !hasGeoJson(config, builtIn)))) {
+  if (config.publicationId === null || (config.providers && (!builtIn || !hasGeoJson(config, builtIn)))) {
     files.push(composeFile('compose.empty.yaml'));
   }
   if (config.tls) files.push(composeFile('compose.tls.yaml'));
@@ -772,12 +933,20 @@ interface FeaturesOpenApi {
   paths?: Record<string, { get?: FeaturesOperation; post?: FeaturesOperation }>;
   tags?: { name: string }[];
   info?: { title: string; version: string };
-  components?: object;
+  components?: { parameters?: Record<string, FeaturesParameter> };
+}
+
+interface FeaturesParameter {
+  $ref?: string;
+  name?: string;
+  in?: string;
+  description?: string;
+  schema?: Record<string, unknown>;
 }
 
 interface FeaturesOperation {
   description?: string;
-  parameters?: unknown[];
+  parameters?: FeaturesParameter[];
   responses: Record<string, unknown>;
 }
 

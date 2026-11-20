@@ -128,6 +128,27 @@ async function runPostgisTests() {
   }));
 }
 
+async function runFeaturesFilesTests() {
+  run('build-files-cli', process.execPath, ['node_modules/typescript/bin/tsc']);
+  const parquetImage = 'gis-platform-pygeoapi-parquet:0.24.0-arrow-23.0.1';
+  run('build-parquet-image', 'docker', ['build', '-f', 'Dockerfile.pygeoapi', '-t', parquetImage, '.']);
+  run('create-feature-files', 'docker', ['run', '--rm', ...containerUser, ...resultsMount,
+    '--mount', `type=bind,src=${join(root, 'tests/features-files-fixtures.py')},dst=/fixtures.py,readonly`,
+    '--entrypoint', '/venv/bin/python', parquetImage, '/fixtures.py']);
+  const port = await freePort();
+  const name = `${project}-files`;
+  const filter = mode === '--features-files' && process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
+  try {
+    console.log(run('test-features-files', process.execPath, ['--test', ...filter, 'tests/features-files.test.mjs'], {
+      COMPOSE_PROJECT_NAME: name, GIS_STATE_DIR: join(results, 'files-state'),
+      GIS_TEST_PUBLIC_URL: `http://localhost:${port}`, GIS_TEST_CONFIG: join(results, 'files.yaml'),
+    }));
+  } finally {
+    run('features-files-down', 'docker', ['compose', '-p', name, 'down', '--remove-orphans', '--volumes']);
+    removeTestVolumes(name);
+  }
+}
+
 function removeTestVolumes(projectName) {
   const output = run(`${projectName}-volumes`, 'docker', ['volume', 'ls', '-q',
     '--filter', `label=com.docker.compose.project=${projectName}`]);
@@ -236,6 +257,10 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
 }
 
 console.log(`Results: ${results}`);
+if (mode === '--features-files') {
+  await runFeaturesFilesTests();
+  process.exit(0);
+}
 if (mode === '--postgis') {
   await runPostgisTests();
   process.exit(0);
@@ -266,6 +291,7 @@ if (mode !== '--smoke') {
 if (mode !== '--cli') await runHttpTests();
 if (!mode) {
   await runPostgisTests();
+  await runFeaturesFilesTests();
   await runAccessTests();
   const qgis = process.env.GIS_QGIS_MCP !== '0' &&
     (process.env.GIS_QGIS_MCP === '1' || await qgisPluginIsListening());

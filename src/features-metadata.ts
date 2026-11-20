@@ -17,6 +17,7 @@ interface ManagedMetadata {
   url: string;
   api: OpenApi;
   collections: Catalog['collections'];
+  conformsTo?: string[];
 }
 
 export async function readManagedMetadata() {
@@ -122,6 +123,15 @@ export function mountFeaturesMetadata(app: Express, modes: Record<string, Public
 function mountRoot(app: Express, modes: Record<string, Publication['access']>, cookieName: string,
   readReader: (req: Request, res: Response) => Promise<PublicationReader | null>, root: string, metadata?: ManagedMetadata) {
   const publications = new Map(Object.entries(modes));
+  const conformsTo = metadata?.conformsTo;
+  if (conformsTo) app.get(`${root}/conformance`, (req, res) => {
+    const representation = requestedFormat(req, ['json', 'html']);
+    if (!representation) return res.status(400).json({ code: 'InvalidParameterValue', description: 'Invalid format.' });
+    res.vary('Accept');
+    if (representation === 'html') return res.send(page('Features conformance',
+      `<ul>${conformsTo.map((uri) => `<li>${escapeHtml(uri)}</li>`).join('')}</ul>`));
+    res.json({ conformsTo });
+  });
   app.use([`${root}/openapi`, `${root}/collections`], (_req, res, next) => {
     res.vary('Cookie').vary('Authorization').vary('Accept');
     next();

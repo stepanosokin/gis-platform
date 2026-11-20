@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, extname, resolve } from 'node:path';
 import { Ajv } from 'ajv';
 import { parseDocument, stringify } from 'yaml';
 import schema from './platform.schema.json' with { type: 'json' };
@@ -14,6 +14,7 @@ export interface Publication {
   description: string;
   extent: [number, number, number, number];
   time_field?: string;
+  crs?: string[];
   freshness?: { max_delay_seconds: number };
 }
 
@@ -49,7 +50,10 @@ export interface PostgisSource {
   max_lag_seconds: number;
 }
 
-type Source = { type: 'geojson'; path: string } | PostgisSource;
+export type VectorFileSource =
+  ({ type: 'geopackage' | 'shapefile'; layer: string } | { type: 'geoparquet'; layer?: never }) &
+  { path: string; id_field: string };
+type Source = { type: 'geojson'; path: string } | VectorFileSource | PostgisSource;
 
 interface PlatformConfig {
   schema_version: 1;
@@ -92,6 +96,7 @@ export type FeaturesConfig = {
   publicUrl: string;
   sourcePath: string;
   geojsonSourceId?: string;
+  vectorFiles?: Record<string, VectorFileSource>;
   postgisSources?: Record<string, PostgisSource>;
   providers?: Record<string, Provider>;
   auth?: AuthConfig;
@@ -112,7 +117,44 @@ export function postgisSource(config: FeaturesConfig, id: string) {
 
 export function hasGeoJson(config: FeaturesConfig, provider?: string) {
   return publicationEntries(config).some(([, publication]) =>
-    (provider === undefined || publication.provider === provider) && !postgisSource(config, publication.source));
+    (provider === undefined || publication.provider === provider) &&
+    !postgisSource(config, publication.source) && !vectorFile(config, publication.source));
+}
+
+export function vectorFile(config: FeaturesConfig, id: string) {
+  return config.vectorFiles && Object.hasOwn(config.vectorFiles, id) ? config.vectorFiles[id] : undefined;
+}
+
+export const crs84 = 'http://www.opengis.net/def/crs/OGC/1.3/CRS84';
+
+function supportedCrs(id: string, source: Source, values: string[]) {
+  const result = new Set([crs84]);
+  for (const value of values) {
+    if (value === 'CRS84' || value === crs84) continue;
+    const match = /^(?:((?:EPSG|ESRI)):(\d{1,8})|http:\/\/www\.opengis\.net\/def\/crs\/(EPSG|ESRI)\/0\/(\d{1,8}))$/.exec(value);
+    if (!match) throw new Error(`Publication '${id}' has invalid CRS '${value}'. Use CRS84, EPSG:<code> or ESRI:<code>.`);
+    const authority = match[1] ?? match[3];
+    const code = match[2] ?? match[4];
+    if (authority === 'EPSG' && code === '102026') {
+      throw new Error(`Publication '${id}': use ESRI:102026 for Asia North Equidistant Conic.`);
+    }
+    if ((source.type === 'geojson' || source.type === 'postgis') &&
+      (authority !== 'EPSG' || (code !== '4326' && code !== '3857'))) {
+      throw new Error(`Publication '${id}': ${value} is unsupported for ${source.type} bbox. Use CRS84, EPSG:4326 or EPSG:3857.`);
+    }
+    result.add(`http://www.opengis.net/def/crs/${authority}/0/${code}`);
+  }
+  return [...result];
+}
+
+export function usedVectorFiles(config: FeaturesConfig, provider?: string) {
+  return [...new Set(publicationEntries(config)
+    .filter(([, publication]) => provider === undefined || publication.provider === provider)
+    .map(([, publication]) => publication.source))]
+    .flatMap((id): [string, VectorFileSource][] => {
+      const source = vectorFile(config, id);
+      return source ? [[id, source]] : [];
+    });
 }
 
 export function needsPublicMetadata(config: FeaturesConfig) {
@@ -157,6 +199,7 @@ export function serializeFeaturesConfig(config: FeaturesConfig) {
     sources: {
       ...(config.sourcePath && { [geojsonSourceId]: { type: 'geojson', path: config.sourcePath } }),
       ...config.postgisSources,
+      ...config.vectorFiles,
     },
     providers: config.providers ?? { [builtInProviderId(config)!]: { type: 'pygeoapi' } },
     publications: Object.fromEntries(publicationEntries(config)),
@@ -191,6 +234,14 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     entry[1].type === 'geojson');
   if (geojsonSources.length > 1) throw new Error('Only one GeoJSON source can be configured.');
   const postgisSources = sources.filter((entry): entry is [string, PostgisSource] => entry[1].type === 'postgis');
+  const vectorFiles = sources.filter((entry): entry is [string, VectorFileSource] =>
+    entry[1].type === 'geopackage' || entry[1].type === 'shapefile' || entry[1].type === 'geoparquet');
+  const fileExtensions = { geopackage: '.gpkg', shapefile: '.shp', geoparquet: '.parquet' };
+  for (const [id, source] of vectorFiles) {
+    const extension = fileExtensions[source.type];
+    if (extname(source.path) !== extension) throw new Error(`Source '${id}' requires a ${extension} file.`);
+    source.path = resolve(directory, source.path);
+  }
   if (providers.filter(([, provider]) => !provider.image).length > 1) {
     throw new Error('Only one provider can use the built-in image. Configure an image and API for each additional instance.');
   }
@@ -232,12 +283,12 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   }
 
   const entries = Object.entries(config.publications).map((
-    [id, { source, provider, protocol, access, title, description, extent, time_field, freshness }],
+    [id, { source, provider, protocol, access, title, description, extent, time_field, freshness, crs }],
   ): [string, Publication] => [id, {
     source, provider, protocol, access, title, description, extent,
-    ...(time_field !== undefined && { time_field }), ...(freshness && { freshness }),
+    ...(time_field !== undefined && { time_field }), ...(freshness && { freshness }), ...(crs && { crs }),
   }]);
-  const sourceTypes = new Map<string, Source['type']>();
+  const sourceTypes = new Map<string, 'file' | 'postgis'>();
   for (const [id, publication] of entries) {
     const { source, provider, protocol, access, extent, time_field, freshness } = publication;
     if (!Object.hasOwn(config.sources, source)) {
@@ -251,11 +302,14 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Publication '${id}' uses a protocol unsupported by provider '${provider}'.`);
     }
     const sourceConfig = config.sources[source]!;
+    if (publication.crs) publication.crs = supportedCrs(id, sourceConfig, publication.crs);
+    const sourceType = sourceConfig.type === 'postgis' ? 'postgis' : 'file';
     const suppliedType = sourceTypes.get(provider);
-    if (suppliedType && suppliedType !== sourceConfig.type) {
-      throw new Error(`Provider '${provider}' serves GeoJSON and PostGIS. Use separate provider instances.`);
+    if (suppliedType && suppliedType !== sourceType) {
+      const fileFormats = vectorFiles.length ? 'file sources' : 'GeoJSON';
+      throw new Error(`Provider '${provider}' serves ${fileFormats} and PostGIS. Use separate provider instances.`);
     }
-    sourceTypes.set(provider, sourceConfig.type);
+    sourceTypes.set(provider, sourceType);
     if (sourceConfig.type === 'postgis') {
       if (!instance?.postgis) throw new Error(`Publication '${id}' requires a PostGIS connection on provider '${provider}'.`);
       const max_delay_seconds = freshness?.max_delay_seconds ?? 60;
@@ -263,7 +317,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
         throw new Error(`Publication '${id}': source max_lag_seconds exceeds freshness.max_delay_seconds.`);
       }
       publication.freshness = { max_delay_seconds };
-    } else if (freshness || time_field) {
+    } else if (freshness || (time_field && sourceConfig.type !== 'geoparquet')) {
       throw new Error(`Publication '${id}' requires a PostGIS source for freshness or time_field.`);
     }
     const [west, south, east, north] = extent;
@@ -297,8 +351,10 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     publicUrl: new URL('/features', `${tls ? 'https' : 'http'}://${host}:${port}`).href,
     sourcePath: geojson ? resolve(directory, geojson[1].path) : '',
     ...(postgisSources.length && { postgisSources: Object.fromEntries(postgisSources) }),
-    ...(postgisSources.length && geojson && { geojsonSourceId: geojson[0] }),
-    ...(postgisSources.length || providers.length !== 1 || providers.some(([, provider]) => provider.image || provider.postgis)
+    ...(vectorFiles.length && { vectorFiles: Object.fromEntries(vectorFiles) }),
+    ...((postgisSources.length || vectorFiles.length) && geojson && { geojsonSourceId: geojson[0] }),
+    ...(postgisSources.length || vectorFiles.length || entries.some(([, pub]) => pub.crs) ||
+      providers.length !== 1 || providers.some(([, provider]) => provider.image || provider.postgis)
       ? { providers: config.providers } : {}),
     ...(first ? { publicationId: first[0], publication: first[1],
       ...(others.length > 0 && { additionalPublications: Object.fromEntries(others) }) }
