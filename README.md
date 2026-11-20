@@ -2,24 +2,36 @@
 
 Платформа для публикации ГИС-сервисов различных типов на основе решений с открытым исходным кодом и современных стандартов работы с геопространственными данными.
 
-## Статус проекта
+## Локальная публикация GeoJSON
 
-На 17 ноября 2026 года проект находится на этапе согласования архитектуры первой версии. Реализация платформы ещё не начата; стартовая спецификация пока не подготовлена.
+В примере одна публичная коллекция OGC API — Features. CLI применяет общий YAML и запускает Caddy и pygeoapi через Docker Compose. Для запуска используйте Node.js 24 или новее и Docker с Compose v2. В Windows выполняйте команды в пользовательском дистрибутиве WSL 2 с включённой интеграцией Docker Desktop. Разместите рабочую копию в файловой системе этого дистрибутива, например в `~/gis-platform`.
 
-В [карте «GIS Platform: решения для стартовой спецификации»](https://github.com/stepanosokin/gis-platform/issues/1) закрыто **7 из 9 вопросов**. Согласованы протоколы и границы первой версии, учётные записи и права доступа, свежесть динамических публикаций PostGIS и граница H3, общий YAML-конфиг и шлюз Caddy/Express. Подробные решения находятся в связанных вопросах карты.
+```sh
+npm ci
+npm run build
+node dist/cli.js config validate examples/features.yaml
+node dist/cli.js config plan examples/features.yaml
+```
 
-Остаются два вопроса:
+Передайте выведенный ID плана в `node dist/cli.js config apply <plan-id>`. После успешного применения проверьте ответы через шлюз.
 
-- [Выбрать Python или Node и контракт CLI администратора](https://github.com/stepanosokin/gis-platform/issues/9).
-- [Согласовать Docker-эксплуатацию и критерии проверки платформы](https://github.com/stepanosokin/gis-platform/issues/10).
+```sh
+curl -fsS 'http://localhost:8080/features/collections?f=json'
+curl -fsS 'http://localhost:8080/features/openapi?f=json'
+curl -fsS 'http://localhost:8080/features/collections/places/items?f=json&limit=1'
+curl -fsS 'http://localhost:8080/features/collections/places/items/central?f=json'
+curl -fsS 'http://localhost:8080/features/collections/places/items?f=json&bbox=37,55,38,56'
+```
 
-После их согласования — подготовка стартовой спецификации, отдельное согласование состава четырёх уровней тестирования и переход к задачам реализации.
+Путь к GeoJSON задаётся относительно YAML или абсолютным путём. Используйте `FeatureCollection` с уникальным строковым `id` у каждого объекта. Для локального примера Caddy слушает loopback, а pygeoapi читает только смонтированный файл. После редактирования YAML создайте и примените новый план.
 
-Сейчас репозиторий содержит правила работы, глоссарий и исследовательские материалы. Исходников приложения и Docker-конфигурации ещё нет. Исследования основаны на документации и исходном коде; интеграционные проверки платформы не выполнялись.
+CLI хранит планы и рабочую конфигурацию в `.gis-platform/`. Остановить локальный пример можно командой `docker compose stop`, возобновить — `docker compose start`.
 
 ## Материалы
 
 - [Правила работы и тестирования](AGENTS.md).
+- [Локальный запуск автотестов](tests/README.md).
+- [Стартовая спецификация первой версии](https://github.com/stepanosokin/gis-platform/issues/13).
 - [Глоссарий проекта](GLOSSARY.md).
 - [Сравнение вариантов компонента доступа](docs/research/auth-stack-comparison.md).
 - [Конфиг и шлюз: проверенные границы](docs/research/gateway-config-options.md).

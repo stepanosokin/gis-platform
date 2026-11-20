@@ -1,0 +1,20 @@
+schema_version: 1
+server:
+  host: localhost
+  port: 8080
+sources:
+  sample-places:
+    type: geojson
+    path: places.geojson
+providers:
+  file-features:
+    type: pygeoapi
+publications:
+  places:
+    source: sample-places
+    provider: file-features
+    protocol: features
+    access: public
+    title: Example places
+    description: Three point features for the local publication example.
+    extent: [37, 55, 40, 58]

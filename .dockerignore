@@ -1,0 +1,5 @@
+.git
+.gis-platform
+node_modules
+dist
+test_results

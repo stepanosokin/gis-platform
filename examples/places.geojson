@@ -1,0 +1,8 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {"type": "Feature", "id": "central", "geometry": {"type": "Point", "coordinates": [37.62, 55.75]}, "properties": {"name": "Central"}},
+    {"type": "Feature", "id": "east", "geometry": {"type": "Point", "coordinates": [39.87, 57.62]}, "properties": {"name": "East"}},
+    {"type": "Feature", "id": "north", "geometry": {"type": "Point", "coordinates": [37.54, 56.74]}, "properties": {"name": "North"}}
+  ]
+}

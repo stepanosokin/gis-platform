@@ -1,2 +1,5 @@
 # Test run outputs and temporary test data
 /test_results/
+/node_modules/
+/dist/
+/.gis-platform/
