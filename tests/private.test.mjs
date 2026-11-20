@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { json } from 'node:stream/consumers';
 import { test } from 'node:test';
 import { setTimeout } from 'node:timers/promises';
+import { parse, stringify } from 'yaml';
 import { auth, cookieFrom, emailLink, register, request, session, signIn } from './access-client.mjs';
 
 const gateway = process.env.GIS_TEST_PUBLIC_URL;
@@ -499,6 +500,158 @@ function freshGet(path, headers, expected, readBody = false) {
     req.on('error', reject);
   });
 }
+
+async function planPrivateConfig(edit, expected = 'OK', exitCode = 0) {
+  const filename = process.env.GIS_TEST_CONFIG;
+  const draft = parse(await readFile(filename, 'utf8'));
+  edit(draft);
+  const candidate = join(dirname(filename), 'publication-lifecycle.yaml');
+  await writeFile(candidate, stringify(draft));
+  return cli(['config', 'plan', candidate], expected, exitCode);
+}
+
+test('deleting and restoring a private publication drops its grants and keeps the source', async () => {
+  const email = 'publication-restore@example.test';
+  const other = 'other-private';
+  await register(email, password);
+  const cookie = await signIn(email, password);
+  const token = await createToken(cookie, 'Publication lifecycle');
+  const headers = bearer(token.secret).headers;
+  cli(['access', 'grant', 'private-places', '--email', email]);
+  cli(['access', 'grant', other, '--email', email]);
+  await freshGet(items, headers, 200);
+  const { currentVersion } = cli(['status']);
+
+  const removal = await planPrivateConfig(({ publications }) => { delete publications['private-places']; });
+  assert.deepEqual(removal.removed, ['private-places']);
+  assert.ok(removal.routesToClose.includes(new URL(privateCollection, gateway).href));
+  assert.deepEqual(removal.publications.find(({ publicationId }) => publicationId === 'private-places'), {
+    publicationId: 'private-places', previousUrl: new URL(privateCollection, gateway).href,
+    newUrl: null, previousAccess: 'private', newAccess: null, personalGrants: 'delete',
+  });
+  await freshGet(items, headers, 200);
+
+  cli(['config', 'apply', removal.planId]);
+  for (const path of [items, privateCollection, `${privateCollection}/schema`, `${privateCollection}/queryables`]) {
+    await freshGet(path, headers, 404);
+  }
+  const catalog = await freshGet('/features/collections?f=json', headers, 200, true);
+  assert.ok(!catalog.collections.some(({ id }) => id === 'private-places'));
+  assert.ok(catalog.collections.some(({ id }) => id === other));
+  const api = await freshGet('/features/openapi?f=json', headers, 200, true);
+  assert.ok(!Object.keys(api.paths).some((path) => path.startsWith('/collections/private-places')));
+  cli(['access', 'grant', 'private-places', '--email', email], 'NOT_FOUND', 3);
+  await freshGet(publicItems, {}, 200);
+
+  const restore = cli(['config', 'plan', '--rollback-to', currentVersion]);
+  assert.deepEqual(restore.added, ['private-places']);
+  cli(['config', 'apply', restore.planId]);
+  await freshGet(items, headers, 403);
+  cli(['access', 'grant', 'private-places', '--email', email]);
+  assert.equal((await freshGet(items, headers, 200, true)).id, 'central');
+  cli(['config', 'apply', removal.planId]);
+  await freshGet(items, headers, 200);
+  cli(['access', 'revoke', 'private-places', '--email', email]);
+  cli(['access', 'revoke', other, '--email', email]);
+});
+
+test('a failed switch that would remove a publication keeps its data and grants', async () => {
+  const email = 'failed-publication-removal@example.test';
+  await register(email, password);
+  const headers = { Cookie: await signIn(email, password) };
+  cli(['access', 'grant', 'private-places', '--email', email]);
+  const { currentVersion } = cli(['status']);
+  const removal = await planPrivateConfig(({ auth, publications, server }) => {
+    delete publications['private-places'];
+    server.port = auth.mailpit_port;
+  });
+  cli(['config', 'apply', removal.planId], 'APPLY_FAILED', 6);
+  assert.equal(cli(['status']).currentVersion, currentVersion);
+  await freshGet(items, headers, 200);
+  const catalog = await freshGet('/features/collections?f=json', headers, 200, true);
+  assert.ok(catalog.collections.some(({ id }) => id === 'private-places'));
+  cli(['access', 'revoke', 'private-places', '--email', email]);
+});
+
+test('a database error deleting publication grants rolls back the candidate', async () => {
+  const email = 'failed-grant-deletion@example.test';
+  await register(email, password);
+  const headers = { Cookie: await signIn(email, password) };
+  cli(['access', 'grant', 'private-places', '--email', email]);
+  const { currentVersion } = cli(['status']);
+  const sql = (...args) => compose('exec', '-T', 'postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1',
+    '-U', 'gis', '-d', 'gis', ...args);
+  sql('-c', `
+    CREATE FUNCTION reject_test_grant_deletion() RETURNS trigger LANGUAGE plpgsql
+      AS $$ BEGIN RAISE EXCEPTION 'injected storage error'; RETURN NULL; END $$;
+    CREATE TRIGGER reject_test_grant_deletion BEFORE DELETE ON publication_grant
+      FOR EACH ROW EXECUTE FUNCTION reject_test_grant_deletion();
+  `);
+  try {
+    const removal = await planPrivateConfig(({ publications }) => { delete publications['private-places']; });
+    cli(['config', 'apply', removal.planId], 'APPLY_FAILED', 6);
+    assert.equal(cli(['status']).currentVersion, currentVersion);
+    await freshGet(items, headers, 200);
+  } finally {
+    sql('-c', 'DROP TRIGGER reject_test_grant_deletion ON publication_grant; DROP FUNCTION reject_test_grant_deletion()');
+  }
+  cli(['access', 'revoke', 'private-places', '--email', email]);
+});
+
+test('a removed publication ID stays reserved for its source and protocol', async () => {
+  const { currentVersion } = cli(['status']);
+  const removal = await planPrivateConfig(({ publications }) => { delete publications['private-places']; });
+  cli(['config', 'apply', removal.planId]);
+
+  const assignNewSource = (draft) => {
+    draft.sources = { replacement: { type: 'geojson', path: 'replacement.geojson' } };
+    draft.publications = { 'private-places': { ...draft.publications['private-places'], source: 'replacement' } };
+  };
+  const rejected = await planPrivateConfig(assignNewSource, 'INVALID_CONFIG', 2);
+  assert.match(rejected.message, /'private-places' is reserved/);
+  const retargeted = await planPrivateConfig((draft) => {
+    Object.values(draft.sources)[0].path = 'replacement.geojson';
+    draft.publications = { 'private-places': draft.publications['private-places'] };
+  }, 'INVALID_CONFIG', 2);
+  assert.match(retargeted.message, /'private-places' is reserved/);
+  await planPrivateConfig(({ publications }) => {
+    publications['private-places'].protocol = 'tiles';
+  }, 'INVALID_CONFIG', 2);
+  assert.equal(cli(['status']).currentVersion, removal.planId);
+
+  const restore = cli(['config', 'plan', '--rollback-to', currentVersion]);
+  cli(['config', 'apply', restore.planId]);
+  const renamed = await planPrivateConfig(({ publications }) => { publications.places.title = 'Renamed public places'; });
+  const publication = renamed.publications.find(({ publicationId }) => publicationId === 'places');
+  assert.equal(publication.newUrl, publication.previousUrl);
+  cli(['config', 'apply', renamed.planId]);
+  const collection = await freshGet('/features/collections/places?f=json', {}, 200, true);
+  assert.equal(collection.id, 'places');
+  assert.equal(collection.title, 'Renamed public places');
+  cli(['config', 'apply', cli(['config', 'plan', '--rollback-to', currentVersion]).planId]);
+});
+
+test('all publications can be removed together with auth and restored without their grants', async () => {
+  const email = 'last-publication@example.test';
+  await register(email, password);
+  const headers = { Cookie: await signIn(email, password) };
+  cli(['access', 'grant', 'private-places', '--email', email]);
+  const { currentVersion } = cli(['status']);
+  const removeAll = await planPrivateConfig((draft) => {
+    draft.publications = {};
+    delete draft.auth;
+  });
+  assert.deepEqual(removeAll.removed, ['registered-places', 'places', 'private-places', 'other-private']);
+  assert.equal(removeAll.newUrl, null);
+  cli(['config', 'apply', removeAll.planId]);
+  assert.deepEqual((await freshGet('/features/collections?f=json', {}, 200, true)).collections, []);
+  await freshGet(publicItems, {}, 404);
+  await freshGet(items, headers, 404);
+
+  cli(['config', 'apply', cli(['config', 'plan', '--rollback-to', currentVersion]).planId]);
+  await freshGet(publicItems, {}, 200);
+  await freshGet(items, headers, 403);
+});
 
 test('rolling back a publication keeps the current account, token and grant revocation', async () => {
   const email = 'configuration-rollback@example.test';

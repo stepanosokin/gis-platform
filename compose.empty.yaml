@@ -1,0 +1,9 @@
+services:
+  pygeoapi:
+    volumes: !override
+      - type: bind
+        source: ${GIS_PROVIDER_REVISION_DIR:-${GIS_REVISION_DIR:-./.gis-platform}}
+        target: /etc/pygeoapi/gis
+        read_only: true
+        bind:
+          create_host_path: false

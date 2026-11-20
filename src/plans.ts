@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { publicationEntries, serializeFeaturesConfig, type FeaturesConfig } from './config.js';
 import { archiveLegacyOpenApi, closeGateway, compose, openGateway, prepareFeaturesStack, providerConfigurationChanged,
-  resolveComposeProject, savedSourceFingerprint, sourceFingerprint, startFeaturesStack } from './features-stack.js';
+  publicationGrantRemoval, resolveComposeProject, savedSourceFingerprint, sourceFingerprint, startFeaturesStack } from './features-stack.js';
 import { CliError } from './cli-result.js';
 
 interface Plan {
@@ -22,7 +22,8 @@ interface ActiveState {
   planId: string | null;
   previousVersion?: string | null;
   pendingPlanId?: string;
-  phase?: 'preflight' | 'switch' | 'open' | 'recovery';
+  phase?: 'preflight' | 'switch' | 'open' | 'finalize' | 'recovery';
+  finalizeFailed?: boolean;
   closedRoutes?: string[];
   results?: Record<string, ApplyResult>;
 }
@@ -80,7 +81,7 @@ async function readPlan(planId: string): Promise<Plan> {
 }
 
 function publicationUrl(config: FeaturesConfig) {
-  return `${config.publicUrl}/collections/${config.publicationId}`;
+  return config.publicationId === null ? null : `${config.publicUrl}/collections/${config.publicationId}`;
 }
 
 export async function configurationStatus() {
@@ -90,22 +91,50 @@ export async function configurationStatus() {
     phase: state.phase ?? (state.pendingPlanId ? 'switch' : 'ready'),
     pendingPlanId: state.pendingPlanId ?? null, closedRoutes: state.closedRoutes ?? [],
   };
-  if (state.phase === 'recovery') throw new CliError('RECOVERY_INCOMPLETE', 7,
+  if (state.phase === 'recovery' || state.finalizeFailed) throw new CliError('RECOVERY_INCOMPLETE', 7,
     `Configuration recovery is incomplete. Closed routes: ${data.closedRoutes.join(', ')}.`, data);
   return data;
 }
 
 export async function planRollback(version: string) {
   const state = await readActive();
-  let confirmed = state.planId;
-  while (confirmed) {
-    const plan = await readPlan(confirmed);
-    if (confirmed === version) return createPlan(plan.config, plan.yaml ?? serializeFeaturesConfig(plan.config), {
-      targetVersion: confirmed, baseVersion: state.planId,
+  for await (const plan of confirmedHistory(state.planId ? await readPlan(state.planId) : null)) {
+    if (plan.planId === version) return createPlan(plan.config, plan.yaml ?? serializeFeaturesConfig(plan.config), {
+      targetVersion: version, baseVersion: state.planId,
     });
-    confirmed = plan.baseVersion;
   }
   throw new CliError('NOT_FOUND', 3, 'Confirmed configuration version not found.');
+}
+
+async function* confirmedHistory(current: Plan | null) {
+  for (let version = current; version; version = version.baseVersion ? await readPlan(version.baseVersion) : null) {
+    yield version;
+  }
+}
+
+async function checkPublicationIdentities(config: FeaturesConfig, current: Plan | null) {
+  const unverified = new Map(publicationEntries(config));
+  if (!unverified.size) return;
+  const retired = new Set<string>();
+  const reject = (id: string) => {
+    throw new CliError('INVALID_CONFIG', 2, `Publication ID '${id}' is reserved for its original source and protocol. Use a new ID.`);
+  };
+  for await (const version of confirmedHistory(current)) {
+    for (const [id, previous] of publicationEntries(version.config)) {
+      const candidate = unverified.get(id);
+      if (!candidate) continue;
+      const sameIdentity = previous.source === candidate.source && previous.protocol === candidate.protocol;
+      if (version === current) {
+        if (!sameIdentity) reject(id);
+      } else {
+        retired.add(id);
+        if (!sameIdentity || version.config.sourcePath !== config.sourcePath) continue;
+      }
+      unverified.delete(id);
+    }
+    if (!unverified.size) return;
+  }
+  for (const id of retired) if (unverified.has(id)) reject(id);
 }
 
 function fingerprint({ baseVersion, config, yaml, targetVersion, attempt, sourceHash }: Omit<Plan, 'planId'>) {
@@ -117,8 +146,9 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   let { baseVersion, targetVersion } = versions ?? {};
   if (baseVersion === undefined) baseVersion = (await readActive()).planId;
   const currentPlan = baseVersion ? await readPlan(baseVersion) : null;
+  await checkPublicationIdentities(config, currentPlan);
   const current = currentPlan?.config ?? null;
-  const sourceHash = await sourceFingerprint(config.sourcePath);
+  const sourceHash = config.publicationId === null ? null : await sourceFingerprint(config.sourcePath);
   const changedSource = await sourceContentChanged(sourceHash, baseVersion);
   const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash };
   const planId = fingerprint(snapshot);
@@ -140,7 +170,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
       newUrl: after ? `${config.publicUrl}/collections/${id}` : null,
       previousAccess: before?.access ?? null,
       newAccess: after?.access ?? null,
-      personalGrants: !after ? 'inactive' : before ? 'preserve' : 'none',
+      personalGrants: !after ? 'delete' : before ? 'preserve' : 'none',
     };
   });
   return {
@@ -238,8 +268,69 @@ async function openConfirmedVersion(state: ActiveState, candidate: Plan) {
   await writeJson(activeFile, settled(confirmed, candidate.planId, { code: 'OK' }));
 }
 
+async function grantCleanup(plan: Plan, current: Plan | null) {
+  if (!current) return;
+  const next = new Set(publicationEntries(plan.config).map(([id]) => id));
+  const previous = new Set(publicationEntries(current.config).map(([id]) => id));
+  const deleteIds = [...previous].filter((id) => !next.has(id));
+  const added = new Set([...next].filter((id) => !previous.has(id)));
+  if (!deleteIds.length && !added.size) return;
+
+  let accounts: Plan | undefined;
+  for await (const version of confirmedHistory(current)) {
+    if (version.config.auth) accounts ??= version;
+    // Older versions could retire a publication without removing its grants.
+    for (const [id] of publicationEntries(version.config)) {
+      if (added.delete(id)) deleteIds.push(id);
+    }
+    if (accounts && !added.size) break;
+  }
+  if (accounts && deleteIds.length) return { database: revision(plan.config.auth ? plan : accounts), deleteIds };
+}
+
+async function finalizeRemoval(state: ActiveState, plan: Plan, current: Plan | null,
+  cleanup: NonNullable<Awaited<ReturnType<typeof grantCleanup>>>, resume: boolean) {
+  const candidate = revision(plan);
+  const { database, deleteIds } = cleanup;
+  const temporaryPostgres = !plan.config.auth;
+  const runDatabase = (...args: string[]) => compose(database.config, database.directory, ...args);
+  let deletionMayHaveRun = resume;
+  try {
+    if (temporaryPostgres) await runDatabase('up', '-d', '--wait', 'postgres');
+    deletionMayHaveRun = true;
+    const committed = resume
+      ? await publicationGrantRemoval(database, plan.planId, 'abort')
+      : await publicationGrantRemoval(database, plan.planId, { deleteIds })
+        .catch(() => publicationGrantRemoval(database, plan.planId, 'abort'));
+    if (temporaryPostgres) await runDatabase('stop', 'postgres');
+    if (!committed) {
+      await restoreStack(state, plan, current, 'Publication grants could not be removed. The previous configuration was restored.');
+      return;
+    }
+    if (resume) {
+      await closeGateway(candidate.directory);
+      await startFeaturesStack(plan.config, candidate.directory);
+    }
+    await openGateway(candidate.directory);
+    await writeJson(activeFile, settled({ ...state, planId: plan.planId, previousVersion: state.planId }, plan.planId, { code: 'OK' }));
+  } catch {
+    if (!deletionMayHaveRun) {
+      await restoreStack(state, plan, current, 'The accounts database could not be started. The previous configuration was restored.');
+      return;
+    }
+    // A lost database response can conceal a commit. Keep the gate closed until
+    // the marker is readable, then finish opening or restore the old revision.
+    await secureGateway(candidate).catch(() => {});
+    await writeJson(activeFile, { ...state, finalizeFailed: true });
+    throw new CliError('RECOVERY_INCOMPLETE', 7, 'Publication removal could not be finalized. Retry the same plan.', {
+      planId: plan.planId, currentVersion: state.planId, closedRoutes: state.closedRoutes ?? [],
+    });
+  }
+}
+
 async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null) {
   const candidate = revision(plan);
+  const cleanup = await grantCleanup(plan, current);
   await writeJson(activeFile, { ...state, pendingPlanId: plan.planId, phase: 'preflight' });
   try {
     if (current && !current.yaml) {
@@ -263,10 +354,13 @@ async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null
     await closeGateway(candidate.directory);
     if (current) await secureGateway(revision(current), !current.yaml);
     await startFeaturesStack(plan.config, candidate.directory);
-    await openConfirmedVersion(pending, plan);
+    if (!cleanup) await openConfirmedVersion(pending, plan);
+    else await writeJson(activeFile, { ...pending, phase: 'finalize' });
   } catch {
     await restoreStack(pending, plan, current, 'The candidate failed verification and the previous configuration was restored.');
+    return;
   }
+  if (cleanup) await finalizeRemoval({ ...pending, phase: 'finalize' }, plan, current, cleanup, false);
 }
 
 async function applicationLock(scope: string) {
@@ -313,7 +407,11 @@ export async function applyPlan(planId: string) {
       const candidate = await readPlan(state.pendingPlanId);
       const previousId = state.phase === 'open' ? state.previousVersion : state.planId;
       const previous = previousId ? await readPlan(previousId) : null;
-      if (state.phase === 'preflight') {
+      if (state.phase === 'finalize') {
+        const cleanup = await grantCleanup(candidate, previous);
+        if (!cleanup) throw new CliError('RECOVERY_INCOMPLETE', 7, 'The accounts database could not be found.');
+        await finalizeRemoval(state, candidate, previous, cleanup, true);
+      } else if (state.phase === 'preflight') {
         await writeJson(activeFile, settled(state, candidate.planId, {
           code: 'APPLY_FAILED', message: 'The preflight check was interrupted.',
         }));
@@ -334,9 +432,11 @@ export async function applyPlan(planId: string) {
         planId, baseVersion: plan.baseVersion, currentVersion: state.planId,
       });
     }
+    await checkPublicationIdentities(plan.config, current);
     if (current && JSON.stringify(current.config) === JSON.stringify(plan.config) &&
         !await sourceContentChanged(plan.sourceHash, current.planId)) {
-      const sourceChangedAfterPlanning = await sourceContentChanged(await sourceFingerprint(plan.config.sourcePath), current.planId);
+      const sourceChangedAfterPlanning = plan.config.publicationId !== null &&
+        await sourceContentChanged(await sourceFingerprint(plan.config.sourcePath), current.planId);
       const outcome = sourceChangedAfterPlanning
         ? { code: 'APPLY_FAILED', message: 'The GeoJSON source changed after planning. Create a new plan.' } as const
         : { code: 'NO_CHANGE' } as const;

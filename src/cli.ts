@@ -49,7 +49,7 @@ async function main() {
   if (command === 'apply') {
     const result = await applyPlan(argument);
     const action = result.code === 'OK' ? 'Applied' : 'Already active';
-    success(result.code, result.data, `${action}: ${result.data.url}\nCurrent version: ${result.data.currentVersion ?? 'none'}`);
+    success(result.code, result.data, `${action}: ${result.data.url ?? 'no publications'}\nCurrent version: ${result.data.currentVersion ?? 'none'}`);
     return;
   }
 
@@ -62,7 +62,7 @@ async function main() {
     `Added: ${plan.added.join(', ') || 'none'}`,
     `Changed: ${plan.changed.join(', ') || 'none'}`,
     `Removed: ${plan.removed.join(', ') || 'none'}`,
-    `URL: ${plan.previousUrl ?? '(none)'} → ${plan.newUrl}`,
+    `URL: ${plan.previousUrl ?? '(none)'} → ${plan.newUrl ?? '(none)'}`,
     ...plan.publications.map(({ publicationId, previousUrl, newUrl, previousAccess, newAccess, personalGrants }) =>
       `${publicationId}: ${previousUrl ?? '(none)'} → ${newUrl ?? '(none)'} | access: ${previousAccess ?? 'none'} → ${newAccess ?? 'none'} | grants: ${personalGrants}`),
     `Services: ${plan.services.join(', ') || 'none'}`,
@@ -76,7 +76,7 @@ async function planFile(command: string, filename: string) {
   });
   if (command === 'plan') return createPlan(config, yaml);
   const publicationIds = publicationEntries(config).map(([id]) => id);
-  success('OK', { publicationId: config.publicationId, publicationIds }, `Valid configuration: ${publicationIds.join(', ')}`);
+  success('OK', { publicationId: config.publicationId, publicationIds }, `Valid configuration: ${publicationIds.join(', ') || 'no publications'}`);
 }
 
 async function applyPlan(planId: string) {

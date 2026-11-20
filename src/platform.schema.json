@@ -104,7 +104,6 @@
     "publications": {
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/id" },
-      "minProperties": 1,
       "additionalProperties": {
         "type": "object",
         "required": ["source", "provider", "protocol", "access", "title", "description", "extent"],

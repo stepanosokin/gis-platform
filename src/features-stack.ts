@@ -83,15 +83,16 @@ function caddyConfig(config: FeaturesConfig) {
   const protectedIds = publications.filter(([, publication]) => publication.access !== 'public').map(([id]) => id);
   const publicIds = publications.filter(([, publication]) => publication.access === 'public').map(([id]) => id);
   const collectionRoute = (ids: string[]) => `collections/(${ids.join('|')})(/(schema|queryables|items(/.+)?))?`;
-  const allCollections = collectionRoute(publications.map(([id]) => id));
+  const allCollections = publications.length ? collectionRoute(publications.map(([id]) => id)) : '';
+  const loggedRoutes = ['openapi', 'collections', ...(allCollections ? [allCollections] : [])].join('|');
   const journal = `
 	log
-	@loggedFeatures path_regexp ^/features/(openapi|collections|${allCollections})$
-	@unloggedFeatures not path_regexp ^/features/(openapi|collections|${allCollections})$
-	@loggedPublication path_regexp loggedPublication ^/features/${allCollections}$
+	@loggedFeatures path_regexp ^/features/(${loggedRoutes})$
+	@unloggedFeatures not path_regexp ^/features/(${loggedRoutes})$
 	log_skip @unloggedFeatures
-	log_append @loggedFeatures requestId {http.request.uuid}
-	log_append @loggedPublication publicationId {http.regexp.loggedPublication.1}
+	log_append @loggedFeatures requestId {http.request.uuid}${allCollections ? `
+	@loggedPublication path_regexp loggedPublication ^/features/${allCollections}$
+	log_append @loggedPublication publicationId {http.regexp.loggedPublication.1}` : ''}
 	header @loggedFeatures >X-Request-Id {http.request.uuid}
 `;
   const publicRoutes = ['conformance', 'static/.+'];
@@ -323,7 +324,8 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
     }
   }
   const sameSource = previous?.config.sourcePath === config.sourcePath;
-  const sourceHash = await sourceFingerprint(config.sourcePath);
+  const hasPublications = config.publicationId !== null;
+  const sourceHash = hasPublications ? await sourceFingerprint(config.sourcePath) : null;
   const previousHash = previous && await savedSourceFingerprint(previous.directory);
   if ((options.sourceHash && sourceHash && sourceHash !== options.sourceHash) ||
       (options.sourceHash === null && sameSource && sourceHash && previousHash && sourceHash !== previousHash)) {
@@ -338,16 +340,18 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
     await writeFile(join(revisionDirectory, 'source.sha256'), previousHash);
     return;
   }
-  if (!sourceHash) throw new Error('The GeoJSON source is unavailable.');
+  if (hasPublications && !sourceHash) throw new Error('The GeoJSON source is unavailable.');
   const output = await compose(config, revisionDirectory, 'run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', 'pygeoapi',
     '-ec', [
-      `/venv/bin/python -c "from pygeoapi.provider.geojson import GeoJSONProvider; GeoJSONProvider({'name': 'GeoJSON', 'type': 'feature', 'data': '/source/data.geojson', 'id_field': 'id'}).query(limit=1)" >/dev/null`,
+      ...(hasPublications ? [
+        `/venv/bin/python -c "from pygeoapi.provider.geojson import GeoJSONProvider; GeoJSONProvider({'name': 'GeoJSON', 'type': 'feature', 'data': '/source/data.geojson', 'id_field': 'id'}).query(limit=1)" >/dev/null`,
+      ] : []),
       '/venv/bin/pygeoapi openapi generate "$PYGEOAPI_CONFIG" -f json -of /tmp/openapi.json >/dev/null',
       'cat /tmp/openapi.json',
     ].join('\n'));
   checkOpenApi(output, config, publicationEntries(config).map(([id]) => id));
   await writeFile(join(revisionDirectory, 'openapi.json'), output);
-  await writeFile(join(revisionDirectory, 'source.sha256'), sourceHash);
+  if (sourceHash) await writeFile(join(revisionDirectory, 'source.sha256'), sourceHash);
 }
 
 async function providerDirectory(directory: string) {
@@ -357,6 +361,7 @@ async function providerDirectory(directory: string) {
 
 export async function compose(config: FeaturesConfig, revisionDirectory: string, ...args: string[]) {
   const files = [composeFile('compose.yaml')];
+  if (config.publicationId === null) files.push(composeFile('compose.empty.yaml'));
   if (config.tls) files.push(composeFile('compose.tls.yaml'));
   if (config.auth) {
     files.push(composeFile('compose.auth.yaml'));
@@ -421,6 +426,42 @@ export async function closeGateway(directory: string) {
 
 export async function openGateway(directory: string) {
   await rm(join(directory, 'closed'), { force: true });
+}
+
+export async function publicationGrantRemoval({ config, directory }: Revision, planId: string,
+  action: 'abort' | { deleteIds: string[] }) {
+  if (!/^plan-[a-f0-9]{64}$/.test(planId) ||
+      (action !== 'abort' && action.deleteIds.some((id) => !/^[a-z][a-z0-9-]{0,62}$/.test(id)))) {
+    throw new Error('Invalid publication removal.');
+  }
+  const version = `'${planId}'`;
+  // The first transaction decides the outcome. A delayed worker cannot delete
+  // grants if recovery has already recorded an aborted removal.
+  const command = action === 'abort'
+    ? `INSERT INTO publication_grant_removal (version, committed) VALUES (${version}, false) ON CONFLICT DO NOTHING;`
+    : `
+      DO $grant_removal$
+      BEGIN
+        INSERT INTO publication_grant_removal (version, committed) VALUES (${version}, true) ON CONFLICT DO NOTHING;
+        IF FOUND AND to_regclass('public.publication_grant') IS NOT NULL THEN
+          DELETE FROM public.publication_grant
+            WHERE publication_id IN (${action.deleteIds.map((id) => `'${id}'`).join(', ')});
+        END IF;
+      END
+      $grant_removal$;
+    `;
+  const output = await compose(config, directory, 'exec', '-T', 'postgres',
+    'psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', 'gis', '-d', 'gis', '-c', `
+      BEGIN;
+      SELECT pg_advisory_xact_lock(hashtext('gis.publication_grant_removal'));
+      CREATE TABLE IF NOT EXISTS publication_grant_removal (version text PRIMARY KEY, committed boolean NOT NULL);
+      ${command}
+      SELECT committed FROM publication_grant_removal WHERE version = ${version};
+      COMMIT;
+    `);
+  const committed = output.trim();
+  if (committed !== 't' && committed !== 'f') throw new Error('The grant removal result is unavailable.');
+  return committed === 't';
 }
 
 export async function startFeaturesStack(config: FeaturesConfig, revisionDirectory: string) {

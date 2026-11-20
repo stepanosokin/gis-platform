@@ -51,18 +51,19 @@ export type AuthConfig = {
   cli?: AdminConfig;
 } & ({ mode: 'development'; mailpit_port?: number } | { mode: 'production'; smtp: SmtpConfig });
 
-export interface FeaturesConfig {
+export type FeaturesConfig = {
   port: number;
   publicUrl: string;
   sourcePath: string;
-  publicationId: string;
-  publication: Publication;
-  additionalPublications?: Record<string, Publication>;
   auth?: AuthConfig;
   tls?: TlsConfig;
-}
+} & (
+  { publicationId: string; publication: Publication; additionalPublications?: Record<string, Publication> } |
+  { publicationId: null; sourceId: string; providerId: string }
+);
 
 export function publicationEntries(config: FeaturesConfig): [string, Publication][] {
+  if (config.publicationId === null) return [];
   return [[config.publicationId, config.publication], ...Object.entries(config.additionalPublications ?? {})];
 }
 
@@ -70,8 +71,8 @@ export function serializeFeaturesConfig(config: FeaturesConfig) {
   const snapshot: PlatformConfig = {
     schema_version: 1,
     server: { host: new URL(config.publicUrl).hostname, port: config.port, tls: config.tls },
-    sources: { [config.publication.source]: { type: 'geojson', path: config.sourcePath } },
-    providers: { [config.publication.provider]: { type: 'pygeoapi' } },
+    sources: { [config.publicationId === null ? config.sourceId : config.publication.source]: { type: 'geojson', path: config.sourcePath } },
+    providers: { [config.publicationId === null ? config.providerId : config.publication.provider]: { type: 'pygeoapi' } },
     publications: Object.fromEntries(publicationEntries(config)),
     auth: config.auth,
   };
@@ -113,10 +114,8 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     if (access !== 'public' && !config.auth) throw new Error(`Publication '${id}' requires auth configuration.`);
   }
   const [first, ...others] = entries;
-  if (!first) throw new Error('Expected at least one publication.');
-  const [publicationId, publication] = first;
-  const sourceConfig = config.sources[publication.source];
-  if (!sourceConfig) throw new Error(`Expected source '${publication.source}'.`);
+  const [sourceId, sourceConfig] = Object.entries(config.sources)[0]!;
+  const providerId = Object.keys(config.providers)[0]!;
 
   const { host, port, tls } = config.server;
   const auth = config.auth;
@@ -139,9 +138,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     port,
     publicUrl: new URL('/features', `${tls ? 'https' : 'http'}://${host}:${port}`).href,
     sourcePath: resolve(directory, sourceConfig.path),
-    publicationId,
-    publication,
-    ...(others.length > 0 && { additionalPublications: Object.fromEntries(others) }),
+    ...(first ? { publicationId: first[0], publication: first[1],
+      ...(others.length > 0 && { additionalPublications: Object.fromEntries(others) }) }
+      : { publicationId: null, sourceId, providerId }),
     ...(auth && { auth }),
     ...(tls && { tls: { cert_file: resolve(directory, tls.cert_file), key_file: resolve(directory, tls.key_file) } }),
   };
