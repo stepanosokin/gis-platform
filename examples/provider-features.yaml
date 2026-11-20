@@ -1,0 +1,11 @@
+type: pygeoapi
+api:
+  protocol: features
+  scheme: http
+  port: 8081
+  base_path: /
+  public_root: /features
+  links: canonical
+  readiness: /openapi?f=json
+volumes:
+  cache: /provider-cache

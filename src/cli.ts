@@ -6,6 +6,7 @@ import { configurationStatus, createPlan, planRollback } from './plans.js';
 import type { ApplyReply } from './apply-worker.js';
 import { CliError } from './cli-result.js';
 import { runAdminCommand } from './admin-client.js';
+import { planProviderCommand } from './provider-command.js';
 
 const arguments_ = process.argv.slice(2);
 const json = arguments_.includes('--json');
@@ -18,6 +19,12 @@ function success(code: string, data: Record<string, unknown>, message: string) {
 }
 
 async function main() {
+  if (group === 'provider') {
+    const plan = await planProviderCommand(command, commandArguments.slice(2));
+    const result = await applyPlan(plan.planId);
+    success(result.code, result.data, `Current version: ${result.data.currentVersion}`);
+    return;
+  }
   if (group === 'status' && !command) {
     const admin = process.env.GIS_ADMIN_PORT ? await runAdminCommand(commandArguments).catch((error: unknown) => {
       if (!(error instanceof CliError) || error.code !== 'FAILED') throw error;

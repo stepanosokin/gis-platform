@@ -1,4 +1,5 @@
 import type { Express, Request, Response } from 'express';
+import { readFile } from 'node:fs/promises';
 import { stringify } from 'yaml';
 import { page } from './account-pages.js';
 import type { Publication } from './config.js';
@@ -10,6 +11,16 @@ interface Catalog {
 
 interface LinkedCatalog {
   dataset: { '@id': string }[];
+}
+
+interface ManagedMetadata {
+  url: string;
+  api: OpenApi;
+  collections: Catalog['collections'];
+}
+
+export async function readManagedMetadata() {
+  return JSON.parse(await readFile('/etc/gis/features.json', 'utf8')) as Record<string, ManagedMetadata>;
 }
 
 interface OpenApi {
@@ -95,17 +106,33 @@ function requestedFormat(req: Request, supported: (keyof typeof mediaTypes)[]) {
 }
 
 export function mountFeaturesMetadata(app: Express, modes: Record<string, Publication['access']>, cookieName: string,
-  readReader: (req: Request, res: Response) => Promise<PublicationReader | null>) {
+  readReader: (req: Request, res: Response) => Promise<PublicationReader | null>,
+  managed?: Record<string, ManagedMetadata>) {
+  for (const [root, metadata] of Object.entries(managed ?? { '/features': undefined })) {
+    mountRoot(app, modes, cookieName, readReader, root, metadata);
+  }
+}
+
+function mountRoot(app: Express, modes: Record<string, Publication['access']>, cookieName: string,
+  readReader: (req: Request, res: Response) => Promise<PublicationReader | null>, root: string, metadata?: ManagedMetadata) {
   const publications = new Map(Object.entries(modes));
-  app.use(['/features/openapi', '/features/collections'], (_req, res, next) => {
+  app.use([`${root}/openapi`, `${root}/collections`], (_req, res, next) => {
     res.vary('Cookie').vary('Authorization').vary('Accept');
     next();
   });
-  app.get('/features/collections', async (req, res) => {
+  app.get(`${root}/collections`, async (req, res) => {
     const representation = requestedFormat(req, ['json', 'html', 'jsonld']);
     if (!representation) return res.status(400).json({ code: 'InvalidParameterValue', description: 'Invalid format.' });
     const reader = await readReader(req, res);
     if (representation === 'jsonld') {
+      if (metadata) return res.type(mediaTypes.jsonld).json({
+        '@context': { '@vocab': 'https://schema.org/' },
+        '@type': 'DataCatalog',
+        dataset: metadata.collections.filter(({ id }) => canRead(publications, id, reader))
+          .map(({ id, title, description }) => ({
+            '@id': `${metadata.url}/collections/${id}`, '@type': 'Dataset', name: title, description,
+          })),
+      });
       const catalog = await upstreamDocument<LinkedCatalog>('collections', 'jsonld');
       catalog.dataset = catalog.dataset.filter(({ '@id': url }) => {
         const id = /^\/features\/collections\/([^/]+)$/.exec(new URL(url).pathname)?.[1];
@@ -113,24 +140,30 @@ export function mountFeaturesMetadata(app: Express, modes: Record<string, Public
       });
       return res.type(mediaTypes.jsonld).json(catalog);
     }
-    const catalog = await upstreamDocument<Catalog>('collections');
+    const catalog = metadata ? {
+      collections: metadata.collections,
+      links: ['json', 'html', 'jsonld'].map((format) => ({
+        href: `${metadata.url}/collections?f=${format}`, rel: format === representation ? 'self' : 'alternate',
+        type: mediaTypes[format as keyof typeof mediaTypes],
+      })),
+    } : await upstreamDocument<Catalog>('collections');
     catalog.collections = catalog.collections.filter(({ id }) => canRead(publications, id, reader));
     if (representation === 'html') {
       const rows = catalog.collections.map(({ id, title, description }) =>
-        `<li><a href="/features/collections/${encodeURIComponent(id)}?f=html">${escapeHtml(title)}</a>${description ? `<p>${escapeHtml(description)}</p>` : ''}</li>`);
+        `<li><a href="${root}/collections/${encodeURIComponent(id)}?f=html">${escapeHtml(title)}</a>${description ? `<p>${escapeHtml(description)}</p>` : ''}</li>`);
       return res.send(page('Features collections', rows.length ? `<ul>${rows.join('')}</ul>` : '<p>No collections available.</p>'));
     }
     res.json(catalog);
   });
-  app.get('/features/openapi', async (req, res) => {
+  app.get(`${root}/openapi`, async (req, res) => {
     const representation = requestedFormat(req, ['json', 'html', 'yaml']);
     if (!representation) return res.status(400).json({ code: 'InvalidParameterValue', description: 'Invalid format.' });
     const reader = await readReader(req, res);
-    const api = await upstreamDocument<OpenApi>('openapi');
+    const api = metadata ? structuredClone(metadata.api) : await upstreamDocument<OpenApi>('openapi');
     annotateOpenApi(api, publications, reader, cookieName);
     if (representation === 'yaml') return res.type('application/yaml').send(stringify(api));
     if (representation === 'html') {
-      return res.send(page('Features OpenAPI', '<p><a href="/features/openapi?f=json">OpenAPI JSON</a></p>' +
+      return res.send(page('Features OpenAPI', `<p><a href="${root}/openapi?f=json">OpenAPI JSON</a></p>` +
         `<pre>${escapeHtml(JSON.stringify(api, null, 2))}</pre>`));
     }
     res.type('application/vnd.oai.openapi+json;version=3.0').json(api);

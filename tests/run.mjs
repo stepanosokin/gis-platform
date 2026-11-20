@@ -80,7 +80,7 @@ async function runHttpTests() {
 
   try {
     assert.equal(cli('apply', ['apply', plan.planId]).code, 'OK');
-    if (mode !== '--versions') {
+    if (mode !== '--versions' && mode !== '--providers') {
       const testFilter = mode === '--smoke' ? ['--test-name-pattern=^the applied'] : [];
       console.log(run('test-http', 'docker', [
         'run', '--rm', ...containerUser, ...resultsMount, '--network', `${project}_default`,
@@ -97,6 +97,12 @@ async function runHttpTests() {
         ...stackEnvironment, GIS_TEST_PUBLIC_URL: publicUrl, GIS_TEST_CONFIG: file,
       }));
     }
+    if (mode === '--providers' || !mode) {
+      const filter = mode === '--providers' && process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
+      console.log(run('test-providers', process.execPath, ['--test', ...filter, 'tests/providers.test.mjs'], {
+        ...stackEnvironment, GIS_TEST_PUBLIC_URL: publicUrl, GIS_TEST_CONFIG: file,
+      }));
+    }
   } catch (error) {
     try {
       run('stack-containers', 'docker', ['compose', '-p', project, 'ps', '--all']);
@@ -106,8 +112,16 @@ async function runHttpTests() {
     }
     throw error;
   } finally {
-    run('stack-down', 'docker', ['compose', '-p', project, 'down', '--volumes']);
+    run('stack-down', 'docker', ['compose', '-p', project, 'down', '--remove-orphans', '--volumes']);
+    removeTestVolumes(project);
   }
+}
+
+function removeTestVolumes(projectName) {
+  const output = run(`${projectName}-volumes`, 'docker', ['volume', 'ls', '-q',
+    '--filter', `label=com.docker.compose.project=${projectName}`]);
+  const volumes = output.trim().split(/\s+/).filter(Boolean);
+  if (volumes.length) run(`${projectName}-volume-down`, 'docker', ['volume', 'rm', ...volumes]);
 }
 
 function makeAdminCertificates() {
@@ -206,6 +220,7 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
   } finally {
     run(`${suite}-down`, 'docker', ['compose', '-p', accessProject, '-f', 'compose.yaml', '-f', 'compose.auth.yaml',
       '-f', 'compose.mailpit.yaml', 'down', '--remove-orphans', '--volumes']);
+    removeTestVolumes(accessProject);
   }
 }
 
@@ -219,7 +234,7 @@ if (mode === '--qgis') {
   process.exit(0);
 }
 run('build-test-image', 'docker', ['build', '-f', 'tests/Dockerfile', '-t', image, '.']);
-if (mode === '--versions') {
+if (mode === '--versions' || mode === '--providers') {
   await runHttpTests();
   process.exit(0);
 }

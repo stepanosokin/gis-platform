@@ -11,7 +11,7 @@ import nodemailer from 'nodemailer';
 import { Pool } from 'pg';
 import { mountAccountPages } from './account-pages.js';
 import type { Publication } from './config.js';
-import { featuresError, mountFeaturesMetadata } from './features-metadata.js';
+import { featuresError, mountFeaturesMetadata, readManagedMetadata } from './features-metadata.js';
 import { publicationAccess } from './publication-access.js';
 import type { PublicationReader } from './publication-access.js';
 import { prepareAccessStore, readPublicationReader } from './access-store.js';
@@ -30,6 +30,7 @@ interface Settings {
   publicationTitles?: Record<string, string>;
   operators?: Record<string, AdminPermission[]>;
   version?: string;
+  managedFeatures?: boolean;
 }
 
 const settings = JSON.parse(await readFile('/etc/gis/access.json', 'utf8')) as Settings;
@@ -265,7 +266,8 @@ app.get('/internal/authorize/:publicationId', async (req, res) => {
   res.sendStatus(204);
 });
 mountFeaturesMetadata(app, settings.publications, `${secureCookies ? '__Secure-' : ''}gis.session_token`,
-  async (req, res) => (await publicationReader(req, res)).reader);
+  async (req, res) => (await publicationReader(req, res)).reader,
+  settings.managedFeatures ? await readManagedMetadata() : undefined);
 app.get('/internal/ready', async (_req, res) => {
   await pool.query('SELECT 1');
   res.sendStatus(204);

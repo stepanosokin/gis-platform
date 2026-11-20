@@ -15,11 +15,30 @@ export interface Publication {
   extent: [number, number, number, number];
 }
 
+export interface ManagedProvider {
+  type: 'pygeoapi';
+  image: string;
+  digest?: string;
+  api: {
+    protocol: 'features';
+    scheme: 'http';
+    port: number;
+    base_path: string;
+    public_root: string;
+    links: 'canonical';
+    readiness: string;
+  };
+  environment?: Record<string, string>;
+  volumes?: Record<string, string>;
+}
+
+export type Provider = { type: 'pygeoapi'; image?: undefined } | ManagedProvider;
+
 interface PlatformConfig {
   schema_version: 1;
   server: { host: string; port: number; tls?: TlsConfig };
   sources: Record<string, { type: 'geojson'; path: string }>;
-  providers: Record<string, { type: 'pygeoapi' }>;
+  providers: Record<string, Provider>;
   publications: Record<string, Publication>;
   auth?: AuthConfig;
 }
@@ -55,6 +74,7 @@ export type FeaturesConfig = {
   port: number;
   publicUrl: string;
   sourcePath: string;
+  providers?: Record<string, Provider>;
   auth?: AuthConfig;
   tls?: TlsConfig;
 } & (
@@ -67,12 +87,45 @@ export function publicationEntries(config: FeaturesConfig): [string, Publication
   return [[config.publicationId, config.publication], ...Object.entries(config.additionalPublications ?? {})];
 }
 
+export function needsPublicMetadata(config: FeaturesConfig) {
+  return config.providers !== undefined &&
+    (!config.auth || publicationEntries(config).every(([, publication]) => publication.access === 'public'));
+}
+
+export function builtInProviderId(config: FeaturesConfig) {
+  return config.providers ? Object.keys(config.providers).find((id) => !config.providers?.[id]?.image)
+    : config.publicationId === null ? config.providerId : config.publication.provider;
+}
+
+export function providerRoot(config: FeaturesConfig, id: string) {
+  return config.providers?.[id]?.image ? config.providers[id].api.public_root : '/features';
+}
+
+export function publicationUrl(config: FeaturesConfig, id: string, publication: Publication) {
+  return new URL(`${providerRoot(config, publication.provider)}/collections/${id}`, config.publicUrl).href;
+}
+
+export function imageReference(image: string) {
+  const match = /^((?:(?:[a-z0-9][a-z0-9.-]*)(?::[0-9]+)?\/)?[a-z0-9]+(?:[._-]+[a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-]+[a-z0-9]+)*)*)(?::([\w][\w.-]{0,127}))?(?:@(sha256:[0-9a-f]{64}))?$/.exec(image);
+  if (!match?.[1] || (!match[2] && !match[3]) || match[2] === 'latest') {
+    throw new Error('A provider image must include a version tag or an immutable digest.');
+  }
+  return { repository: match[1], digest: match[3] };
+}
+
+export function pinnedImage(provider: ManagedProvider) {
+  const { repository, digest } = imageReference(provider.image);
+  if (digest) return provider.image;
+  if (!provider.digest) throw new Error('The provider image has not been pinned.');
+  return `${repository}@${provider.digest}`;
+}
+
 export function serializeFeaturesConfig(config: FeaturesConfig) {
   const snapshot: PlatformConfig = {
     schema_version: 1,
     server: { host: new URL(config.publicUrl).hostname, port: config.port, tls: config.tls },
     sources: { [config.publicationId === null ? config.sourceId : config.publication.source]: { type: 'geojson', path: config.sourcePath } },
-    providers: { [config.publicationId === null ? config.providerId : config.publication.provider]: { type: 'pygeoapi' } },
+    providers: config.providers ?? { [builtInProviderId(config)!]: { type: 'pygeoapi' } },
     publications: Object.fromEntries(publicationEntries(config)),
     auth: config.auth,
   };
@@ -99,15 +152,53 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     throw new Error(errors.join('; '));
   }
 
+  const providers = Object.entries(config.providers);
+  if (providers.filter(([, provider]) => !provider.image).length > 1) {
+    throw new Error('Only one provider can use the built-in image. Configure an image and API for each additional instance.');
+  }
+  const roots = new Set<string>();
+  for (const [id, provider] of providers) {
+    if (!provider.image && !Object.hasOwn(provider, 'image')) {
+      roots.add('/features');
+      continue;
+    }
+    if (!provider.image || id.length > 54) throw new Error(`Invalid managed provider '${id}'.`);
+    const { digest } = imageReference(provider.image);
+    if (digest && provider.digest && digest !== provider.digest) throw new Error(`Provider '${id}' has conflicting digests.`);
+    const { public_root: root } = provider.api;
+    if (['/account', '/api', '/internal'].some((reserved) => root === reserved || root.startsWith(reserved + '/'))) {
+      throw new Error(`Provider '${id}' uses a reserved public root.`);
+    }
+    roots.add(root);
+    const targets = Object.values(provider.volumes ?? {});
+    if (targets.some((target) => target.split('/').some((segment) => segment === '.' || segment === '..') ||
+        ['/source', '/etc/pygeoapi/gis', '/venv'].some((path) =>
+          target === path || target.startsWith(path + '/') || path.startsWith(target + '/'))) ||
+        new Set(targets).size !== targets.length) throw new Error(`Invalid volume targets for provider '${id}'.`);
+    if (Object.keys(provider.environment ?? {}).some((name) =>
+      ['PYGEOAPI_CONFIG', 'PYGEOAPI_OPENAPI', 'SCRIPT_NAME'].includes(name))) {
+      throw new Error(`Provider '${id}' overrides a required adapter environment variable.`);
+    }
+  }
+  for (const root of roots) {
+    if ([...roots].some((other) => other !== root && root.startsWith(other + '/'))) {
+      throw new Error(`Ambiguous public root '${root}'.`);
+    }
+  }
+
   const entries = Object.entries(config.publications).map((
     [id, { source, provider, protocol, access, title, description, extent }],
   ): [string, Publication] => [id, { source, provider, protocol, access, title, description, extent }]);
-  for (const [id, { source, provider, access, extent }] of entries) {
+  for (const [id, { source, provider, protocol, access, extent }] of entries) {
     if (!Object.hasOwn(config.sources, source)) {
       throw new Error(`Publication '${id}' references unknown source '${source}'.`);
     }
     if (!Object.hasOwn(config.providers, provider)) {
       throw new Error(`Publication '${id}' references unknown provider '${provider}'.`);
+    }
+    const instance = config.providers[provider];
+    if (instance?.image && instance.api.protocol !== protocol) {
+      throw new Error(`Publication '${id}' uses a protocol unsupported by provider '${provider}'.`);
     }
     const [west, south, east, north] = extent;
     if (west > east || south > north) throw new Error(`Publication '${id}' has an invalid extent.`);
@@ -115,7 +206,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   }
   const [first, ...others] = entries;
   const [sourceId, sourceConfig] = Object.entries(config.sources)[0]!;
-  const providerId = Object.keys(config.providers)[0]!;
+  const providerId = providers[0]?.[0] ?? '';
 
   const { host, port, tls } = config.server;
   const auth = config.auth;
@@ -138,6 +229,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     port,
     publicUrl: new URL('/features', `${tls ? 'https' : 'http'}://${host}:${port}`).href,
     sourcePath: resolve(directory, sourceConfig.path),
+    ...(providers.length !== 1 || providers.some(([, provider]) => provider.image) ? { providers: config.providers } : {}),
     ...(first ? { publicationId: first[0], publication: first[1],
       ...(others.length > 0 && { additionalPublications: Object.fromEntries(others) }) }
       : { publicationId: null, sourceId, providerId }),

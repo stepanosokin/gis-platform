@@ -38,7 +38,7 @@ test('a signed-in user can create a named token and read a private publication w
 function cli(args, expected = 'OK', exitCode = 0, environment = {}) {
   const result = spawnSync(process.execPath, ['dist/cli.js', ...args, '--json'], {
     env: { ...process.env, ...environment }, encoding: 'utf8',
-    timeout: args[0] === 'config' ? 120_000 : 15_000, windowsHide: true,
+    timeout: ['config', 'provider'].includes(args[0]) ? 180_000 : 15_000, windowsHide: true,
   });
   assert.ifError(result.error);
   const response = JSON.parse(result.stdout);
@@ -711,4 +711,62 @@ test('an unavailable unchanged source does not block an access-only change or th
     await rename(moved, source);
     await writeFile(filename, original);
   }
+});
+
+test('moving a private publication between provider instances preserves its URL, ID, and current grant', async () => {
+  const filename = process.env.GIS_TEST_CONFIG;
+  const draft = parse(await readFile(filename, 'utf8'));
+  const platform = join(dirname(filename), 'provider-transfer.yaml');
+  const integration = join(dirname(filename), 'provider-transfer-integration.yaml');
+  await writeFile(platform, stringify(draft));
+  await writeFile(integration, stringify({
+    type: 'pygeoapi',
+    api: { protocol: 'features', scheme: 'http', port: 8082, base_path: '/', public_root: '/features',
+      links: 'canonical', readiness: '/openapi?f=json' },
+  }));
+  cli(['config', 'apply', cli(['config', 'plan', platform]).planId]);
+  const email = 'provider-transfer@example.test';
+  await register(email, password);
+  const cookie = await signIn(email, password);
+  const { secret } = await createToken(cookie, 'Provider transfer');
+  const { headers } = bearer(secret);
+  cli(['access', 'grant', 'private-places', '--email', email]);
+  assert.equal((await freshGet(items, headers, 200, true)).id, 'central');
+  const { currentVersion: original } = cli(['status']);
+
+  cli(['provider', 'add', 'dedicated',
+    'geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a',
+    integration, platform]);
+  const updated = parse(await readFile(platform, 'utf8'));
+  updated.publications['private-places'].provider = 'dedicated';
+  await writeFile(platform, stringify(updated));
+  const transition = cli(['config', 'plan', platform]);
+  assert.deepEqual(transition.publications.find(({ publicationId }) => publicationId === 'private-places'), {
+    publicationId: 'private-places',
+    previousUrl: new URL(privateCollection, gateway).href,
+    newUrl: new URL(privateCollection, gateway).href,
+    previousAccess: 'private', newAccess: 'private', personalGrants: 'preserve',
+  });
+  assert.ok(transition.services.includes('provider-dedicated'));
+  cli(['config', 'apply', transition.planId]);
+
+  await freshGet(items, {}, 401);
+  assert.equal((await freshGet(items, headers, 200, true)).id, 'central');
+  for (const authorized of [false, true]) {
+    const authHeaders = authorized ? headers : {};
+    const catalog = await freshGet('/features/collections?f=json', authHeaders, 200, true);
+    assert.equal(catalog.collections.some(({ id }) => id === 'private-places'), authorized);
+    assert.ok(catalog.collections.some(({ id }) => id === 'places'));
+    const api = await freshGet('/features/openapi?f=json', authHeaders, 200, true);
+    assert.equal(Boolean(api.paths['/collections/private-places/items']), authorized);
+    assert.ok(api.paths['/collections/places/items']);
+  }
+  await freshGet('/features/admin', headers, 404);
+  cli(['provider', 'update', 'dedicated', platform,
+    'docker.io/geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a']);
+  assert.equal((await freshGet(items, headers, 200, true)).id, 'central');
+  cli(['access', 'revoke', 'private-places', '--email', email]);
+  await freshGet(items, headers, 403);
+  cli(['config', 'apply', cli(['config', 'plan', '--rollback-to', original]).planId]);
+  await freshGet(items, headers, 403);
 });

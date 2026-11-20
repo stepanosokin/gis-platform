@@ -3,8 +3,10 @@ import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promis
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { publicationEntries, serializeFeaturesConfig, type FeaturesConfig } from './config.js';
-import { archiveLegacyOpenApi, closeGateway, compose, openGateway, prepareFeaturesStack, providerConfigurationChanged,
+import { builtInProviderId, needsPublicMetadata, publicationEntries, publicationUrl, providerRoot,
+  serializeFeaturesConfig, type FeaturesConfig } from './config.js';
+import { pinProviderImages } from './provider-images.js';
+import { archiveLegacyOpenApi, closeGateway, compose, featuresStackRunning, openGateway, prepareFeaturesStack, providerConfigurationChanged,
   publicationGrantRemoval, resolveComposeProject, savedSourceFingerprint, sourceFingerprint, startFeaturesStack } from './features-stack.js';
 import { CliError } from './cli-result.js';
 
@@ -16,6 +18,7 @@ interface Plan {
   targetVersion?: string;
   attempt?: string;
   sourceHash?: string | null;
+  edit?: { filename: string; before: string };
 }
 
 interface ActiveState {
@@ -24,6 +27,7 @@ interface ActiveState {
   pendingPlanId?: string;
   phase?: 'preflight' | 'switch' | 'open' | 'finalize' | 'recovery';
   finalizeFailed?: boolean;
+  openFailed?: boolean;
   closedRoutes?: string[];
   results?: Record<string, ApplyResult>;
 }
@@ -80,8 +84,8 @@ async function readPlan(planId: string): Promise<Plan> {
   }
 }
 
-function publicationUrl(config: FeaturesConfig) {
-  return config.publicationId === null ? null : `${config.publicUrl}/collections/${config.publicationId}`;
+function firstPublicationUrl(config: FeaturesConfig) {
+  return config.publicationId === null ? null : publicationUrl(config, config.publicationId, config.publication);
 }
 
 export async function configurationStatus() {
@@ -91,7 +95,7 @@ export async function configurationStatus() {
     phase: state.phase ?? (state.pendingPlanId ? 'switch' : 'ready'),
     pendingPlanId: state.pendingPlanId ?? null, closedRoutes: state.closedRoutes ?? [],
   };
-  if (state.phase === 'recovery' || state.finalizeFailed) throw new CliError('RECOVERY_INCOMPLETE', 7,
+  if (state.phase === 'recovery' || state.finalizeFailed || state.openFailed) throw new CliError('RECOVERY_INCOMPLETE', 7,
     `Configuration recovery is incomplete. Closed routes: ${data.closedRoutes.join(', ')}.`, data);
   return data;
 }
@@ -137,25 +141,43 @@ async function checkPublicationIdentities(config: FeaturesConfig, current: Plan 
   for (const id of retired) if (unverified.has(id)) reject(id);
 }
 
-function fingerprint({ baseVersion, config, yaml, targetVersion, attempt, sourceHash }: Omit<Plan, 'planId'>) {
-  return `plan-${createHash('sha256').update(JSON.stringify({ baseVersion, config, yaml, targetVersion, attempt, sourceHash })).digest('hex')}`;
+function digest(value: string) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function fingerprint({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, edit }: Omit<Plan, 'planId'>) {
+  return `plan-${digest(JSON.stringify({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, edit }))}`;
 }
 
 export async function createPlan(config: FeaturesConfig, yaml?: string,
-  versions?: { targetVersion: string; baseVersion: string | null }) {
+  versions?: { targetVersion?: string; baseVersion: string | null }, editFile?: {
+    filename: string; original: string; originalConfig: FeaturesConfig;
+  }) {
   let { baseVersion, targetVersion } = versions ?? {};
   if (baseVersion === undefined) baseVersion = (await readActive()).planId;
   const currentPlan = baseVersion ? await readPlan(baseVersion) : null;
   await checkPublicationIdentities(config, currentPlan);
   const current = currentPlan?.config ?? null;
+  if (current && editFile) {
+    const before = editFile.originalConfig;
+    for (const [id, provider] of Object.entries(before.providers ?? {})) {
+      const active = current.providers?.[id];
+      if (provider.image && !provider.digest && active?.image === provider.image) provider.digest = active.digest;
+    }
+    if (JSON.stringify(before) !== JSON.stringify(current)) {
+      throw new CliError('INVALID_CONFIG', 2, 'Apply the pending platform YAML changes before managing providers.');
+    }
+  }
+  await pinProviderImages(config, current);
   const sourceHash = config.publicationId === null ? null : await sourceFingerprint(config.sourcePath);
   const changedSource = await sourceContentChanged(sourceHash, baseVersion);
-  const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash };
+  const edit = editFile && { filename: editFile.filename, before: digest(editFile.original) };
+  const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash, edit };
   const planId = fingerprint(snapshot);
   await writeJson(join(planDirectory(planId), 'plan.json'), { ...snapshot, planId });
 
-  const previousUrl = current ? publicationUrl(current) : null;
-  const newUrl = publicationUrl(config);
+  const previousUrl = current ? firstPublicationUrl(current) : null;
+  const newUrl = firstPublicationUrl(config);
   const changed = changedSource || JSON.stringify(current) !== JSON.stringify(config);
   const previous = new Map(current ? publicationEntries(current) : []);
   const next = new Map(publicationEntries(config));
@@ -166,27 +188,36 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     const after = next.get(id);
     return {
       publicationId: id,
-      previousUrl: before && current ? `${current.publicUrl}/collections/${id}` : null,
-      newUrl: after ? `${config.publicUrl}/collections/${id}` : null,
+      previousUrl: before && current ? publicationUrl(current, id, before) : null,
+      newUrl: after ? publicationUrl(config, id, after) : null,
       previousAccess: before?.access ?? null,
       newAccess: after?.access ?? null,
       personalGrants: !after ? 'delete' : before ? 'preserve' : 'none',
     };
   });
+  const changedProviders = new Set([...Object.keys(current?.providers ?? {}), ...Object.keys(config.providers ?? {})]
+    .filter((id) => JSON.stringify(current?.providers?.[id]?.image ? current.providers[id] : null) !==
+      JSON.stringify(config.providers?.[id]?.image ? config.providers[id] : null)));
+  const restarted = new Set([...changedProviders, ...Object.keys(config.providers ?? {}).filter((id) =>
+    !!config.providers?.[id]?.image && (changedSource || providerConfigurationChanged(config, current, id)))]);
   return {
     planId,
     baseVersion,
     targetVersion,
     added: [...next.keys()].filter((id) => !previous.has(id)),
     changed: [...next].filter(([id, publication]) => previous.has(id) &&
-      (platformChanged || JSON.stringify(previous.get(id)) !== JSON.stringify(publication))).map(([id]) => id),
+      (platformChanged || changedProviders.has(publication.provider) ||
+       JSON.stringify(previous.get(id)) !== JSON.stringify(publication))).map(([id]) => id),
     removed: [...previous.keys()].filter((id) => !next.has(id)),
     previousUrl,
     newUrl,
     publications: outcomes,
     routesToClose: changed ? affectedRoutes(config, current) : [],
-    services: changed ? ['caddy', ...(changedSource || !currentPlan?.yaml ||
-      providerConfigurationChanged(config, current) ? ['pygeoapi'] : []),
+    services: changed ? ['caddy', ...((builtInProviderId(config) || (current && builtInProviderId(current))) &&
+      (changedSource || !currentPlan?.yaml || providerConfigurationChanged(config, current)) ? ['pygeoapi'] : []),
+      ...[...restarted].filter((id) => config.providers?.[id]?.image || current?.providers?.[id]?.image)
+        .map((id) => `provider-${id}`),
+      ...(needsPublicMetadata(config) ? ['metadata'] : []),
       ...(config.auth || current?.auth ? ['access'] : []),
       ...(current?.auth?.postgres_password_file !== config.auth?.postgres_password_file ? ['postgres'] : []),
       ...(mailPort(current) !== mailPort(config) ? ['mailpit'] : [])] : [],
@@ -254,7 +285,9 @@ function affectedRoutes(candidate: FeaturesConfig, current: FeaturesConfig | nul
     config.publicUrl,
     `${config.publicUrl}/collections`,
     `${config.publicUrl}/openapi`,
-    ...publicationEntries(config).map(([id]) => `${config.publicUrl}/collections/${id}`),
+    ...[...new Set(Object.keys(config.providers ?? {}).map((id) => providerRoot(config, id)))].flatMap((root) =>
+      ['', '/collections', '/openapi'].map((suffix) => new URL(root + suffix, config.publicUrl).href)),
+    ...publicationEntries(config).map(([id, publication]) => publicationUrl(config, id, publication)),
     ...(config.auth ? ['/account', '/api/auth'].map((path) => new URL(path, config.publicUrl).href) : []),
   ]))];
 }
@@ -264,8 +297,65 @@ async function openConfirmedVersion(state: ActiveState, candidate: Plan) {
     ...state, phase: 'open', planId: candidate.planId, previousVersion: state.planId,
   };
   await writeJson(activeFile, confirmed);
-  await openGateway(revision(candidate).directory);
-  await writeJson(activeFile, settled(confirmed, candidate.planId, { code: 'OK' }));
+  await finishOpen(confirmed, candidate);
+}
+
+async function finishOpen(state: ActiveState, candidate: Plan) {
+  await persistProviderEdit(candidate);
+  const { directory } = revision(candidate);
+  try {
+    await openGateway(directory);
+    await writeJson(activeFile, settled(state, candidate.planId, { code: 'OK' }));
+  } catch (error) {
+    if (!candidate.edit) throw error;
+    await keepProviderOpenPending(state, candidate);
+  }
+}
+
+async function keepProviderOpenPending(state: ActiveState, candidate: Plan) {
+  // The operator YAML is already committed. Recover this version on retry.
+  await secureGateway(revision(candidate)).catch(() => {});
+  await writeJson(activeFile, { ...state, openFailed: true }).catch(() => {});
+}
+
+async function resumeProviderOpen(state: ActiveState, candidate: Plan, previous: Plan | null) {
+  const { config, directory } = revision(candidate);
+  try {
+    await checkProviderEdit(candidate);
+    await closeGateway(directory);
+    await startFeaturesStack(config, directory);
+    await finishOpen(state, candidate);
+  } catch {
+    const saved = await readFile(candidate.edit!.filename, 'utf8').catch(() => null);
+    if (state.openFailed || saved === candidate.yaml) {
+      await keepProviderOpenPending(state, candidate);
+    } else {
+      await restoreStack({ ...state, planId: previous?.planId ?? null, previousVersion: previous?.baseVersion ?? null },
+        candidate, previous, 'The provider configuration update could not be completed.');
+    }
+  }
+}
+
+async function persistProviderEdit({ edit, yaml }: Plan) {
+  if (!edit || yaml === undefined) return;
+  const original = await readFile(edit.filename, 'utf8');
+  if (original === yaml) return;
+  if (digest(original) !== edit.before) throw new Error('The platform YAML changed after planning.');
+  const temporaryFile = `${edit.filename}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryFile, yaml, { flag: 'wx', mode: 0o600, flush: true });
+    await rename(temporaryFile, edit.filename);
+  } finally {
+    await rm(temporaryFile, { force: true }).catch(() => {});
+  }
+}
+
+async function checkProviderEdit({ edit, yaml }: Plan) {
+  if (!edit) return;
+  const original = await readFile(edit.filename, 'utf8').catch(() => null);
+  if (original === null || (digest(original) !== edit.before && original !== yaml)) {
+    throw new CliError('PLAN_STALE', 5, 'The platform YAML changed after planning.');
+  }
 }
 
 async function grantCleanup(plan: Plan, current: Plan | null) {
@@ -339,7 +429,8 @@ async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null
       await readFile(join(previous.directory, 'openapi.json')).catch(() => archiveLegacyOpenApi(previous));
     }
     await prepareFeaturesStack(candidate, { previous: current ? revision(current) : undefined, sourceHash: plan.sourceHash });
-    if (plan.yaml !== undefined) await writeFile(join(candidate.directory, 'platform.yaml'), plan.yaml, { mode: 0o600 });
+    if (plan.yaml !== undefined) await writeFile(join(candidate.directory, 'platform.yaml'),
+      plan.config.providers ? serializeFeaturesConfig(plan.config) : plan.yaml, { mode: 0o600 });
   } catch {
     await writeJson(activeFile, settled(state, plan.planId, {
       code: 'APPLY_FAILED', message: 'Preflight failed while checking the source, TLS, native configuration or OpenAPI.',
@@ -384,8 +475,12 @@ async function applicationLock(scope: string) {
 
 function resultFor(state: ActiveState, plan: Plan) {
   const data = {
-    planId: plan.planId, currentVersion: state.planId, url: publicationUrl(plan.config),
+    planId: plan.planId, currentVersion: state.planId, url: firstPublicationUrl(plan.config),
   };
+  if (plan.edit && state.phase === 'open' && state.pendingPlanId === plan.planId) {
+    throw new CliError('RECOVERY_INCOMPLETE', 7, 'The provider YAML was committed. Repeat the plan to reopen the gateway.',
+      { ...data, closedRoutes: state.closedRoutes ?? [] });
+  }
   const result = state.results?.[plan.planId] ?? { code: 'NO_CHANGE' };
   if (result.code === 'APPLY_FAILED' || result.code === 'RECOVERY_INCOMPLETE') {
     throw new CliError(result.code, result.code === 'APPLY_FAILED' ? 6 : 7, result.message!,
@@ -415,6 +510,8 @@ export async function applyPlan(planId: string) {
         await writeJson(activeFile, settled(state, candidate.planId, {
           code: 'APPLY_FAILED', message: 'The preflight check was interrupted.',
         }));
+      } else if (state.phase === 'open' && candidate.edit) {
+        await resumeProviderOpen(state, candidate, previous);
       } else {
         if (state.phase === 'open') {
           state = { ...state, planId: previous?.planId ?? null, previousVersion: previous?.baseVersion ?? null };
@@ -423,7 +520,7 @@ export async function applyPlan(planId: string) {
       }
       state = await readActive();
       if (state.results?.[planId]) return resultFor(state, plan);
-      if (state.phase === 'recovery') return resultFor(state, candidate);
+      if (state.phase === 'recovery' || state.phase === 'open') return resultFor(state, candidate);
     }
     const current = state.planId ? await readPlan(state.planId) : null;
     if (state.planId === planId) return resultFor(state, plan);
@@ -432,14 +529,21 @@ export async function applyPlan(planId: string) {
         planId, baseVersion: plan.baseVersion, currentVersion: state.planId,
       });
     }
+    await checkProviderEdit(plan);
     await checkPublicationIdentities(plan.config, current);
     if (current && JSON.stringify(current.config) === JSON.stringify(plan.config) &&
         !await sourceContentChanged(plan.sourceHash, current.planId)) {
       const sourceChangedAfterPlanning = plan.config.publicationId !== null &&
         await sourceContentChanged(await sourceFingerprint(plan.config.sourcePath), current.planId);
+      if (!sourceChangedAfterPlanning && plan.config.providers &&
+          !await featuresStackRunning(current.config, revision(current).directory)) {
+        await activatePlan(state, plan, current);
+        return resultFor(await readActive(), plan);
+      }
       const outcome = sourceChangedAfterPlanning
         ? { code: 'APPLY_FAILED', message: 'The GeoJSON source changed after planning. Create a new plan.' } as const
         : { code: 'NO_CHANGE' } as const;
+      if (!sourceChangedAfterPlanning) await persistProviderEdit(plan);
       await writeJson(activeFile, settled(state, planId, outcome));
     } else {
       await activatePlan(state, plan, current);

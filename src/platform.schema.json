@@ -92,13 +92,44 @@
       }
     },
     "providers": {
-      "allOf": [{ "$ref": "#/$defs/singleEntry" }],
       "type": "object",
+      "propertyNames": { "$ref": "#/$defs/id" },
       "additionalProperties": {
         "type": "object",
         "required": ["type"],
         "additionalProperties": false,
-        "properties": { "type": { "const": "pygeoapi" } }
+        "properties": {
+          "type": { "const": "pygeoapi" },
+          "image": { "type": "string", "maxLength": 512 },
+          "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "api": {
+            "type": "object",
+            "required": ["protocol", "scheme", "port", "base_path", "public_root", "links", "readiness"],
+            "additionalProperties": false,
+            "properties": {
+              "protocol": { "const": "features" },
+              "scheme": { "const": "http" },
+              "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "base_path": { "type": "string", "pattern": "^/(?:[a-z][a-z0-9-]*(?:/[a-z][a-z0-9-]*)*)?$" },
+              "public_root": { "type": "string", "pattern": "^/[a-z][a-z0-9-]*(?:/[a-z][a-z0-9-]*)*$" },
+              "links": { "const": "canonical" },
+              "readiness": { "type": "string", "pattern": "^/[a-z][a-z0-9/-]*(?:\\?f=json)?$" }
+            }
+          },
+          "environment": {
+            "type": "object",
+            "propertyNames": { "pattern": "^[A-Z_][A-Z0-9_]*$" },
+            "additionalProperties": { "type": "string" }
+          },
+          "volumes": {
+            "type": "object",
+            "propertyNames": { "$ref": "#/$defs/id" },
+            "additionalProperties": { "type": "string", "pattern": "^/(?:[a-zA-Z0-9_.-]+/)*[a-zA-Z0-9_.-]+$" }
+          }
+        },
+        "if": { "required": ["image"] },
+        "then": { "required": ["api"] },
+        "else": { "properties": { "digest": false, "api": false, "environment": false, "volumes": false } }
       }
     },
     "publications": {
