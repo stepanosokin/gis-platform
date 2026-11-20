@@ -32,6 +32,7 @@ interface OpenApiOperation {
 interface OpenApi {
   paths: Record<string, { get?: OpenApiOperation; post?: OpenApiOperation }>;
   tags?: { name: string }[];
+  info?: { title: string };
   components: {
     parameters?: { resourceId?: { schema?: { default?: string } } };
     securitySchemes?: Record<string, unknown>;
@@ -123,12 +124,13 @@ export function mountFeaturesMetadata(app: Express, modes: Record<string, Public
 function mountRoot(app: Express, modes: Record<string, Publication['access']>, cookieName: string,
   readReader: (req: Request, res: Response) => Promise<PublicationReader | null>, root: string, metadata?: ManagedMetadata) {
   const publications = new Map(Object.entries(modes));
+  const title = metadata?.api.info?.title ?? 'Features';
   const conformsTo = metadata?.conformsTo;
   if (conformsTo) app.get(`${root}/conformance`, (req, res) => {
     const representation = requestedFormat(req, ['json', 'html']);
     if (!representation) return res.status(400).json({ code: 'InvalidParameterValue', description: 'Invalid format.' });
     res.vary('Accept');
-    if (representation === 'html') return res.send(page('Features conformance',
+    if (representation === 'html') return res.send(page(`${title} conformance`,
       `<ul>${conformsTo.map((uri) => `<li>${escapeHtml(uri)}</li>`).join('')}</ul>`));
     res.json({ conformsTo });
   });
@@ -167,7 +169,7 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
     if (representation === 'html') {
       const rows = catalog.collections.map(({ id, title, description }) =>
         `<li><a href="${root}/collections/${encodeURIComponent(id)}?f=html">${escapeHtml(title)}</a>${description ? `<p>${escapeHtml(description)}</p>` : ''}</li>`);
-      return res.send(page('Features collections', rows.length ? `<ul>${rows.join('')}</ul>` : '<p>No collections available.</p>'));
+      return res.send(page(`${title} collections`, rows.length ? `<ul>${rows.join('')}</ul>` : '<p>No collections available.</p>'));
     }
     res.json(catalog);
   });
@@ -179,7 +181,7 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
     annotateOpenApi(api, publications, reader, cookieName);
     if (representation === 'yaml') return res.type('application/yaml').send(stringify(api));
     if (representation === 'html') {
-      return res.send(page('Features OpenAPI', `<p><a href="${root}/openapi?f=json">OpenAPI JSON</a></p>` +
+      return res.send(page(`${title} OpenAPI`, `<p><a href="${root}/openapi?f=json">OpenAPI JSON</a></p>` +
         `<pre>${escapeHtml(JSON.stringify(api, null, 2))}</pre>`));
     }
     res.type('application/vnd.oai.openapi+json;version=3.0').json(api);

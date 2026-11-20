@@ -1,5 +1,6 @@
 import express from 'express';
 import { featuresError, mountFeaturesMetadata, readManagedMetadata } from './features-metadata.js';
+import { validateMapRequest } from './maps-profile.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -8,6 +9,7 @@ app.use((_req, res, next) => {
   next();
 });
 const metadata = await readManagedMetadata();
+app.get('/internal/validate-map', validateMapRequest);
 const modes = Object.fromEntries(Object.values(metadata).flatMap(({ collections }) =>
   collections.map(({ id }) => [id, 'public' as const])));
 mountFeaturesMetadata(app, modes, '', async () => null, metadata);

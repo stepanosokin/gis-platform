@@ -3,12 +3,12 @@ import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promis
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { builtInProviderId, hasGeoJson, needsPublicMetadata, postgisSource, publicationEntries, publicationUrl, providerRoot,
-  serializeFeaturesConfig, usedVectorFiles, vectorFile, type FeaturesConfig, type Publication } from './config.js';
+import { builtInProviderId, hasGeoJson, needsMetadataService, postgisSource, publicationEntries, publicationUrl, providerRoot,
+  fileSource, serializeFeaturesConfig, usedFileSources, vectorFile, type FeaturesConfig, type Publication } from './config.js';
 import { pinProviderImages } from './provider-images.js';
 import { archiveLegacyOpenApi, closeGateway, compose, featuresStackRunning, openGateway, prepareFeaturesStack, providerConfigurationChanged,
-  publicationGrantRemoval, resolveComposeProject, savedSourceFingerprint, savedVectorFileFingerprints, sourceFingerprint,
-  startFeaturesStack, vectorFileFingerprints, FeaturesPreflightError } from './features-stack.js';
+  publicationGrantRemoval, resolveComposeProject, savedSourceFingerprint, savedFileFingerprints, sourceFingerprint,
+  startFeaturesStack, fileFingerprints, FeaturesPreflightError } from './features-stack.js';
 import { CliError } from './cli-result.js';
 
 interface Plan {
@@ -19,6 +19,7 @@ interface Plan {
   targetVersion?: string;
   attempt?: string;
   sourceHash?: string | null;
+  // Keep the persisted field name for plans created before raster file support.
   vectorHashes?: Record<string, string | null>;
   edit?: { filename: string; before: string };
 }
@@ -139,11 +140,12 @@ async function checkPublicationIdentities(config: FeaturesConfig, current: Plan 
       if (!candidate) continue;
       const before = postgisLocation(version.config, previous);
       const after = postgisLocation(config, candidate);
-      const beforeFile = vectorFile(version.config, previous.source);
-      const afterFile = vectorFile(config, candidate.source);
+      const beforeFile = fileSource(version.config, previous.source);
+      const afterFile = fileSource(config, candidate.source);
       const sameIdentity = previous.source === candidate.source && previous.protocol === candidate.protocol &&
         JSON.stringify(before) === JSON.stringify(after) &&
-        beforeFile?.type === afterFile?.type && beforeFile?.layer === afterFile?.layer;
+        beforeFile?.type === afterFile?.type &&
+        vectorFile(version.config, previous.source)?.layer === vectorFile(config, candidate.source)?.layer;
       if (version === current) {
         if (!sameIdentity) reject(id);
       } else {
@@ -188,16 +190,16 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   await pinProviderImages(config, current);
   const sourceHash = hasGeoJson(config) ? await sourceFingerprint(config.sourcePath) : null;
   const changedSource = await sourceContentChanged(sourceHash, baseVersion);
-  const vectorHashes = Object.keys(config.vectorFiles ?? {}).length ? await vectorFileFingerprints(config) : undefined;
-  const changedVectorFiles = await vectorContentChanges(vectorHashes, baseVersion);
+  const fileHashes = config.vectorFiles || config.rasterFiles ? await fileFingerprints(config) : undefined;
+  const changedFiles = await fileContentChanges(fileHashes, baseVersion);
   const edit = editFile && { filename: editFile.filename, before: digest(editFile.original) };
-  const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash, vectorHashes, edit };
+  const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash, vectorHashes: fileHashes, edit };
   const planId = fingerprint(snapshot);
   await writeJson(join(planDirectory(planId), 'plan.json'), { ...snapshot, planId });
 
   const previousUrl = current ? firstPublicationUrl(current) : null;
   const newUrl = firstPublicationUrl(config);
-  const changed = changedSource || changedVectorFiles.size > 0 || JSON.stringify(current) !== JSON.stringify(config);
+  const changed = changedSource || changedFiles.size > 0 || JSON.stringify(current) !== JSON.stringify(config);
   const previous = new Map(current ? publicationEntries(current) : []);
   const next = new Map(publicationEntries(config));
   const fileChanged = changedSource || current?.sourcePath !== config.sourcePath;
@@ -220,7 +222,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
       JSON.stringify(config.providers?.[id]?.image ? config.providers[id] : null) ||
       JSON.stringify(current?.providers?.[id]?.postgis) !== JSON.stringify(config.providers?.[id]?.postgis)));
   const dataChanged = (id: string) => (changedSource && hasGeoJson(config, id)) ||
-    usedVectorFiles(config, id).some(([source]) => changedVectorFiles.has(source));
+    usedFileSources(config, id).some(([source]) => changedFiles.has(source));
   const restarted = new Set([...changedProviders, ...Object.keys(config.providers ?? {}).filter((id) =>
     !!config.providers?.[id]?.image && (dataChanged(id) || providerConfigurationChanged(config, current, id)))]);
   const builtIn = builtInProviderId(config);
@@ -230,9 +232,9 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     targetVersion,
     added: [...next.keys()].filter((id) => !previous.has(id)),
     changed: [...next].filter(([id, publication]) => previous.has(id) &&
-      (platformChanged || changedProviders.has(publication.provider) || changedVectorFiles.has(publication.source) ||
-       JSON.stringify(current && vectorFile(current, publication.source)) !== JSON.stringify(vectorFile(config, publication.source)) ||
-       (fileChanged && !postgisSource(config, publication.source) && !vectorFile(config, publication.source)) ||
+      (platformChanged || changedProviders.has(publication.provider) || changedFiles.has(publication.source) ||
+       JSON.stringify(current && fileSource(current, publication.source)) !== JSON.stringify(fileSource(config, publication.source)) ||
+       (fileChanged && !postgisSource(config, publication.source) && !fileSource(config, publication.source)) ||
        JSON.stringify(current && postgisSource(current, publication.source)) !== JSON.stringify(postgisSource(config, publication.source)) ||
        JSON.stringify(previous.get(id)) !== JSON.stringify(publication))).map(([id]) => id),
     removed: [...previous.keys()].filter((id) => !next.has(id)),
@@ -245,7 +247,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
         providerConfigurationChanged(config, current)) ? ['pygeoapi'] : []),
       ...[...restarted].filter((id) => config.providers?.[id]?.image || current?.providers?.[id]?.image)
         .map((id) => `provider-${id}`),
-      ...(needsPublicMetadata(config) ? ['metadata'] : []),
+      ...(needsMetadataService(config) ? ['metadata'] : []),
       ...(config.auth || current?.auth ? ['access'] : []),
       ...(current?.auth?.postgres_password_file !== config.auth?.postgres_password_file ? ['postgres'] : []),
       ...(mailPort(current) !== mailPort(config) ? ['mailpit'] : [])] : [],
@@ -258,9 +260,9 @@ async function sourceContentChanged(sourceHash: string | null | undefined, baseV
   return previousHash !== null && previousHash !== sourceHash;
 }
 
-async function vectorContentChanges(hashes: Plan['vectorHashes'], baseVersion: string | null) {
+async function fileContentChanges(hashes: Plan['vectorHashes'], baseVersion: string | null) {
   if (!hashes || !baseVersion) return new Set<string>();
-  const previous = await savedVectorFileFingerprints(planDirectory(baseVersion));
+  const previous = await savedFileFingerprints(planDirectory(baseVersion));
   return new Set(Object.keys(hashes).filter((source) =>
     Object.hasOwn(previous, source) && hashes[source] !== null && previous[source] !== hashes[source]));
 }
@@ -464,7 +466,7 @@ async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null
       await readFile(join(previous.directory, 'openapi.json')).catch(() => archiveLegacyOpenApi(previous));
     }
     await prepareFeaturesStack(candidate, { previous: current ? revision(current) : undefined,
-      sourceHash: plan.sourceHash, vectorHashes: plan.vectorHashes });
+      sourceHash: plan.sourceHash, fileHashes: plan.vectorHashes });
     if (plan.yaml !== undefined) await writeFile(join(candidate.directory, 'platform.yaml'),
       plan.config.providers ? serializeFeaturesConfig(plan.config) : plan.yaml, { mode: 0o600 });
   } catch (error) {
@@ -570,21 +572,21 @@ export async function applyPlan(planId: string) {
     await checkPublicationIdentities(plan.config, current);
     if (current && JSON.stringify(current.config) === JSON.stringify(plan.config) &&
         !await sourceContentChanged(plan.sourceHash, current.planId) &&
-        !(await vectorContentChanges(plan.vectorHashes, current.planId)).size) {
+        !(await fileContentChanges(plan.vectorHashes, current.planId)).size) {
       const sourceChangedAfterPlanning = hasGeoJson(plan.config) &&
         await sourceContentChanged(await sourceFingerprint(plan.config.sourcePath), current.planId);
-      const plannedVectorHashes = plan.vectorHashes;
-      const liveVectorHashes = plannedVectorHashes && await vectorFileFingerprints(plan.config);
-      const vectorChangedAfterPlanning = plannedVectorHashes && liveVectorHashes &&
-        (Object.entries(plannedVectorHashes).some(([id, hash]) => hash !== null && liveVectorHashes[id] !== hash) ||
-          (await vectorContentChanges(liveVectorHashes, current.planId)).size > 0);
-      if (!sourceChangedAfterPlanning && !vectorChangedAfterPlanning && plan.config.providers &&
+      const plannedFileHashes = plan.vectorHashes;
+      const liveFileHashes = plannedFileHashes && await fileFingerprints(plan.config);
+      const fileChangedAfterPlanning = plannedFileHashes && liveFileHashes &&
+        (Object.entries(plannedFileHashes).some(([id, hash]) => hash !== null && liveFileHashes[id] !== hash) ||
+          (await fileContentChanges(liveFileHashes, current.planId)).size > 0);
+      if (!sourceChangedAfterPlanning && !fileChangedAfterPlanning && plan.config.providers &&
           !await featuresStackRunning(current.config, revision(current).directory)) {
         await activatePlan(state, plan, current);
         return resultFor(await readActive(), plan);
       }
-      const outcome = sourceChangedAfterPlanning || vectorChangedAfterPlanning
-        ? { code: 'APPLY_FAILED', message: `The ${sourceChangedAfterPlanning ? 'GeoJSON' : 'vector file'} source changed after planning. Create a new plan.` } as const
+      const outcome = sourceChangedAfterPlanning || fileChangedAfterPlanning
+        ? { code: 'APPLY_FAILED', message: `The ${sourceChangedAfterPlanning ? 'GeoJSON' : 'file'} source changed after planning. Create a new plan.` } as const
         : { code: 'NO_CHANGE' } as const;
       if (outcome.code === 'NO_CHANGE') await persistProviderEdit(plan);
       await writeJson(activeFile, settled(state, planId, outcome));

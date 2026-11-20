@@ -8,7 +8,7 @@ import type { AdminPermission } from './admin-command.js';
 export interface Publication {
   source: string;
   provider: string;
-  protocol: 'features';
+  protocol: 'features' | 'maps';
   access: 'public' | 'registered' | 'private';
   title: string;
   description: string;
@@ -27,7 +27,7 @@ export interface ManagedProvider extends PygeoapiProvider {
   image: string;
   digest?: string;
   api: {
-    protocol: 'features';
+    protocol: Publication['protocol'];
     scheme: 'http';
     port: number;
     base_path: string;
@@ -53,7 +53,9 @@ export interface PostgisSource {
 export type VectorFileSource =
   ({ type: 'geopackage' | 'shapefile'; layer: string } | { type: 'geoparquet'; layer?: never }) &
   { path: string; id_field: string };
-type Source = { type: 'geojson'; path: string } | VectorFileSource | PostgisSource;
+export type RasterFileSource = { type: 'geotiff' | 'cog'; path: string; epsg?: number };
+export type FileSource = VectorFileSource | RasterFileSource;
+type Source = { type: 'geojson'; path: string } | FileSource | PostgisSource;
 
 interface PlatformConfig {
   schema_version: 1;
@@ -97,6 +99,7 @@ export type FeaturesConfig = {
   sourcePath: string;
   geojsonSourceId?: string;
   vectorFiles?: Record<string, VectorFileSource>;
+  rasterFiles?: Record<string, RasterFileSource>;
   postgisSources?: Record<string, PostgisSource>;
   providers?: Record<string, Provider>;
   auth?: AuthConfig;
@@ -118,11 +121,19 @@ export function postgisSource(config: FeaturesConfig, id: string) {
 export function hasGeoJson(config: FeaturesConfig, provider?: string) {
   return publicationEntries(config).some(([, publication]) =>
     (provider === undefined || publication.provider === provider) &&
-    !postgisSource(config, publication.source) && !vectorFile(config, publication.source));
+    !postgisSource(config, publication.source) && !fileSource(config, publication.source));
 }
 
 export function vectorFile(config: FeaturesConfig, id: string) {
   return config.vectorFiles && Object.hasOwn(config.vectorFiles, id) ? config.vectorFiles[id] : undefined;
+}
+
+export function rasterFile(config: FeaturesConfig, id: string) {
+  return config.rasterFiles && Object.hasOwn(config.rasterFiles, id) ? config.rasterFiles[id] : undefined;
+}
+
+export function fileSource(config: FeaturesConfig, id: string) {
+  return vectorFile(config, id) ?? rasterFile(config, id);
 }
 
 export const crs84 = 'http://www.opengis.net/def/crs/OGC/1.3/CRS84';
@@ -147,19 +158,20 @@ function supportedCrs(id: string, source: Source, values: string[]) {
   return [...result];
 }
 
-export function usedVectorFiles(config: FeaturesConfig, provider?: string) {
+export function usedFileSources(config: FeaturesConfig, provider?: string) {
   return [...new Set(publicationEntries(config)
     .filter(([, publication]) => provider === undefined || publication.provider === provider)
     .map(([, publication]) => publication.source))]
-    .flatMap((id): [string, VectorFileSource][] => {
-      const source = vectorFile(config, id);
+    .flatMap((id): [string, FileSource][] => {
+      const source = fileSource(config, id);
       return source ? [[id, source]] : [];
     });
 }
 
-export function needsPublicMetadata(config: FeaturesConfig) {
+export function needsMetadataService(config: FeaturesConfig) {
   return config.providers !== undefined &&
-    (!config.auth || publicationEntries(config).every(([, publication]) => publication.access === 'public'));
+    (!config.auth || publicationEntries(config).some(([, publication]) => publication.protocol === 'maps') ||
+      publicationEntries(config).every(([, publication]) => publication.access === 'public'));
 }
 
 export function builtInProviderId(config: FeaturesConfig) {
@@ -200,6 +212,7 @@ export function serializeFeaturesConfig(config: FeaturesConfig) {
       ...(config.sourcePath && { [geojsonSourceId]: { type: 'geojson', path: config.sourcePath } }),
       ...config.postgisSources,
       ...config.vectorFiles,
+      ...config.rasterFiles,
     },
     providers: config.providers ?? { [builtInProviderId(config)!]: { type: 'pygeoapi' } },
     publications: Object.fromEntries(publicationEntries(config)),
@@ -242,6 +255,13 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     if (extname(source.path) !== extension) throw new Error(`Source '${id}' requires a ${extension} file.`);
     source.path = resolve(directory, source.path);
   }
+  const rasterFiles = sources.filter((entry): entry is [string, RasterFileSource] =>
+    entry[1].type === 'geotiff' || entry[1].type === 'cog');
+  for (const [id, source] of rasterFiles) {
+    if (!/\.tiff?$/i.test(source.path)) throw new Error(`Source '${id}' requires a .tif or .tiff file.`);
+    source.path = resolve(directory, source.path);
+    source.epsg ??= 4326;
+  }
   if (providers.filter(([, provider]) => !provider.image).length > 1) {
     throw new Error('Only one provider can use the built-in image. Configure an image and API for each additional instance.');
   }
@@ -259,6 +279,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     const { digest } = imageReference(provider.image);
     if (digest && provider.digest && digest !== provider.digest) throw new Error(`Provider '${id}' has conflicting digests.`);
     const { public_root: root } = provider.api;
+    if (provider.api.protocol === 'maps' && (root !== '/maps' || provider.postgis)) {
+      throw new Error(`Maps provider '${id}' requires public_root /maps and file sources.`);
+    }
     if (['/account', '/api', '/internal'].some((reserved) => root === reserved || root.startsWith(reserved + '/'))) {
       throw new Error(`Provider '${id}' uses a reserved public root.`);
     }
@@ -281,6 +304,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Ambiguous public root '${root}'.`);
     }
   }
+  const providersAtMaps = providers.flatMap(([, provider]) =>
+    provider.image && provider.api.public_root === '/maps' ? [provider.api.protocol] : []);
+  if (new Set(providersAtMaps).size > 1) throw new Error("Providers at '/maps' must use the same protocol.");
 
   const entries = Object.entries(config.publications).map((
     [id, { source, provider, protocol, access, title, description, extent, time_field, freshness, crs }],
@@ -298,10 +324,15 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Publication '${id}' references unknown provider '${provider}'.`);
     }
     const instance = config.providers[provider];
-    if (instance?.image && instance.api.protocol !== protocol) {
+    if ((instance?.image ? instance.api.protocol : 'features') !== protocol) {
       throw new Error(`Publication '${id}' uses a protocol unsupported by provider '${provider}'.`);
     }
     const sourceConfig = config.sources[source]!;
+    const raster = sourceConfig.type === 'geotiff' || sourceConfig.type === 'cog';
+    if (raster !== (protocol === 'maps')) {
+      throw new Error(`Publication '${id}' has a source type unsupported by protocol '${protocol}'.`);
+    }
+    if (raster && publication.crs) throw new Error(`Publication '${id}': set the raster source epsg instead of crs.`);
     if (publication.crs) publication.crs = supportedCrs(id, sourceConfig, publication.crs);
     const sourceType = sourceConfig.type === 'postgis' ? 'postgis' : 'file';
     const suppliedType = sourceTypes.get(provider);
@@ -321,7 +352,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Publication '${id}' requires a PostGIS source for freshness or time_field.`);
     }
     const [west, south, east, north] = extent;
-    if (west > east || south > north) throw new Error(`Publication '${id}' has an invalid extent.`);
+    if (west > east || south > north || (raster && (west === east || south === north))) {
+      throw new Error(`Publication '${id}' has an invalid extent.`);
+    }
     if (access !== 'public' && !config.auth) throw new Error(`Publication '${id}' requires auth configuration.`);
   }
   const [first, ...others] = entries;
@@ -352,8 +385,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     sourcePath: geojson ? resolve(directory, geojson[1].path) : '',
     ...(postgisSources.length && { postgisSources: Object.fromEntries(postgisSources) }),
     ...(vectorFiles.length && { vectorFiles: Object.fromEntries(vectorFiles) }),
-    ...((postgisSources.length || vectorFiles.length) && geojson && { geojsonSourceId: geojson[0] }),
-    ...(postgisSources.length || vectorFiles.length || entries.some(([, pub]) => pub.crs) ||
+    ...(rasterFiles.length && { rasterFiles: Object.fromEntries(rasterFiles) }),
+    ...((postgisSources.length || vectorFiles.length || rasterFiles.length) && geojson && { geojsonSourceId: geojson[0] }),
+    ...(postgisSources.length || vectorFiles.length || rasterFiles.length || entries.some(([, pub]) => pub.crs) ||
       providers.length !== 1 || providers.some(([, provider]) => provider.image || provider.postgis)
       ? { providers: config.providers } : {}),
     ...(first ? { publicationId: first[0], publication: first[1],

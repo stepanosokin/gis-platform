@@ -149,6 +149,34 @@ async function runFeaturesFilesTests() {
   }
 }
 
+async function runMapsTests() {
+  run('build-maps-cli', process.execPath, ['node_modules/typescript/bin/tsc']);
+  run('create-map-files', 'docker', ['run', '--rm', ...containerUser, ...resultsMount,
+    '--mount', `type=bind,src=${join(root, 'tests/maps-fixtures.py')},dst=/fixtures.py,readonly`,
+    '--entrypoint', '/venv/bin/python', toolsImage, '/fixtures.py']);
+  const name = `${project}-maps`;
+  const filter = mode === '--maps' && process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
+  const adminPort = String(await freePort());
+  makeAdminCertificates();
+  const environment = {
+    COMPOSE_PROJECT_NAME: name,
+    GIS_STATE_DIR: join(results, 'maps-state'),
+    GIS_TEST_PUBLIC_URL: `http://localhost:${await freePort()}`,
+    GIS_TEST_MAILPIT: `http://localhost:${await freePort()}`,
+    GIS_TEST_CONFIG: join(results, 'maps.yaml'),
+    GIS_ADMIN_PORT: adminPort,
+    GIS_ADMIN_CA_FILE: join(results, 'ca.pem'),
+    GIS_ADMIN_CERT_FILE: join(results, 'operator.pem'),
+    GIS_ADMIN_KEY_FILE: join(results, 'operator-key.pem'),
+  };
+  try {
+    console.log(run('test-maps', process.execPath, ['--test', ...filter, 'tests/maps.test.mjs'], environment));
+  } finally {
+    run('maps-down', 'docker', ['compose', '-p', name, 'down', '--remove-orphans', '--volumes']);
+    removeTestVolumes(name);
+  }
+}
+
 function removeTestVolumes(projectName) {
   const output = run(`${projectName}-volumes`, 'docker', ['volume', 'ls', '-q',
     '--filter', `label=com.docker.compose.project=${projectName}`]);
@@ -257,6 +285,10 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
 }
 
 console.log(`Results: ${results}`);
+if (mode === '--maps') {
+  await runMapsTests();
+  process.exit(0);
+}
 if (mode === '--features-files') {
   await runFeaturesFilesTests();
   process.exit(0);
@@ -292,6 +324,7 @@ if (mode !== '--cli') await runHttpTests();
 if (!mode) {
   await runPostgisTests();
   await runFeaturesFilesTests();
+  await runMapsTests();
   await runAccessTests();
   const qgis = process.env.GIS_QGIS_MCP !== '0' &&
     (process.env.GIS_QGIS_MCP === '1' || await qgisPluginIsListening());
