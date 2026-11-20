@@ -3,12 +3,13 @@ import { dirname, resolve } from 'node:path';
 import { Ajv } from 'ajv';
 import { parseDocument } from 'yaml';
 import schema from './platform.schema.json' with { type: 'json' };
+import type { AdminPermission } from './admin-command.js';
 
 export interface Publication {
   source: string;
   provider: string;
   protocol: 'features';
-  access: 'public' | 'registered';
+  access: 'public' | 'registered' | 'private';
   title: string;
   description: string;
   extent: [number, number, number, number];
@@ -37,9 +38,17 @@ interface TlsConfig {
   key_file: string;
 }
 
+export interface AdminConfig extends TlsConfig {
+  port: number;
+  ca_file: string;
+  operators: Record<string, AdminPermission[]>;
+}
+
 export type AuthConfig = {
   secret_file: string;
   postgres_password_file: string;
+  administrator_emails?: string[];
+  cli?: AdminConfig;
 } & ({ mode: 'development'; mailpit_port?: number } | { mode: 'production'; smtp: SmtpConfig });
 
 export interface FeaturesConfig {
@@ -84,7 +93,7 @@ export async function readFeaturesConfig(filename: string): Promise<FeaturesConf
     }
     const [west, south, east, north] = extent;
     if (west > east || south > north) throw new Error(`Publication '${id}' has an invalid extent.`);
-    if (access === 'registered' && !config.auth) throw new Error(`Publication '${id}' requires auth configuration.`);
+    if (access !== 'public' && !config.auth) throw new Error(`Publication '${id}' requires auth configuration.`);
   }
   const [first, ...others] = entries;
   if (!first) throw new Error('Expected at least one publication.');
@@ -98,6 +107,14 @@ export async function readFeaturesConfig(filename: string): Promise<FeaturesConf
   if (auth) {
     auth.secret_file = resolve(directory, auth.secret_file);
     auth.postgres_password_file = resolve(directory, auth.postgres_password_file);
+    if (auth.cli) {
+      if (auth.cli.port === port || (auth.mode === 'development' && auth.cli.port === (auth.mailpit_port ?? 8025))) {
+        throw new Error('The admin CLI requires a separate local port.');
+      }
+      auth.cli.ca_file = resolve(directory, auth.cli.ca_file);
+      auth.cli.cert_file = resolve(directory, auth.cli.cert_file);
+      auth.cli.key_file = resolve(directory, auth.cli.key_file);
+    }
     if (auth.mode === 'production' && auth.smtp.password_file) {
       auth.smtp.password_file = resolve(directory, auth.smtp.password_file);
     }

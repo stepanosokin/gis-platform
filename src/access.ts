@@ -10,15 +10,25 @@ import { Pool } from 'pg';
 import { mountAccountPages } from './account-pages.js';
 import type { Publication } from './config.js';
 import { featuresError, mountFeaturesMetadata } from './features-metadata.js';
+import { publicationAccess } from './publication-access.js';
+import { prepareAccessStore, readPublicationReader } from './access-store.js';
+import { startAdminServer } from './admin-server.js';
+import type { AdminPermission } from './admin-command.js';
 
 interface Settings {
   origin: string;
   production: boolean;
   smtp: { host: string; port: number; from: string; secure?: boolean; username?: string };
   publications: Record<string, Publication['access']>;
+  administratorEmails?: string[];
+  publicationTitles?: Record<string, string>;
+  operators?: Record<string, AdminPermission[]>;
+  version?: string;
 }
 
 const settings = JSON.parse(await readFile('/etc/gis/access.json', 'utf8')) as Settings;
+const administratorEmails = new Set(settings.administratorEmails?.map((email) => email.toLowerCase()));
+const publicationModes = new Map(Object.entries(settings.publications));
 const secureCookies = new URL(settings.origin).protocol === 'https:';
 const readSecret = async (name: string) => (await readFile(`/run/secrets/${name}`, 'utf8')).replace(/\n+$/, '');
 const pool = new Pool({ host: 'postgres', user: 'gis', database: 'gis',
@@ -113,6 +123,11 @@ const auth = betterAuth({
 
 const { runMigrations } = await getMigrations(auth.options);
 await runMigrations();
+await prepareAccessStore(pool);
+if (settings.operators) {
+  await startAdminServer(pool, { operators: settings.operators, version: settings.version ?? 'unknown',
+    publications: publicationModes, publicationTitles: settings.publicationTitles ?? {}, administratorEmails });
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -130,6 +145,14 @@ async function readSession(req: Request) {
 }
 function activeSession(session: Awaited<ReturnType<typeof readSession>>) {
   return session?.user.emailVerified && session.user.active ? session : null;
+}
+
+async function publicationReader(req: Request) {
+  const session = await readSession(req);
+  if (session) return readPublicationReader(pool, session.user.id, administratorEmails);
+  // Without a session cookie Better Auth can return before checking PostgreSQL.
+  await pool.query('SELECT 1');
+  return null;
 }
 
 async function requireActiveSession(req: Request, res: Response, next: NextFunction) {
@@ -152,11 +175,17 @@ app.get('/api/auth/get-session', async (req, res) => {
   const session = activeSession(await readSession(req));
   res.json(session ? { user: session.user } : null);
 });
-app.get('/internal/authorize', requireActiveSession, (_req, res) => {
+app.get('/internal/authorize/:publicationId', async (req, res) => {
+  const { publicationId } = req.params;
+  const mode = typeof publicationId === 'string' ? publicationModes.get(publicationId) : undefined;
+  if (typeof publicationId !== 'string' || !mode) return res.sendStatus(404);
+  const reader = await publicationReader(req);
+  const status = publicationAccess(mode, publicationId, reader);
+  if (status !== 200) return featuresError(res, status);
   res.sendStatus(204);
 });
 mountFeaturesMetadata(app, settings.publications, `${secureCookies ? '__Secure-' : ''}gis.session_token`,
-  async (req) => activeSession(await readSession(req)) !== null);
+  publicationReader);
 app.get('/internal/ready', async (_req, res) => {
   await pool.query('SELECT 1');
   res.sendStatus(204);

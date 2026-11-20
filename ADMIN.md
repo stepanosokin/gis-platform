@@ -2,7 +2,7 @@
 
 ## Текущая реализация
 
-CLI поддерживает `config validate`, `config plan` и `config apply` для публичных публикаций и публикаций по регистрации из одного источника GeoJSON через OGC API — Features. Команды выполняются из корня репозитория. [Локальный запуск](README.md#локальная-публикация-geojson) · [Регистрация и доступ](README.md#регистрация-и-доступ)
+CLI поддерживает `config validate`, `config plan` и `config apply` для публикаций из одного источника GeoJSON через OGC API — Features во всех трёх режимах доступа. Для управления доступом доступны `users list`, `users block`, `users unblock`, `access grant` и `access revoke`. Команды выполняются из корня репозитория. [Локальный запуск](README.md#локальная-публикация-geojson) · [Регистрация и доступ](README.md#регистрация-и-доступ)
 
 ```sh
 npm ci
@@ -14,6 +14,41 @@ node dist/cli.js config plan examples/features.yaml
 Проверьте изменения публикации, URL и список сервисов в плане. Передайте ID из первой строки вывода в `node dist/cli.js config apply <plan-id>`. После применения коллекция из примера доступна по адресу `http://localhost:8080/features/collections/places`.
 
 Добавьте `--json` к любой из трёх команд для машинного вывода. В ответе `config plan --json` ID плана находится в `data.planId`.
+
+### Настройка закрытых публикаций и локального CLI
+
+Установите `access: private` в записи закрытой публикации в YAML. Персональные разрешения хранятся в PostgreSQL по постоянным ID пользователя и публикации. Чтобы назначить роль администратора для доступа к данным, укажите адрес пользователя в `auth.administrator_emails`. Роль действует после применения конфига для активной учётной записи с подтверждённым email.
+
+Для локальных команд дополните существующий блок `auth` следующими полями.
+
+```yaml
+  administrator_emails: [administrator@example.org]
+  cli:
+    port: 8444
+    ca_file: pki/cli-ca.pem
+    cert_file: pki/cli-server.pem
+    key_file: pki/cli-server-key.pem
+    operators:
+      operator: [diagnostics, users-read, access-write]
+      agent: [diagnostics]
+```
+
+- Используйте отдельный центр сертификации для CLI. Сертификат сервера должен содержать `IP:127.0.0.1` в SAN и быть пригоден для серверной аутентификации. Для каждой локальной учётной записи выпустите отдельный клиентский сертификат с `clientAuth` и `CN`, совпадающим с именем записи в `operators`.
+- Защитите каждый закрытый ключ правами ОС. У пользователя или агента должен быть доступ к своему ключу. Ключ центра сертификации храните отдельно. Удаление учётной записи из `operators` вступает в силу после применения конфига.
+- Для локальной учётной записи задайте `GIS_ADMIN_PORT`, `GIS_ADMIN_CA_FILE`, `GIS_ADMIN_CERT_FILE` и `GIS_ADMIN_KEY_FILE`. В PowerShell используйте `$env:GIS_ADMIN_PORT = '8444'` и тот же синтаксис для путей. Административный порт публикуется на `127.0.0.1`.
+- `diagnostics` разрешает `status` и `doctor` для проверки компонента доступа и его подключения к PostgreSQL. `users-read` разрешает `users list`. `access-write` разрешает блокировку, разблокировку, выдачу и отзыв разрешений. Для применения YAML действуют права ОС на рабочий каталог и Docker. Доступ к Docker нужен владельцу развёртывания.
+
+```sh
+node dist/cli.js users list --json
+node dist/cli.js access grant parks-features --email reader@example.org
+node dist/cli.js users block --user-id user-8
+node dist/cli.js users unblock --user-id user-8
+node dist/cli.js access revoke parks-features --user-id user-8
+```
+
+В JSON команды `users list` массив `data.users` содержит `id`, `email`, `name`, `registeredAt`, `status` и доступные `publications`. Статусы — `active`, `unverified` и `blocked`. У публикации `anonymous: true` означает доступ без действующей идентификации.
+
+Событие успешного изменения записывается в PostgreSQL вместе с изменением. Владелец развёртывания может посмотреть события `access.change` командой `docker compose logs access` с параметрами своего проекта. Событие содержит имя из проверенного клиентского сертификата, команду и ID затронутых объектов.
 
 ## Согласованный контракт первой версии
 

@@ -1,10 +1,13 @@
 import { resolve } from 'node:path';
 import { publicationEntries, readFeaturesConfig } from './config.js';
-import { applyPlan, CliError, createPlan } from './plans.js';
+import { applyPlan, createPlan } from './plans.js';
+import { CliError } from './cli-result.js';
+import { runAdminCommand } from './admin-client.js';
 
 const arguments_ = process.argv.slice(2);
 const json = arguments_.includes('--json');
-const [group, command, argument, ...extra] = arguments_.filter((value) => value !== '--json');
+const commandArguments = arguments_.filter((value) => value !== '--json');
+const [group, command, argument, ...extra] = commandArguments;
 
 function success(code: string, data: Record<string, unknown>, message: string) {
   if (json) console.log(JSON.stringify({ status: 'ok', code, data }));
@@ -12,6 +15,11 @@ function success(code: string, data: Record<string, unknown>, message: string) {
 }
 
 async function main() {
+  if (group === 'status' || group === 'doctor' || group === 'users' || group === 'access') {
+    const result = await runAdminCommand(commandArguments);
+    success(result.code, result.data, formatAdminResult(result));
+    return;
+  }
   if (group !== 'config' || !argument || extra.length ||
       (command !== 'validate' && command !== 'plan' && command !== 'apply')) {
     throw new CliError('INVALID_INPUT', 2,
@@ -43,6 +51,20 @@ async function main() {
     `URL: ${plan.previousUrl ?? '(none)'} → ${plan.newUrl}`,
     `Services: ${plan.services.join(', ') || 'none'}`,
   ].join('\n'));
+}
+
+function formatAdminResult({ code, data }: Awaited<ReturnType<typeof runAdminCommand>>) {
+  if (group === 'users' && command === 'list') {
+    const users = data.users as { email: string; name: string; registeredAt: string; status: string;
+      publications: { id: string; anonymous: boolean }[] }[];
+    return users.map((user) => {
+      const publications = user.publications.map(({ id, anonymous }) => anonymous ? `${id} (anonymous)` : id);
+      const displayName = user.name.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
+      return [user.email, displayName, user.registeredAt, user.status, publications.join(', ') || 'none'].join('\t');
+    }).join('\n') || 'No users.';
+  }
+  if (typeof data.currentVersion === 'string') return `Access ready (version ${data.currentVersion}).`;
+  return code === 'NO_CHANGE' ? 'No change.' : 'Access updated.';
 }
 
 try {

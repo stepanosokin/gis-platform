@@ -3,7 +3,7 @@ import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import { get as getHttp } from 'node:http';
 import { get as getHttps } from 'node:https';
 import { isIP } from 'node:net';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { text } from 'node:stream/consumers';
 import { setTimeout } from 'node:timers/promises';
 import { checkServerIdentity } from 'node:tls';
@@ -62,11 +62,11 @@ function caddyConfig(config: FeaturesConfig) {
   const tlsOptions = config.tls ? '\n\tauto_https disable_redirects' : '';
   const certificate = config.tls ? '\n\ttls /run/secrets/tls_cert /run/secrets/tls_key' : '';
   const publications = publicationEntries(config);
-  const registered = publications.filter(([, publication]) => publication.access === 'registered').map(([id]) => id);
+  const protectedIds = publications.filter(([, publication]) => publication.access !== 'public').map(([id]) => id);
   const publicIds = publications.filter(([, publication]) => publication.access === 'public').map(([id]) => id);
   const collectionRoute = (ids: string[]) => `collections/(${ids.join('|')})(/(schema|queryables|items(/.+)?))?`;
   const publicRoutes = ['conformance', 'static/.+'];
-  if (!registered.length) publicRoutes.push('openapi', 'collections');
+  if (!protectedIds.length) publicRoutes.push('openapi', 'collections');
   if (publicIds.length) publicRoutes.push(collectionRoute(publicIds));
 
   const featuresHtmlPolicy = config.auth ? `
@@ -78,7 +78,7 @@ function caddyConfig(config: FeaturesConfig) {
 				header_up -Authorization
 				header_down Cache-Control no-store${featuresHtmlPolicy}
 			}`;
-  const protectedRoutes = registered.length ? `
+  const protectedRoutes = protectedIds.length ? `
 	@metadata {
 		method GET HEAD
 		path /features/openapi /features/collections
@@ -86,14 +86,14 @@ function caddyConfig(config: FeaturesConfig) {
 	handle @metadata {
 		reverse_proxy access:3000
 	}
-	@registered {
+	@protected {
 		method GET HEAD
-		path_regexp ^/features/${collectionRoute(registered)}$
+		path_regexp publication ^/features/${collectionRoute(protectedIds)}$
 	}
-	handle @registered {
+	handle @protected {
 		route {
 			forward_auth access:3000 {
-				uri /internal/authorize
+				uri /internal/authorize/{http.regexp.publication.1}
 			}
 			${proxyFeatures}
 		}
@@ -164,11 +164,24 @@ export async function prepareFeaturesStack(config: FeaturesConfig, revisionDirec
     await writeFile(join(revisionDirectory, 'access.json'), JSON.stringify({
       origin: new URL(config.publicUrl).origin, production: auth.mode === 'production', smtp,
       publications: Object.fromEntries(publicationEntries(config).map(([id, { access }]) => [id, access])),
+      publicationTitles: Object.fromEntries(publicationEntries(config).map(([id, { title }]) => [id, title])),
+      administratorEmails: auth.administrator_emails,
+      operators: auth.cli?.operators, version: basename(revisionDirectory),
     }));
     if (auth.mode === 'production' && auth.smtp.password_file) {
       await writeFile(join(revisionDirectory, 'compose.smtp.json'), JSON.stringify({
         services: { access: { secrets: ['smtp_password'] } },
         secrets: { smtp_password: { file: auth.smtp.password_file } },
+      }));
+    }
+    if (auth.cli) {
+      const secretFiles = { cli_ca: auth.cli.ca_file, cli_cert: auth.cli.cert_file, cli_key: auth.cli.key_file };
+      await writeFile(join(revisionDirectory, 'compose.admin.json'), JSON.stringify({
+        services: { access: {
+          ports: [{ target: 3001, published: String(auth.cli.port), host_ip: '127.0.0.1' }],
+          secrets: Object.keys(secretFiles),
+        } },
+        secrets: Object.fromEntries(Object.entries(secretFiles).map(([name, file]) => [name, { file }])),
       }));
     }
   }
@@ -185,6 +198,7 @@ export async function compose(config: FeaturesConfig, revisionDirectory: string,
     files.push(composeFile('compose.auth.yaml'));
     if (config.auth.mode === 'development') files.push(composeFile('compose.mailpit.yaml'));
     else if (config.auth.smtp.password_file) files.push(join(revisionDirectory, 'compose.smtp.json'));
+    if (config.auth.cli) files.push(join(revisionDirectory, 'compose.admin.json'));
   }
   await run('docker', ['compose', ...files.flatMap((file) => ['-f', file]), ...args], {
     env: {

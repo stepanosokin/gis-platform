@@ -4,17 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { publicationEntries, type FeaturesConfig } from './config.js';
 import { compose, prepareFeaturesStack, startFeaturesStack } from './features-stack.js';
-
-export class CliError extends Error {
-  constructor(
-    readonly code: string,
-    readonly exitCode: number,
-    message: string,
-    readonly data: Record<string, unknown> = {},
-  ) {
-    super(message);
-  }
-}
+import { CliError } from './cli-result.js';
 
 interface Plan {
   planId: string;
