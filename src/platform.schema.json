@@ -11,8 +11,45 @@
       "additionalProperties": false,
       "properties": {
         "host": { "type": "string", "maxLength": 253, "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$" },
-        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "tls": {
+          "type": "object",
+          "required": ["cert_file", "key_file"],
+          "additionalProperties": false,
+          "properties": {
+            "cert_file": { "type": "string", "minLength": 1 },
+            "key_file": { "type": "string", "minLength": 1 }
+          }
+        }
       }
+    },
+    "auth": {
+      "type": "object",
+      "required": ["mode", "secret_file", "postgres_password_file"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "enum": ["development", "production"] },
+        "secret_file": { "type": "string", "minLength": 1 },
+        "postgres_password_file": { "type": "string", "minLength": 1 },
+        "mailpit_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "smtp": {
+          "type": "object",
+          "required": ["host", "port", "from"],
+          "additionalProperties": false,
+          "properties": {
+            "host": { "type": "string", "minLength": 1 },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "from": { "type": "string", "minLength": 1 },
+            "secure": { "type": "boolean" },
+            "username": { "type": "string", "minLength": 1 },
+            "password_file": { "type": "string", "minLength": 1 }
+          },
+          "dependencies": { "username": ["password_file"], "password_file": ["username"] }
+        }
+      },
+      "if": { "properties": { "mode": { "const": "production" } } },
+      "then": { "required": ["smtp"], "properties": { "mailpit_port": false } },
+      "else": { "properties": { "smtp": false } }
     },
     "sources": {
       "allOf": [{ "$ref": "#/$defs/singleEntry" }],
@@ -38,8 +75,9 @@
       }
     },
     "publications": {
-      "allOf": [{ "$ref": "#/$defs/singleEntry" }],
       "type": "object",
+      "propertyNames": { "$ref": "#/$defs/id" },
+      "minProperties": 1,
       "additionalProperties": {
         "type": "object",
         "required": ["source", "provider", "protocol", "access", "title", "description", "extent"],
@@ -48,7 +86,7 @@
           "source": { "$ref": "#/$defs/id" },
           "provider": { "$ref": "#/$defs/id" },
           "protocol": { "const": "features" },
-          "access": { "const": "public" },
+          "access": { "enum": ["public", "registered"] },
           "title": { "type": "string", "minLength": 1 },
           "description": { "type": "string", "minLength": 1 },
           "extent": {

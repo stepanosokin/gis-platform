@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, rmdir, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { FeaturesConfig } from './config.js';
+import { publicationEntries, type FeaturesConfig } from './config.js';
 import { compose, prepareFeaturesStack, startFeaturesStack } from './features-stack.js';
 
 export class CliError extends Error {
@@ -81,17 +81,22 @@ export async function createPlan(config: FeaturesConfig) {
 
   const previousUrl = current ? publicationUrl(current) : null;
   const newUrl = publicationUrl(config);
-  const samePublication = current?.publicationId === config.publicationId;
   const changed = JSON.stringify(current) !== JSON.stringify(config);
+  const previous = new Map(current ? publicationEntries(current) : []);
+  const next = new Map(publicationEntries(config));
+  const platformChanged = current?.publicUrl !== config.publicUrl || current?.sourcePath !== config.sourcePath ||
+    JSON.stringify(current?.auth) !== JSON.stringify(config.auth) || JSON.stringify(current?.tls) !== JSON.stringify(config.tls);
   return {
     planId,
     baseVersion,
-    added: samePublication ? [] : [config.publicationId],
-    changed: samePublication && changed ? [config.publicationId] : [],
-    removed: current && !samePublication ? [current.publicationId] : [],
+    added: [...next.keys()].filter((id) => !previous.has(id)),
+    changed: [...next].filter(([id, publication]) => previous.has(id) &&
+      (platformChanged || JSON.stringify(previous.get(id)) !== JSON.stringify(publication))).map(([id]) => id),
+    removed: [...previous.keys()].filter((id) => !next.has(id)),
     previousUrl,
     newUrl,
-    services: changed ? ['pygeoapi', 'caddy'] : [],
+    services: changed ? ['pygeoapi', 'caddy', ...(config.auth || current?.auth ? ['access', 'postgres'] : []),
+      ...(config.auth?.mode === 'development' || current?.auth?.mode === 'development' ? ['mailpit'] : [])] : [],
   };
 }
 
@@ -102,7 +107,7 @@ async function restoreStack(candidate: Plan, current: Plan | null) {
       await compose(candidate.config, directory, 'stop', 'caddy');
       await startFeaturesStack(current.config, planDirectory(current.planId));
     } else {
-      await compose(candidate.config, directory, 'down', '--volumes');
+      await compose(candidate.config, directory, 'down', '--remove-orphans');
     }
     await writeJson(activeFile, { planId: current?.planId ?? null });
   } catch (error) {

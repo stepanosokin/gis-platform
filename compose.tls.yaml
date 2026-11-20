@@ -1,0 +1,11 @@
+services:
+  caddy:
+    secrets:
+      - tls_cert
+      - tls_key
+
+secrets:
+  tls_cert:
+    file: ${GIS_TLS_CERT_FILE:-./.gis-platform/tls-cert.pem}
+  tls_key:
+    file: ${GIS_TLS_KEY_FILE:-./.gis-platform/tls-key.pem}

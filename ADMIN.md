@@ -2,7 +2,7 @@
 
 ## Текущая реализация
 
-CLI поддерживает `config validate`, `config plan` и `config apply` для одной публичной публикации GeoJSON через OGC API — Features. Команды выполняются из корня репозитория. [Задача #14](https://github.com/stepanosokin/gis-platform/issues/14) · [Требования и запуск](README.md#локальная-публикация-geojson)
+CLI поддерживает `config validate`, `config plan` и `config apply` для публичных публикаций и публикаций по регистрации из одного источника GeoJSON через OGC API — Features. Команды выполняются из корня репозитория. [Локальный запуск](README.md#локальная-публикация-geojson) · [Регистрация и доступ](README.md#регистрация-и-доступ)
 
 ```sh
 npm ci

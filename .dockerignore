@@ -1,5 +1,11 @@
-.git
-.gis-platform
-node_modules
-dist
-test_results
+**
+!Dockerfile.access
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**
+!tests/
+!tests/**
+!examples/
+!examples/features.yaml

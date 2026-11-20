@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
@@ -11,10 +13,17 @@
   },
   "dependencies": {
     "ajv": "8.17.1",
+    "better-auth": "1.7.26",
+    "express": "5.3.0",
+    "nodemailer": "10.6.0",
+    "pg": "8.23.1",
     "yaml": "2.8.2"
   },
   "devDependencies": {
+    "@types/express": "5.0.6",
     "@types/node": "24.10.1",
+    "@types/nodemailer": "8.0.2",
+    "@types/pg": "8.23.1",
     "typescript": "5.9.3"
   }
 }

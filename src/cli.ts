@@ -1,5 +1,5 @@
 import { resolve } from 'node:path';
-import { readFeaturesConfig } from './config.js';
+import { publicationEntries, readFeaturesConfig } from './config.js';
 import { applyPlan, CliError, createPlan } from './plans.js';
 
 const arguments_ = process.argv.slice(2);
@@ -29,7 +29,8 @@ async function main() {
     throw new CliError('INVALID_CONFIG', 2, error instanceof Error ? error.message : String(error));
   });
   if (command === 'validate') {
-    success('OK', { publicationId: config.publicationId }, `Valid configuration: ${config.publicationId}`);
+    const publicationIds = publicationEntries(config).map(([id]) => id);
+    success('OK', { publicationId: config.publicationId, publicationIds }, `Valid configuration: ${publicationIds.join(', ')}`);
     return;
   }
 

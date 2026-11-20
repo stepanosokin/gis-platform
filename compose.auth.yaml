@@ -1,0 +1,50 @@
+services:
+  access:
+    build:
+      context: .
+      dockerfile: Dockerfile.access
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ${GIS_REVISION_DIR:-./.gis-platform}/access.json
+        target: /etc/gis/access.json
+        read_only: true
+        bind:
+          create_host_path: false
+    secrets:
+      - auth_secret
+      - postgres_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/internal/ready').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 25
+
+  postgres:
+    image: postgres:18-bookworm@sha256:194e55feb2597b1465dbee81cc9fd8d204566cd2eb42c8d22fd6c931a38781b1
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gis
+      POSTGRES_DB: gis
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - accounts:/var/lib/postgresql
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, gis, -d, gis]
+      interval: 2s
+      timeout: 2s
+      retries: 25
+
+secrets:
+  auth_secret:
+    file: ${GIS_AUTH_SECRET_FILE:-./.gis-platform/auth-secret}
+  postgres_password:
+    file: ${GIS_POSTGRES_PASSWORD_FILE:-./.gis-platform/postgres-password}
+
+volumes:
+  accounts:
