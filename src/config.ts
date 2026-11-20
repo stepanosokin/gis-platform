@@ -13,10 +13,16 @@ export interface Publication {
   title: string;
   description: string;
   extent: [number, number, number, number];
+  time_field?: string;
+  freshness?: { max_delay_seconds: number };
 }
 
-export interface ManagedProvider {
+interface PygeoapiProvider {
   type: 'pygeoapi';
+  postgis?: { host: string; port?: number; database: string; user: string; password_file: string };
+}
+
+export interface ManagedProvider extends PygeoapiProvider {
   image: string;
   digest?: string;
   api: {
@@ -32,12 +38,23 @@ export interface ManagedProvider {
   volumes?: Record<string, string>;
 }
 
-export type Provider = { type: 'pygeoapi'; image?: undefined } | ManagedProvider;
+export type Provider = (PygeoapiProvider & { image?: undefined }) | ManagedProvider;
+
+export interface PostgisSource {
+  type: 'postgis';
+  schema: string;
+  relation: string;
+  id_field: string;
+  geometry_field: string;
+  max_lag_seconds: number;
+}
+
+type Source = { type: 'geojson'; path: string } | PostgisSource;
 
 interface PlatformConfig {
   schema_version: 1;
   server: { host: string; port: number; tls?: TlsConfig };
-  sources: Record<string, { type: 'geojson'; path: string }>;
+  sources: Record<string, Source>;
   providers: Record<string, Provider>;
   publications: Record<string, Publication>;
   auth?: AuthConfig;
@@ -74,6 +91,8 @@ export type FeaturesConfig = {
   port: number;
   publicUrl: string;
   sourcePath: string;
+  geojsonSourceId?: string;
+  postgisSources?: Record<string, PostgisSource>;
   providers?: Record<string, Provider>;
   auth?: AuthConfig;
   tls?: TlsConfig;
@@ -85,6 +104,15 @@ export type FeaturesConfig = {
 export function publicationEntries(config: FeaturesConfig): [string, Publication][] {
   if (config.publicationId === null) return [];
   return [[config.publicationId, config.publication], ...Object.entries(config.additionalPublications ?? {})];
+}
+
+export function postgisSource(config: FeaturesConfig, id: string) {
+  return config.postgisSources && Object.hasOwn(config.postgisSources, id) ? config.postgisSources[id] : undefined;
+}
+
+export function hasGeoJson(config: FeaturesConfig, provider?: string) {
+  return publicationEntries(config).some(([, publication]) =>
+    (provider === undefined || publication.provider === provider) && !postgisSource(config, publication.source));
 }
 
 export function needsPublicMetadata(config: FeaturesConfig) {
@@ -121,10 +149,15 @@ export function pinnedImage(provider: ManagedProvider) {
 }
 
 export function serializeFeaturesConfig(config: FeaturesConfig) {
+  const geojsonSourceId = config.geojsonSourceId ??
+    (config.publicationId === null ? config.sourceId : config.publication.source);
   const snapshot: PlatformConfig = {
     schema_version: 1,
     server: { host: new URL(config.publicUrl).hostname, port: config.port, tls: config.tls },
-    sources: { [config.publicationId === null ? config.sourceId : config.publication.source]: { type: 'geojson', path: config.sourcePath } },
+    sources: {
+      ...(config.sourcePath && { [geojsonSourceId]: { type: 'geojson', path: config.sourcePath } }),
+      ...config.postgisSources,
+    },
     providers: config.providers ?? { [builtInProviderId(config)!]: { type: 'pygeoapi' } },
     publications: Object.fromEntries(publicationEntries(config)),
     auth: config.auth,
@@ -153,11 +186,20 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   }
 
   const providers = Object.entries(config.providers);
+  const sources = Object.entries(config.sources);
+  const geojsonSources = sources.filter((entry): entry is [string, Extract<Source, { type: 'geojson' }>] =>
+    entry[1].type === 'geojson');
+  if (geojsonSources.length > 1) throw new Error('Only one GeoJSON source can be configured.');
+  const postgisSources = sources.filter((entry): entry is [string, PostgisSource] => entry[1].type === 'postgis');
   if (providers.filter(([, provider]) => !provider.image).length > 1) {
     throw new Error('Only one provider can use the built-in image. Configure an image and API for each additional instance.');
   }
   const roots = new Set<string>();
   for (const [id, provider] of providers) {
+    if (provider.postgis) {
+      provider.postgis.password_file = resolve(directory, provider.postgis.password_file);
+      provider.postgis.port ??= 5432;
+    }
     if (!provider.image && !Object.hasOwn(provider, 'image')) {
       roots.add('/features');
       continue;
@@ -171,12 +213,15 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     }
     roots.add(root);
     const targets = Object.values(provider.volumes ?? {});
+    const reservedPaths = ['/source', '/etc/pygeoapi/gis', '/venv'];
+    if (provider.postgis) reservedPaths.push('/run/secrets/postgis_password');
     if (targets.some((target) => target.split('/').some((segment) => segment === '.' || segment === '..') ||
-        ['/source', '/etc/pygeoapi/gis', '/venv'].some((path) =>
+        reservedPaths.some((path) =>
           target === path || target.startsWith(path + '/') || path.startsWith(target + '/'))) ||
         new Set(targets).size !== targets.length) throw new Error(`Invalid volume targets for provider '${id}'.`);
     if (Object.keys(provider.environment ?? {}).some((name) =>
-      ['PYGEOAPI_CONFIG', 'PYGEOAPI_OPENAPI', 'SCRIPT_NAME'].includes(name))) {
+      ['PYGEOAPI_CONFIG', 'PYGEOAPI_OPENAPI', 'SCRIPT_NAME'].includes(name) ||
+      (provider.postgis && ['PGPASSWORD', 'PGPASSFILE'].includes(name)))) {
       throw new Error(`Provider '${id}' overrides a required adapter environment variable.`);
     }
   }
@@ -187,9 +232,14 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   }
 
   const entries = Object.entries(config.publications).map((
-    [id, { source, provider, protocol, access, title, description, extent }],
-  ): [string, Publication] => [id, { source, provider, protocol, access, title, description, extent }]);
-  for (const [id, { source, provider, protocol, access, extent }] of entries) {
+    [id, { source, provider, protocol, access, title, description, extent, time_field, freshness }],
+  ): [string, Publication] => [id, {
+    source, provider, protocol, access, title, description, extent,
+    ...(time_field !== undefined && { time_field }), ...(freshness && { freshness }),
+  }]);
+  const sourceTypes = new Map<string, Source['type']>();
+  for (const [id, publication] of entries) {
+    const { source, provider, protocol, access, extent, time_field, freshness } = publication;
     if (!Object.hasOwn(config.sources, source)) {
       throw new Error(`Publication '${id}' references unknown source '${source}'.`);
     }
@@ -200,12 +250,29 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     if (instance?.image && instance.api.protocol !== protocol) {
       throw new Error(`Publication '${id}' uses a protocol unsupported by provider '${provider}'.`);
     }
+    const sourceConfig = config.sources[source]!;
+    const suppliedType = sourceTypes.get(provider);
+    if (suppliedType && suppliedType !== sourceConfig.type) {
+      throw new Error(`Provider '${provider}' serves GeoJSON and PostGIS. Use separate provider instances.`);
+    }
+    sourceTypes.set(provider, sourceConfig.type);
+    if (sourceConfig.type === 'postgis') {
+      if (!instance?.postgis) throw new Error(`Publication '${id}' requires a PostGIS connection on provider '${provider}'.`);
+      const max_delay_seconds = freshness?.max_delay_seconds ?? 60;
+      if (sourceConfig.max_lag_seconds > max_delay_seconds) {
+        throw new Error(`Publication '${id}': source max_lag_seconds exceeds freshness.max_delay_seconds.`);
+      }
+      publication.freshness = { max_delay_seconds };
+    } else if (freshness || time_field) {
+      throw new Error(`Publication '${id}' requires a PostGIS source for freshness or time_field.`);
+    }
     const [west, south, east, north] = extent;
     if (west > east || south > north) throw new Error(`Publication '${id}' has an invalid extent.`);
     if (access !== 'public' && !config.auth) throw new Error(`Publication '${id}' requires auth configuration.`);
   }
   const [first, ...others] = entries;
-  const [sourceId, sourceConfig] = Object.entries(config.sources)[0]!;
+  const geojson = geojsonSources[0];
+  const sourceId = geojson?.[0] ?? sources[0]![0];
   const providerId = providers[0]?.[0] ?? '';
 
   const { host, port, tls } = config.server;
@@ -228,8 +295,11 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   return {
     port,
     publicUrl: new URL('/features', `${tls ? 'https' : 'http'}://${host}:${port}`).href,
-    sourcePath: resolve(directory, sourceConfig.path),
-    ...(providers.length !== 1 || providers.some(([, provider]) => provider.image) ? { providers: config.providers } : {}),
+    sourcePath: geojson ? resolve(directory, geojson[1].path) : '',
+    ...(postgisSources.length && { postgisSources: Object.fromEntries(postgisSources) }),
+    ...(postgisSources.length && geojson && { geojsonSourceId: geojson[0] }),
+    ...(postgisSources.length || providers.length !== 1 || providers.some(([, provider]) => provider.image || provider.postgis)
+      ? { providers: config.providers } : {}),
     ...(first ? { publicationId: first[0], publication: first[1],
       ...(others.length > 0 && { additionalPublications: Object.fromEntries(others) }) }
       : { publicationId: null, sourceId, providerId }),

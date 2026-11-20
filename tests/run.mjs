@@ -117,6 +117,17 @@ async function runHttpTests() {
   }
 }
 
+async function runPostgisTests() {
+  run('build-postgis-cli', process.execPath, ['node_modules/typescript/bin/tsc']);
+  const port = await freePort();
+  const mailPort = await freePort();
+  console.log(run('test-postgis', process.execPath, ['--test', 'tests/postgis.test.mjs'], {
+    COMPOSE_PROJECT_NAME: `${project}-postgis`, GIS_STATE_DIR: join(results, 'postgis-state'),
+    GIS_TEST_PUBLIC_URL: `http://localhost:${port}`, GIS_TEST_MAILPIT: `http://localhost:${mailPort}`,
+    GIS_TEST_CONFIG: join(results, 'postgis.yaml'),
+  }));
+}
+
 function removeTestVolumes(projectName) {
   const output = run(`${projectName}-volumes`, 'docker', ['volume', 'ls', '-q',
     '--filter', `label=com.docker.compose.project=${projectName}`]);
@@ -225,6 +236,10 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
 }
 
 console.log(`Results: ${results}`);
+if (mode === '--postgis') {
+  await runPostgisTests();
+  process.exit(0);
+}
 if (mode === '--access') {
   await runAccessTests(mode.slice(2));
   process.exit(0);
@@ -250,6 +265,7 @@ if (mode !== '--smoke') {
 }
 if (mode !== '--cli') await runHttpTests();
 if (!mode) {
+  await runPostgisTests();
   await runAccessTests();
   const qgis = process.env.GIS_QGIS_MCP !== '0' &&
     (process.env.GIS_QGIS_MCP === '1' || await qgisPluginIsListening());

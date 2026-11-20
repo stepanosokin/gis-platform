@@ -12,11 +12,12 @@ import { checkServerIdentity, createSecureContext } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { parse } from 'yaml';
-import { builtInProviderId, needsPublicMetadata, pinnedImage, providerRoot, publicationEntries, publicationUrl,
-  type FeaturesConfig } from './config.js';
+import { builtInProviderId, hasGeoJson, needsPublicMetadata, pinnedImage, postgisSource, providerRoot, publicationEntries, publicationUrl,
+  type FeaturesConfig, type Publication } from './config.js';
 
 const run = promisify(execFile);
 const composeFile = (name: string) => fileURLToPath(new URL(`../${name}`, import.meta.url));
+const postgisPlugin = 'gis_postgis.PostGISProvider';
 let project: string | undefined;
 
 export async function resolveComposeProject() {
@@ -67,15 +68,36 @@ function pygeoapiConfig(config: FeaturesConfig, instance = builtInProviderId(con
         links: [],
         extents: {
           spatial: { bbox: publication.extent, crs: 'http://www.opengis.net/def/crs/OGC/1.3/CRS84' },
+          ...(publication.time_field && { temporal: { begin: null, end: null } }),
         },
-        providers: [{ type: 'feature', name: 'GeoJSON', data: '/source/data.geojson', id_field: 'id' }],
+        providers: [pygeoapiSource(config, publication)],
     }])),
+  };
+}
+
+function pygeoapiSource(config: FeaturesConfig, publication: Publication) {
+  const source = postgisSource(config, publication.source);
+  if (!source) return { type: 'feature', name: 'GeoJSON', data: '/source/data.geojson', id_field: 'id' };
+  const connection = config.providers?.[publication.provider]?.postgis;
+  if (!connection) throw new Error('The PostGIS connection is missing.');
+  const { host, port, database, user } = connection;
+  return {
+    type: 'feature',
+    name: postgisPlugin,
+    data: { host, port, dbname: database, user, search_path: [source.schema] },
+    table: source.relation,
+    id_field: source.id_field,
+    geom_field: source.geometry_field,
+    time_field: publication.time_field,
+    options: { connect_timeout: 3, options: '-c default_transaction_read_only=on' },
   };
 }
 
 export function providerConfigurationChanged(candidate: FeaturesConfig, previous: FeaturesConfig | null,
   id = builtInProviderId(candidate)) {
-  return !previous || candidate.sourcePath !== previous.sourcePath ||
+  return !previous || (id !== undefined && (
+    ((hasGeoJson(candidate, id) || hasGeoJson(previous, id)) && candidate.sourcePath !== previous.sourcePath) ||
+    candidate.providers?.[id]?.postgis?.password_file !== previous.providers?.[id]?.postgis?.password_file)) ||
     JSON.stringify(pygeoapiConfig(candidate, id)) !== JSON.stringify(pygeoapiConfig(previous, id));
 }
 
@@ -272,12 +294,18 @@ function managedGatewayRoutes(config: FeaturesConfig, collectionRoute: (ids: str
     for (const id of ids) {
       const instance = config.providers?.[id];
       const api = instance?.image ? instance.api : undefined;
-      const proxy = `uri strip_prefix ${root}
+      const proxy = (postgis = false) => `uri strip_prefix ${root}
 			${api && api.base_path !== '/' ? `rewrite * ${api.base_path}{http.request.uri.path}` : ''}
 			reverse_proxy ${serviceName(config, id)}:${api?.port ?? 80} {
 				header_up -Cookie
 				header_up -Authorization
-				header_down Cache-Control no-store${htmlPolicy}
+				header_down Cache-Control no-store${htmlPolicy}${postgis ? `
+				@sourceFailure status 5xx
+				handle_response @sourceFailure {
+					header Cache-Control no-store
+					header Content-Type application/json
+					respond \`{"code":"ServiceUnavailable"}\` 503
+				}` : ''}
 			}`;
       if (id === ids[0]) {
         routes.push(`
@@ -287,21 +315,17 @@ function managedGatewayRoutes(config: FeaturesConfig, collectionRoute: (ids: str
 	}
 	handle @root${rootIndex} {
 		route {
-			${proxy}
+			${proxy()}
 		}
 	}
 `);
       }
-      for (const mode of ['public', 'protected']) {
-        const collectionIds = entries.filter(([, entry]) =>
-          entry.provider === id && (entry.access === 'public') === (mode === 'public')).map(([key]) => key);
-        if (!collectionIds.length) continue;
+      function addPublicationRoute(anonymous: boolean, postgis: boolean, match: (name: string) => string) {
         const name = `provider${routes.length}`;
-        const anonymous = mode === 'public';
+        const upstream = proxy(postgis);
         routes.push(`
 	@${name} {
-		method GET HEAD
-		path_regexp ${name} ^${root}/${collectionRoute(collectionIds)}$
+		${match(name)}
 	}
 	handle @${name} {
 		route {${config.auth ? `${anonymous ? `\n			vars public_provider ${name}` : ''}
@@ -309,7 +333,7 @@ function managedGatewayRoutes(config: FeaturesConfig, collectionRoute: (ids: str
 				uri /internal/authorize/{http.regexp.${name}.1}
 				header_up X-GIS-Request-Id {http.request.uuid}
 			}${anonymous ? '\n			vars public_provider false' : ''}` : ''}
-			${proxy}
+			${upstream}
 		}
 	}
 `);
@@ -317,9 +341,21 @@ function managedGatewayRoutes(config: FeaturesConfig, collectionRoute: (ids: str
 		@${name}Unavailable vars public_provider ${name}
 		handle @${name}Unavailable {
 			route {
-				${proxy}
+				${upstream}
 			}
 		}`);
+      }
+      for (const anonymous of [true, false]) {
+        for (const postgis of [false, true]) {
+          const visible = entries.filter(([, entry]) => entry.provider === id && (entry.access === 'public') === anonymous &&
+            Boolean(postgisSource(config, entry.source)) === postgis).map(([key]) => key);
+          if (!visible.length) continue;
+          addPublicationRoute(anonymous, postgis, (name) => `method GET HEAD
+		path_regexp ${name} ^${root}/${collectionRoute(visible)}$`);
+          if (postgis) addPublicationRoute(anonymous, true, (name) => `method POST
+		header_regexp Content-Type (?i)^application/json(?:\\s*;.*)?$
+		path_regexp ${name} ^${root}/collections/(${visible.join('|')})/items$`);
+        }
       }
     }
   }
@@ -367,7 +403,7 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
   await rm(join(revisionDirectory, 'provider-directory'), { force: true });
   const sameSource = previous?.config.sourcePath === config.sourcePath;
   const hasPublications = config.publicationId !== null;
-  const sourceHash = hasPublications ? await sourceFingerprint(config.sourcePath) : null;
+  const sourceHash = hasGeoJson(config) ? await sourceFingerprint(config.sourcePath) : null;
   const previousHash = previous && await savedSourceFingerprint(previous.directory);
   if ((options.sourceHash && sourceHash && sourceHash !== options.sourceHash) ||
       (options.sourceHash === null && sameSource && sourceHash && previousHash && sourceHash !== previousHash)) {
@@ -473,6 +509,7 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
 async function writeProviderCompose(config: FeaturesConfig, directory: string) {
   const services: Record<string, unknown> = {};
   const volumes: Record<string, object> = {};
+  const secrets: Record<string, { file: string }> = {};
   if (!builtInProviderId(config)) services.pygeoapi = { profiles: ['unused-built-in'] };
   if (needsPublicMetadata(config)) services.metadata = {
     build: { context: '.', dockerfile: 'Dockerfile.access' },
@@ -482,11 +519,26 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string) {
   };
   const escapeCompose = (value: string) => value.replaceAll('$', () => '$$');
   for (const [id, provider] of Object.entries(config.providers ?? {})) {
-    if (!provider.image) continue;
     const service = serviceName(config, id);
-    const native = join(directory, service);
-    const { port, scheme, base_path: base, readiness } = provider.api;
+    const secret = `postgis-${id}`;
+    const passwordFile = provider.postgis?.password_file;
+    const connection = passwordFile && publicationEntries(config).some(([, publication]) =>
+      publication.provider === id && postgisSource(config, publication.source)) ? {
+        environment: { PYTHONPATH: '/etc/pygeoapi/gis' + (provider.image && provider.environment?.PYTHONPATH
+            ? `:${escapeCompose(provider.environment.PYTHONPATH)}` : '') },
+        secrets: [{ source: secret, target: 'postgis_password' }],
+      } : undefined;
+    const native = service === 'pygeoapi' ? directory : join(directory, service);
     await mkdir(native, { recursive: true });
+    if (connection) {
+      secrets[secret] = { file: escapeCompose(passwordFile!) };
+      await copyFile(fileURLToPath(new URL('../src/gis_postgis.py', import.meta.url)), join(native, 'gis_postgis.py'));
+    }
+    if (!provider.image) {
+      if (connection) services[service] = connection;
+      continue;
+    }
+    const { port, scheme, base_path: base, readiness } = provider.api;
     await writeFile(join(native, 'pygeoapi.yml'), JSON.stringify(pygeoapiConfig(config, id)));
     const namedVolumes = Object.entries(provider.volumes ?? {}).map(([name, target]) => {
       const volume = `${service}_${name}`;
@@ -500,6 +552,7 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string) {
         ...Object.fromEntries(Object.entries(provider.environment ?? {}).map(([name, value]) => [name, escapeCompose(value)])),
         PYGEOAPI_CONFIG: '/etc/pygeoapi/gis/pygeoapi.yml',
         PYGEOAPI_OPENAPI: '/etc/pygeoapi/gis/openapi.json',
+        ...connection?.environment,
         ...(base !== '/' && { SCRIPT_NAME: base }),
       },
       entrypoint: ['/venv/bin/gunicorn'],
@@ -508,11 +561,12 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string) {
       volumes: [
         { type: 'bind', source: escapeCompose(await nativeProviderDirectory(directory, service)), target: '/etc/pygeoapi/gis', read_only: true,
           bind: { create_host_path: false } },
-        ...(publicationEntries(config).some(([, publication]) => publication.provider === id)
+        ...(hasGeoJson(config, id)
           ? [{ type: 'bind', source: '${GIS_SOURCE_FILE}', target: '/source/data.geojson', read_only: true,
             bind: { create_host_path: false } }] : []),
         ...namedVolumes,
       ],
+      ...(connection && { secrets: connection.secrets }),
       healthcheck: {
         test: ['CMD', '/venv/bin/python', '-c',
           `from urllib.request import urlopen; urlopen('${scheme}://127.0.0.1:${port}${base === '/' ? '' : base}${readiness}', timeout=2).read()`],
@@ -520,10 +574,28 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string) {
       },
     };
   }
-  await writeFile(join(directory, 'compose.providers.json'), JSON.stringify({ services, volumes }));
+  await writeFile(join(directory, 'compose.providers.json'), JSON.stringify({ services, volumes, secrets }));
 }
 
 const checkGeoJson = `/venv/bin/python -c "from pygeoapi.provider.geojson import GeoJSONProvider; GeoJSONProvider({'name': 'GeoJSON', 'type': 'feature', 'data': '/source/data.geojson', 'id_field': 'id'}).query(limit=1)" >/dev/null`;
+const checkPostgis = `/venv/bin/python - <<'PY'
+import json
+import os
+from pygeoapi.plugin import load_plugin
+
+with open(os.environ['PYGEOAPI_CONFIG']) as config:
+    resources = json.load(config)['resources']
+for resource in resources.values():
+    definition = resource['providers'][0]
+    if definition['name'] != '${postgisPlugin}':
+        continue
+    provider = load_plugin('provider', definition)
+    if provider.time_field:
+        time_field = provider.fields.get(provider.time_field, {})
+        if time_field.get('format') != 'date-time':
+            raise ValueError('PostGIS time_field must reference a timestamp column.')
+    provider.query(limit=1, bbox=resource['extents']['spatial']['bbox'])
+PY`;
 const generateOpenApi = '/venv/bin/pygeoapi openapi generate "$PYGEOAPI_CONFIG" -f json -of /tmp/openapi.json >/dev/null';
 
 async function reuseManagedArtifacts(config: FeaturesConfig, directory: string, previous: Revision | undefined,
@@ -533,7 +605,8 @@ async function reuseManagedArtifacts(config: FeaturesConfig, directory: string, 
     const draft = service === 'pygeoapi' ? directory : join(directory, service);
     await mkdir(draft, { recursive: true });
     await rm(join(draft, 'provider-directory'), { force: true });
-    if (!previous || !sameSourceContent || providerConfigurationChanged(config, previous.config, id)) continue;
+    if (!previous || (hasGeoJson(config, id) && !sameSourceContent) ||
+        providerConfigurationChanged(config, previous.config, id)) continue;
     const prior = previous.config.providers?.[id];
     const exists = provider.image ? prior?.image && JSON.stringify(prior) === JSON.stringify(provider)
       : id === builtInProviderId(previous.config);
@@ -560,12 +633,42 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
     if (mounted !== native) {
       api = checkOpenApi(await readFile(join(mounted, 'openapi.json'), 'utf8'), url, collectionIds);
     } else {
-      if (collectionIds.length && !sourceHash) throw new Error('The GeoJSON source is unavailable.');
+      const geojson = hasGeoJson(config, id);
+      if (geojson && !sourceHash) throw new Error('The GeoJSON source is unavailable.');
+      const postgis = entries.some(([, publication]) =>
+        publication.provider === id && postgisSource(config, publication.source));
       const output = await compose(config, directory, 'run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', service,
-        '-ec', [...(collectionIds.length ? [checkGeoJson] : []), generateOpenApi, 'cat /tmp/openapi.json'].join('\n'));
+        '-ec', [...(geojson ? [checkGeoJson] : []), ...(postgis ? [checkPostgis] : []),
+          generateOpenApi, 'cat /tmp/openapi.json'].join('\n'));
       api = checkOpenApi(output, url, collectionIds);
     }
     await writeFile(join(native, 'openapi.json'), JSON.stringify(api));
+    for (const [publicationId, publication] of entries.filter(([, publication]) => publication.provider === id)) {
+      const collection = `/collections/${publicationId}`;
+      const items = api.paths?.[`${collection}/items`];
+      if (!items) continue;
+      if (!postgisSource(config, publication.source)) {
+        delete items.post;
+        continue;
+      }
+      items.get?.parameters?.push(
+        { name: 'filter', in: 'query', description: 'A CQL2 Text expression.', schema: { type: 'string' } },
+        { name: 'filter-lang', in: 'query', schema: { type: 'string', enum: ['cql2-text'] } },
+      );
+      if (items.post) {
+        items.post.description = 'Send a CQL2 JSON expression in the request body. Use POST with the same body at each page URL.';
+        items.post.parameters = [
+          { name: 'filter-lang', in: 'query', schema: { type: 'string', enum: ['cql2-json'] } },
+        ];
+      }
+      for (const operation of [items.get, items.post, api.paths?.[`${collection}/items/{featureId}`]?.get]) {
+        if (operation) operation.responses['503'] = {
+          description: 'The publication source is temporarily unavailable.',
+          content: { 'application/json': { schema: { type: 'object', required: ['code'],
+            properties: { code: { type: 'string', enum: ['ServiceUnavailable'] } } } } },
+        };
+      }
+    }
     const shared = documents[root];
     if (shared) {
       Object.assign(shared.api.paths!, Object.fromEntries(Object.entries(api.paths ?? {}).filter(([key]) =>
@@ -583,8 +686,11 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
   }
   const roots = Object.fromEntries(Object.entries(documents).map(([root, { url, api }]) => [
     root, { url, api, collections: entries.filter(([, publication]) => providerRoot(config, publication.provider) === root)
-      .map(([id, { title, description, extent }]) => ({
-        id, title, description, extent: { spatial: { bbox: [extent], crs: 'http://www.opengis.net/def/crs/OGC/1.3/CRS84' } },
+      .map(([id, { title, description, extent, time_field }]) => ({
+        id, title, description, extent: {
+          spatial: { bbox: [extent], crs: 'http://www.opengis.net/def/crs/OGC/1.3/CRS84' },
+          ...(time_field && { temporal: { interval: [[null, null]] } }),
+        },
         links: ['json', 'html', 'jsonld'].map((format) => ({
           rel: 'self', href: `${url}/collections/${id}?f=${format}`,
           type: ({ json: 'application/json', html: 'text/html', jsonld: 'application/ld+json' })[format],
@@ -604,7 +710,10 @@ async function nativeProviderDirectory(directory: string, service = 'pygeoapi') 
 
 export async function compose(config: FeaturesConfig, revisionDirectory: string, ...args: string[]) {
   const files = [composeFile('compose.yaml')];
-  if (config.publicationId === null) files.push(composeFile('compose.empty.yaml'));
+  const builtIn = builtInProviderId(config);
+  if (config.publicationId === null || (config.postgisSources && (!builtIn || !hasGeoJson(config, builtIn)))) {
+    files.push(composeFile('compose.empty.yaml'));
+  }
   if (config.tls) files.push(composeFile('compose.tls.yaml'));
   if (config.auth) {
     files.push(composeFile('compose.auth.yaml'));
@@ -660,10 +769,16 @@ function probeCollection(origin: URL, path: string, certificate: Buffer | undefi
 interface FeaturesOpenApi {
   openapi?: string;
   servers?: { url: string }[];
-  paths?: Record<string, unknown>;
+  paths?: Record<string, { get?: FeaturesOperation; post?: FeaturesOperation }>;
   tags?: { name: string }[];
   info?: { title: string; version: string };
   components?: object;
+}
+
+interface FeaturesOperation {
+  description?: string;
+  parameters?: unknown[];
+  responses: Record<string, unknown>;
 }
 
 function checkOpenApi(body: string, publicUrl: string, ids: string[]) {

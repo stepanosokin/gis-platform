@@ -79,16 +79,34 @@
       "else": { "properties": { "smtp": false } }
     },
     "sources": {
-      "allOf": [{ "$ref": "#/$defs/singleEntry" }],
       "type": "object",
+      "propertyNames": { "$ref": "#/$defs/id" },
+      "minProperties": 1,
       "additionalProperties": {
-        "type": "object",
-        "required": ["type", "path"],
-        "additionalProperties": false,
-        "properties": {
-          "type": { "const": "geojson" },
-          "path": { "type": "string", "minLength": 1 }
-        }
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["type", "path"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "const": "geojson" },
+              "path": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["type", "schema", "relation", "id_field", "geometry_field", "max_lag_seconds"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "const": "postgis" },
+              "schema": { "$ref": "#/$defs/sqlIdentifier" },
+              "relation": { "$ref": "#/$defs/sqlIdentifier" },
+              "id_field": { "$ref": "#/$defs/sqlIdentifier" },
+              "geometry_field": { "$ref": "#/$defs/sqlIdentifier" },
+              "max_lag_seconds": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+            }
+          }
+        ]
       }
     },
     "providers": {
@@ -100,6 +118,18 @@
         "additionalProperties": false,
         "properties": {
           "type": { "const": "pygeoapi" },
+          "postgis": {
+            "type": "object",
+            "required": ["host", "database", "user", "password_file"],
+            "additionalProperties": false,
+            "properties": {
+              "host": { "type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[a-zA-Z0-9_.:%-]+$" },
+              "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "database": { "$ref": "#/$defs/sqlIdentifier" },
+              "user": { "$ref": "#/$defs/sqlIdentifier" },
+              "password_file": { "type": "string", "minLength": 1 }
+            }
+          },
           "image": { "type": "string", "maxLength": 512 },
           "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
           "api": {
@@ -146,6 +176,15 @@
           "access": { "enum": ["public", "registered", "private"] },
           "title": { "type": "string", "minLength": 1 },
           "description": { "type": "string", "minLength": 1 },
+          "time_field": { "$ref": "#/$defs/sqlIdentifier" },
+          "freshness": {
+            "type": "object",
+            "required": ["max_delay_seconds"],
+            "additionalProperties": false,
+            "properties": {
+              "max_delay_seconds": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+            }
+          },
           "extent": {
             "type": "array",
             "minItems": 4,
@@ -163,11 +202,6 @@
   },
   "$defs": {
     "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
-    "singleEntry": {
-      "type": "object",
-      "propertyNames": { "$ref": "#/$defs/id" },
-      "minProperties": 1,
-      "maxProperties": 1
-    }
+    "sqlIdentifier": { "type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[^\\u0000-\\u001F\\u007F]+$" }
   }
 }

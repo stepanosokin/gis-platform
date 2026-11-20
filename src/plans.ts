@@ -3,8 +3,8 @@ import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promis
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { builtInProviderId, needsPublicMetadata, publicationEntries, publicationUrl, providerRoot,
-  serializeFeaturesConfig, type FeaturesConfig } from './config.js';
+import { builtInProviderId, hasGeoJson, needsPublicMetadata, postgisSource, publicationEntries, publicationUrl, providerRoot,
+  serializeFeaturesConfig, type FeaturesConfig, type Publication } from './config.js';
 import { pinProviderImages } from './provider-images.js';
 import { archiveLegacyOpenApi, closeGateway, compose, featuresStackRunning, openGateway, prepareFeaturesStack, providerConfigurationChanged,
   publicationGrantRemoval, resolveComposeProject, savedSourceFingerprint, sourceFingerprint, startFeaturesStack } from './features-stack.js';
@@ -116,6 +116,14 @@ async function* confirmedHistory(current: Plan | null) {
   }
 }
 
+function postgisLocation(config: FeaturesConfig, publication: Publication) {
+  const source = postgisSource(config, publication.source);
+  const connection = config.providers?.[publication.provider]?.postgis;
+  return source && connection
+    ? [connection.host, connection.port, connection.database, source.schema, source.relation]
+    : undefined;
+}
+
 async function checkPublicationIdentities(config: FeaturesConfig, current: Plan | null) {
   const unverified = new Map(publicationEntries(config));
   if (!unverified.size) return;
@@ -127,12 +135,15 @@ async function checkPublicationIdentities(config: FeaturesConfig, current: Plan 
     for (const [id, previous] of publicationEntries(version.config)) {
       const candidate = unverified.get(id);
       if (!candidate) continue;
-      const sameIdentity = previous.source === candidate.source && previous.protocol === candidate.protocol;
+      const before = postgisLocation(version.config, previous);
+      const after = postgisLocation(config, candidate);
+      const sameIdentity = previous.source === candidate.source && previous.protocol === candidate.protocol &&
+        JSON.stringify(before) === JSON.stringify(after);
       if (version === current) {
         if (!sameIdentity) reject(id);
       } else {
         retired.add(id);
-        if (!sameIdentity || version.config.sourcePath !== config.sourcePath) continue;
+        if (!sameIdentity || (!before && version.config.sourcePath !== config.sourcePath)) continue;
       }
       unverified.delete(id);
     }
@@ -169,7 +180,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     }
   }
   await pinProviderImages(config, current);
-  const sourceHash = config.publicationId === null ? null : await sourceFingerprint(config.sourcePath);
+  const sourceHash = hasGeoJson(config) ? await sourceFingerprint(config.sourcePath) : null;
   const changedSource = await sourceContentChanged(sourceHash, baseVersion);
   const edit = editFile && { filename: editFile.filename, before: digest(editFile.original) };
   const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash, edit };
@@ -181,7 +192,8 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   const changed = changedSource || JSON.stringify(current) !== JSON.stringify(config);
   const previous = new Map(current ? publicationEntries(current) : []);
   const next = new Map(publicationEntries(config));
-  const platformChanged = changedSource || current?.publicUrl !== config.publicUrl || current?.sourcePath !== config.sourcePath ||
+  const fileChanged = changedSource || current?.sourcePath !== config.sourcePath;
+  const platformChanged = current?.publicUrl !== config.publicUrl ||
     JSON.stringify(current?.auth) !== JSON.stringify(config.auth) || JSON.stringify(current?.tls) !== JSON.stringify(config.tls);
   const outcomes = [...new Set([...previous.keys(), ...next.keys()])].map((id) => {
     const before = previous.get(id);
@@ -197,24 +209,28 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   });
   const changedProviders = new Set([...Object.keys(current?.providers ?? {}), ...Object.keys(config.providers ?? {})]
     .filter((id) => JSON.stringify(current?.providers?.[id]?.image ? current.providers[id] : null) !==
-      JSON.stringify(config.providers?.[id]?.image ? config.providers[id] : null)));
+      JSON.stringify(config.providers?.[id]?.image ? config.providers[id] : null) ||
+      JSON.stringify(current?.providers?.[id]?.postgis) !== JSON.stringify(config.providers?.[id]?.postgis)));
   const restarted = new Set([...changedProviders, ...Object.keys(config.providers ?? {}).filter((id) =>
-    !!config.providers?.[id]?.image && (changedSource || providerConfigurationChanged(config, current, id)))]);
+    !!config.providers?.[id]?.image && ((changedSource && hasGeoJson(config, id)) || providerConfigurationChanged(config, current, id)))]);
+  const builtIn = builtInProviderId(config);
   return {
     planId,
     baseVersion,
     targetVersion,
     added: [...next.keys()].filter((id) => !previous.has(id)),
     changed: [...next].filter(([id, publication]) => previous.has(id) &&
-      (platformChanged || changedProviders.has(publication.provider) ||
+      (platformChanged || changedProviders.has(publication.provider) || (fileChanged && !postgisSource(config, publication.source)) ||
+       JSON.stringify(current && postgisSource(current, publication.source)) !== JSON.stringify(postgisSource(config, publication.source)) ||
        JSON.stringify(previous.get(id)) !== JSON.stringify(publication))).map(([id]) => id),
     removed: [...previous.keys()].filter((id) => !next.has(id)),
     previousUrl,
     newUrl,
     publications: outcomes,
     routesToClose: changed ? affectedRoutes(config, current) : [],
-    services: changed ? ['caddy', ...((builtInProviderId(config) || (current && builtInProviderId(current))) &&
-      (changedSource || !currentPlan?.yaml || providerConfigurationChanged(config, current)) ? ['pygeoapi'] : []),
+    services: changed ? ['caddy', ...((builtIn || (current && builtInProviderId(current))) &&
+      ((builtIn && changedSource && hasGeoJson(config, builtIn)) || !currentPlan?.yaml ||
+        providerConfigurationChanged(config, current)) ? ['pygeoapi'] : []),
       ...[...restarted].filter((id) => config.providers?.[id]?.image || current?.providers?.[id]?.image)
         .map((id) => `provider-${id}`),
       ...(needsPublicMetadata(config) ? ['metadata'] : []),
@@ -533,7 +549,7 @@ export async function applyPlan(planId: string) {
     await checkPublicationIdentities(plan.config, current);
     if (current && JSON.stringify(current.config) === JSON.stringify(plan.config) &&
         !await sourceContentChanged(plan.sourceHash, current.planId)) {
-      const sourceChangedAfterPlanning = plan.config.publicationId !== null &&
+      const sourceChangedAfterPlanning = hasGeoJson(plan.config) &&
         await sourceContentChanged(await sourceFingerprint(plan.config.sourcePath), current.planId);
       if (!sourceChangedAfterPlanning && plan.config.providers &&
           !await featuresStackRunning(current.config, revision(current).directory)) {

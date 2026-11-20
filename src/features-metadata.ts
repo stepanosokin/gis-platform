@@ -23,8 +23,13 @@ export async function readManagedMetadata() {
   return JSON.parse(await readFile('/etc/gis/features.json', 'utf8')) as Record<string, ManagedMetadata>;
 }
 
+interface OpenApiOperation {
+  security?: Record<string, string[]>[];
+  responses: Record<string, unknown>;
+}
+
 interface OpenApi {
-  paths: Record<string, { get?: { security?: Record<string, string[]>[]; responses: Record<string, unknown> } }>;
+  paths: Record<string, { get?: OpenApiOperation; post?: OpenApiOperation }>;
   tags?: { name: string }[];
   components: {
     parameters?: { resourceId?: { schema?: { default?: string } } };
@@ -57,10 +62,11 @@ function annotateOpenApi(api: OpenApi, publications: Map<string, Publication['ac
     if (!id || !canRead(publications, id, reader)) return false;
     if (publications.get(id) === 'public') return true;
     hasProtectedPaths = true;
-    if (entry.get) {
-      entry.get.security = [{ session: [] }, { bearer: [] }];
+    for (const operation of [entry.get, entry.post]) {
+      if (!operation) continue;
+      operation.security = [{ session: [] }, { bearer: [] }];
       for (const [status, [code, description]] of Object.entries(errors)) {
-        entry.get.responses[status] = {
+        operation.responses[status] = {
           description,
           ...(status === '401' && { headers: { 'WWW-Authenticate': { schema: { type: 'string' } } } }),
           content: { 'application/json': { schema: { type: 'object', required: ['code'], properties: {
