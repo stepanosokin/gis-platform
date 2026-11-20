@@ -7,10 +7,11 @@ services:
       - target: ${GIS_CADDY_PORT:-80}
         published: "${GIS_PUBLIC_PORT:-8080}"
         host_ip: 127.0.0.1
+    command: [caddy, run, --config, /etc/caddy/gis/Caddyfile, --adapter, caddyfile]
     volumes:
       - type: bind
-        source: ${GIS_REVISION_DIR:-./.gis-platform}/Caddyfile
-        target: /etc/caddy/Caddyfile
+        source: ${GIS_REVISION_DIR:-./.gis-platform}
+        target: /etc/caddy/gis
         read_only: true
         bind:
           create_host_path: false
@@ -21,13 +22,14 @@ services:
   pygeoapi:
     image: geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a
     environment:
-      PYGEOAPI_CONFIG: /etc/pygeoapi/config.yml
-      WSGI_WORKERS: "1"
-      GIS_PUBLICATION_ID: ${GIS_PUBLICATION_ID:-places}
+      PYGEOAPI_CONFIG: /etc/pygeoapi/gis/pygeoapi.yml
+      PYGEOAPI_OPENAPI: /etc/pygeoapi/gis/openapi.json
+    entrypoint: [/venv/bin/gunicorn]
+    command: [--workers, "1", --worker-class, gevent, --timeout, "6000", --bind, "0.0.0.0:80", "pygeoapi.flask_app:APP"]
     volumes:
       - type: bind
-        source: ${GIS_REVISION_DIR:-./.gis-platform}/pygeoapi.yml
-        target: /etc/pygeoapi/config.yml
+        source: ${GIS_PROVIDER_REVISION_DIR:-${GIS_REVISION_DIR:-./.gis-platform}}
+        target: /etc/pygeoapi/gis
         read_only: true
         bind:
           create_host_path: false
@@ -43,12 +45,9 @@ services:
         - /venv/bin/python
         - -c
         - |
-          from os import environ
           from urllib.request import urlopen
-          collection = 'http://127.0.0.1/collections/' + environ['GIS_PUBLICATION_ID']
-          for path in ('?f=json', '/items?f=json&limit=1'):
-              with urlopen(collection + path, timeout=2) as response:
-                  response.read()
+          with urlopen('http://127.0.0.1/openapi?f=json', timeout=2) as response:
+              response.read()
       interval: 2s
       timeout: 3s
       retries: 25

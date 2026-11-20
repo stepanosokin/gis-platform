@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { readFile, rename, writeFile } from 'node:fs/promises';
+import { get } from 'node:http';
+import { dirname, join } from 'node:path';
+import { json } from 'node:stream/consumers';
 import { test } from 'node:test';
 import { setTimeout } from 'node:timers/promises';
 import { auth, cookieFrom, emailLink, register, request, session, signIn } from './access-client.mjs';
@@ -33,7 +36,8 @@ test('a signed-in user can create a named token and read a private publication w
 
 function cli(args, expected = 'OK', exitCode = 0, environment = {}) {
   const result = spawnSync(process.execPath, ['dist/cli.js', ...args, '--json'], {
-    env: { ...process.env, ...environment }, encoding: 'utf8', timeout: 15_000, windowsHide: true,
+    env: { ...process.env, ...environment }, encoding: 'utf8',
+    timeout: args[0] === 'config' ? 120_000 : 15_000, windowsHide: true,
   });
   assert.ifError(result.error);
   const response = JSON.parse(result.stdout);
@@ -477,4 +481,81 @@ test('a grant survives access service recreation and dependency outages fail clo
   assert.equal((await request(items, options)).status, 200);
   assert.equal((await request('/command', { method: 'POST' })).status, 404);
   assert.equal((await request('/internal/authorize/private-places', options)).status, 404);
+});
+
+function freshGet(path, headers, expected, readBody = false) {
+  return new Promise((resolve, reject) => {
+    const req = get(new URL(path, gateway), { headers, agent: false, signal: AbortSignal.timeout(5000) }, (response) => {
+      if (response.statusCode !== expected) {
+        response.resume();
+        reject(new Error(`${path}: expected ${expected}, received ${response.statusCode}`));
+      } else if (readBody) {
+        json(response).then(resolve, reject);
+      } else {
+        response.resume();
+        resolve();
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+test('rolling back a publication keeps the current account, token and grant revocation', async () => {
+  const email = 'configuration-rollback@example.test';
+  await register(email, password);
+  const cookie = await signIn(email, password);
+  cli(['access', 'grant', 'private-places', '--email', email]);
+  const token = await createToken(cookie, 'Retained by config rollback');
+  await freshGet(items, bearer(token.secret).headers, 200);
+
+  const { currentVersion } = cli(['status']);
+  const filename = process.env.GIS_TEST_CONFIG;
+  const original = await readFile(filename, 'utf8');
+  let update;
+  try {
+    await writeFile(filename, original.replace('title: Closed places', 'title: Renamed closed places'));
+    update = cli(['config', 'plan', filename]);
+  } finally {
+    await writeFile(filename, original);
+  }
+  assert.deepEqual(update.changed, ['private-places']);
+  assert.equal(update.publications.find(({ publicationId }) => publicationId === 'private-places').personalGrants, 'preserve');
+  cli(['config', 'apply', update.planId]);
+  await freshGet(items, bearer(token.secret).headers, 200);
+  cli(['access', 'revoke', 'private-places', '--email', email]);
+  cli(['users', 'block', '--email', email]);
+
+  const rollback = cli(['config', 'plan', '--rollback-to', currentVersion]);
+  cli(['config', 'apply', rollback.planId]);
+  await freshGet(items, bearer(token.secret).headers, 403);
+  cli(['users', 'unblock', '--email', email]);
+  const listing = await freshGet('/api/auth/tokens', { Cookie: cookie }, 200, true);
+  assert.equal(listing.tokens.some(({ id }) => id === token.id), true);
+  await freshGet(items, bearer(token.secret).headers, 403);
+  cli(['access', 'grant', 'private-places', '--email', email]);
+  await freshGet(items, bearer(token.secret).headers, 200);
+  cli(['access', 'revoke', 'private-places', '--email', email]);
+});
+
+test('an unavailable unchanged source does not block an access-only change or the saved OpenAPI', async () => {
+  const filename = process.env.GIS_TEST_CONFIG;
+  const source = join(dirname(filename), 'places.geojson');
+  const moved = `${source}.test-backup`;
+  const original = await readFile(filename, 'utf8');
+  const updated = original.replace('[administrator@example.test]', '[administrator@example.test, another@example.test]');
+  assert.notEqual(updated, original);
+  await rename(source, moved);
+  try {
+    await writeFile(filename, updated);
+    const plan = cli(['config', 'plan', filename]);
+    assert.ok(plan.services.includes('access'));
+    assert.ok(!plan.services.includes('pygeoapi'));
+    cli(['config', 'apply', plan.planId]);
+    const api = await freshGet('/features/openapi?f=json', {}, 200, true);
+    assert.ok(api.paths['/collections/places/items']);
+    await freshGet(items, {}, 401);
+  } finally {
+    await rename(moved, source);
+    await writeFile(filename, original);
+  }
 });

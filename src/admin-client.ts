@@ -39,7 +39,7 @@ export async function runAdminCommand(args: string[]) {
   }).catch(() => { throw new CliError('FAILED', 1, 'Cannot connect to the local administrator service.'); });
 
   if (result.status === 'error') {
-    const exitCode = { INVALID_INPUT: 2, NOT_FOUND: 3, FORBIDDEN: 4 }[result.code] ?? 1;
+    const exitCode = { INVALID_INPUT: 2, NOT_FOUND: 3, FORBIDDEN: 4, APPLY_IN_PROGRESS: 5 }[result.code] ?? 1;
     throw new CliError(result.code, exitCode, String(result.data.message));
   }
   return result;

@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { createServer } from 'node:https';
 import type { TLSSocket } from 'node:tls';
 import express from 'express';
@@ -38,6 +38,13 @@ export async function startAdminServer(pool: Pool, settings: AdminSettings) {
     const actor: string = res.locals.actor;
     if (!settings.operators[actor]?.includes(requiredPermission(command))) {
       throw new CliError('FORBIDDEN', 4, 'This local account has no permission for this command.');
+    }
+    if (command.operation === 'access grant' || command.operation === 'access revoke') {
+      const closed = await stat('/etc/gis/closed').then(() => true, (error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return false;
+        throw error;
+      });
+      if (closed) throw new CliError('APPLY_IN_PROGRESS', 5, 'Publication access is being reconfigured.');
     }
     let result;
     if (command.operation === 'tokens list' || command.operation === 'tokens revoke') {

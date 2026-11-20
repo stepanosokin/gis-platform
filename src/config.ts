@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { Ajv } from 'ajv';
-import { parseDocument } from 'yaml';
+import { parseDocument, stringify } from 'yaml';
 import schema from './platform.schema.json' with { type: 'json' };
 import type { AdminPermission } from './admin-command.js';
 
@@ -66,11 +66,28 @@ export function publicationEntries(config: FeaturesConfig): [string, Publication
   return [[config.publicationId, config.publication], ...Object.entries(config.additionalPublications ?? {})];
 }
 
+export function serializeFeaturesConfig(config: FeaturesConfig) {
+  const snapshot: PlatformConfig = {
+    schema_version: 1,
+    server: { host: new URL(config.publicUrl).hostname, port: config.port, tls: config.tls },
+    sources: { [config.publication.source]: { type: 'geojson', path: config.sourcePath } },
+    providers: { [config.publication.provider]: { type: 'pygeoapi' } },
+    publications: Object.fromEntries(publicationEntries(config)),
+    auth: config.auth,
+  };
+  return stringify(snapshot);
+}
+
 const validate = new Ajv({ allErrors: true, ownProperties: true }).compile<PlatformConfig>(schema);
 
-export async function readFeaturesConfig(filename: string): Promise<FeaturesConfig> {
-  const document = parseDocument(await readFile(filename, 'utf8'));
-  if (document.errors.length) throw new Error(document.errors[0]?.message);
+export async function readFeaturesConfig(filename: string) {
+  const yaml = await readFile(filename, 'utf8');
+  return { config: parseFeaturesConfig(yaml, dirname(filename)), yaml };
+}
+
+export function parseFeaturesConfig(yaml: string, directory: string): FeaturesConfig {
+  const document = parseDocument(yaml);
+  if (document.errors.length) throw new Error('The configuration is not valid YAML.');
 
   const config: unknown = document.toJS();
   if (!validate(config)) {
@@ -102,7 +119,6 @@ export async function readFeaturesConfig(filename: string): Promise<FeaturesConf
   if (!sourceConfig) throw new Error(`Expected source '${publication.source}'.`);
 
   const { host, port, tls } = config.server;
-  const directory = dirname(filename);
   const auth = config.auth;
   if (auth) {
     auth.secret_file = resolve(directory, auth.secret_file);

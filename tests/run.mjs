@@ -80,13 +80,23 @@ async function runHttpTests() {
 
   try {
     assert.equal(cli('apply', ['apply', plan.planId]).code, 'OK');
-    const testFilter = mode === '--smoke' ? ['--test-name-pattern=^the applied'] : [];
-    console.log(run('test-http', 'docker', [
-      'run', '--rm', ...containerUser, ...resultsMount, '--network', `${project}_default`,
-      '--env', 'GIS_TEST_GATEWAY=http://caddy',
-      '--env', `GIS_TEST_PUBLIC_URL=${publicUrl}`,
-      image, 'node', '--test', ...testFilter, 'tests/http.test.mjs',
-    ]));
+    if (mode !== '--versions') {
+      const testFilter = mode === '--smoke' ? ['--test-name-pattern=^the applied'] : [];
+      console.log(run('test-http', 'docker', [
+        'run', '--rm', ...containerUser, ...resultsMount, '--network', `${project}_default`,
+        '--env', 'GIS_TEST_GATEWAY=http://caddy',
+        '--env', `GIS_TEST_PUBLIC_URL=${publicUrl}`,
+        image, 'node', '--test', ...testFilter, 'tests/http.test.mjs',
+      ]));
+    }
+    if (mode === '--versions' || !mode) {
+      writeFileSync(file, config.replace('port: 8080', `port: ${port}`));
+      makeGatewayCertificate('versions');
+      const filter = mode === '--versions' && process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
+      console.log(run('test-versions', process.execPath, ['--test', ...filter, 'tests/versions.test.mjs'], {
+        ...stackEnvironment, GIS_TEST_PUBLIC_URL: publicUrl, GIS_TEST_CONFIG: file,
+      }));
+    }
   } catch (error) {
     try {
       run('stack-containers', 'docker', ['compose', '-p', project, 'ps', '--all']);
@@ -119,6 +129,13 @@ function makeAdminCertificates() {
   `]);
 }
 
+function makeGatewayCertificate(suite) {
+  run(`certificate-${suite}`, 'docker', ['run', '--rm', ...containerUser, ...resultsMount, '--entrypoint', 'openssl',
+    toolsImage,
+    'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-addext',
+    'subjectAltName=DNS:localhost', '-keyout', '/results/https-key.pem', '-out', '/results/https-cert.pem']);
+}
+
 async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = false } = {}) {
   run(`build-${suite}-cli`, process.execPath, ['node_modules/typescript/bin/tsc']);
   const accessProject = `${project}-${suite}`;
@@ -130,10 +147,7 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
   for (const name of ['auth-secret', 'postgres-password']) {
     writeFileSync(join(results, name), randomBytes(32).toString('hex'), { mode: 0o600 });
   }
-  run(`certificate-${suite}`, 'docker', ['run', '--rm', ...containerUser, ...resultsMount, '--entrypoint', 'openssl',
-    toolsImage,
-    'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost', '-addext',
-    'subjectAltName=DNS:localhost', '-keyout', '/results/https-key.pem', '-out', '/results/https-cert.pem']);
+  makeGatewayCertificate(suite);
   const config = readFileSync(join(root, 'examples/features.yaml'), 'utf8');
   const entryStart = config.indexOf('  places:');
   const publicPublication = config.slice(entryStart);
@@ -205,6 +219,10 @@ if (mode === '--qgis') {
   process.exit(0);
 }
 run('build-test-image', 'docker', ['build', '-f', 'tests/Dockerfile', '-t', image, '.']);
+if (mode === '--versions') {
+  await runHttpTests();
+  process.exit(0);
+}
 if (mode === '--private') {
   await runAccessTests('private');
   process.exit(0);

@@ -6,8 +6,8 @@ services:
     restart: unless-stopped
     volumes:
       - type: bind
-        source: ${GIS_REVISION_DIR:-./.gis-platform}/access.json
-        target: /etc/gis/access.json
+        source: ${GIS_REVISION_DIR:-./.gis-platform}
+        target: /etc/gis
         read_only: true
         bind:
           create_host_path: false

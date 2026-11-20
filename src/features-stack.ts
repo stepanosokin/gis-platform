@@ -1,18 +1,31 @@
 import { execFile } from 'node:child_process';
-import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
+import { createHash, X509Certificate } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { get as getHttp } from 'node:http';
 import { get as getHttps } from 'node:https';
 import { isIP } from 'node:net';
 import { basename, join } from 'node:path';
 import { text } from 'node:stream/consumers';
 import { setTimeout } from 'node:timers/promises';
-import { checkServerIdentity } from 'node:tls';
+import { checkServerIdentity, createSecureContext } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { parse } from 'yaml';
 import { publicationEntries, type FeaturesConfig } from './config.js';
 
 const run = promisify(execFile);
 const composeFile = (name: string) => fileURLToPath(new URL(`../${name}`, import.meta.url));
+let project: string | undefined;
+
+export async function resolveComposeProject() {
+  const { stdout } = await run('docker', ['compose', '-f', composeFile('compose.yaml'), 'config', '--format', 'json'],
+    { windowsHide: true });
+  const config = JSON.parse(stdout) as { name?: string };
+  if (!config.name) throw new Error('Compose did not report a project name.');
+  project = config.name;
+  return project;
+}
 
 function pygeoapiConfig(config: FeaturesConfig) {
   const { publicUrl } = config;
@@ -55,6 +68,11 @@ function pygeoapiConfig(config: FeaturesConfig) {
         providers: [{ type: 'feature', name: 'GeoJSON', data: '/source/data.geojson', id_field: 'id' }],
     }])),
   };
+}
+
+export function providerConfigurationChanged(candidate: FeaturesConfig, previous: FeaturesConfig | null) {
+  return !previous || candidate.sourcePath !== previous.sourcePath ||
+    JSON.stringify(pygeoapiConfig(candidate)) !== JSON.stringify(pygeoapiConfig(previous));
 }
 
 function caddyConfig(config: FeaturesConfig) {
@@ -142,19 +160,7 @@ function caddyConfig(config: FeaturesConfig) {
 		}
 	}
 ` : '';
-  return `{
-	admin off${tlsOptions}
-	log {
-		format filter {
-			wrap json
-			request delete
-			resp_headers delete
-		}
-	}
-}
-
-${site} {${certificate}
-${journal}
+  const routes = `
 ${accounts}
 ${metadataRoutes}
 ${config.auth ? publicationRoutes(protectedIds, false) + publicationRoutes(publicIds, true) : ''}
@@ -171,6 +177,8 @@ ${config.auth ? publicationRoutes(protectedIds, false) + publicationRoutes(publi
 		header Cache-Control no-store
 		respond 404
 	}
+`;
+  const errors = `
 	handle_errors 5xx {
 		header X-Request-Id {http.request.uuid}${publicAuthFallback}
 		handle {
@@ -179,19 +187,86 @@ ${config.auth ? publicationRoutes(protectedIds, false) + publicationRoutes(publi
 			respond \`{"code":"ServiceUnavailable"}\` 503
 		}
 	}
+`;
+  return `{
+	admin off${tlsOptions}
+	log {
+		format filter {
+			wrap json
+			request delete
+			resp_headers delete
+		}
+	}
+}
+
+${site} {${certificate}
+${journal}
+	route {
+		@switching file {
+			root /etc/caddy/gis
+			try_files closed
+		}
+		header @switching Cache-Control no-store
+		header @switching Content-Type application/json
+		respond @switching \`{"code":"ServiceUnavailable"}\` 503
+${routes}
+	}
+${errors}
+}
+
+http://:2080 {
+	bind 127.0.0.1
+	route {
+${routes}
+	}
+${errors}
 }
 `;
 }
 
-export async function prepareFeaturesStack(config: FeaturesConfig, revisionDirectory: string) {
-  const source = await open(config.sourcePath, 'r');
-  try {
-    if (!(await source.stat()).isFile()) throw new Error('The GeoJSON source must be a regular file.');
-  } finally {
-    await source.close();
-  }
+interface Revision {
+  config: FeaturesConfig;
+  directory: string;
+}
 
-  await mkdir(revisionDirectory, { recursive: true });
+export async function sourceFingerprint(path: string) {
+  const hash = createHash('sha256');
+  try {
+    for await (const chunk of createReadStream(path)) hash.update(chunk);
+    return hash.digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+export async function savedSourceFingerprint(directory: string) {
+  return readFile(join(directory, 'source.sha256'), 'utf8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') throw error;
+    return null;
+  });
+}
+
+export async function archiveLegacyOpenApi({ config, directory }: Revision) {
+  const output = await compose(config, directory, 'exec', '-T', 'pygeoapi', 'cat', '/pygeoapi/local.openapi.yml');
+  const body = JSON.stringify(parse(output));
+  checkOpenApi(body, config, publicationEntries(config).map(([id]) => id));
+  await writeFile(join(directory, 'openapi.json'), body);
+}
+
+export async function prepareFeaturesStack({ config, directory: revisionDirectory }: Revision,
+  options: { previous?: Revision; sourceHash?: string | null; useArchivedOpenApi?: boolean } = {}) {
+  const { previous, useArchivedOpenApi } = options;
+  await mkdir(revisionDirectory, { recursive: true, mode: 0o700 });
+  await rm(join(revisionDirectory, 'provider-directory'), { force: true });
+  if (config.tls) {
+    const cert = new X509Certificate(await readFile(config.tls.cert_file));
+    const hostname = new URL(config.publicUrl).hostname;
+    const matches = isIP(hostname) ? cert.checkIP(hostname) : cert.checkHost(hostname);
+    const now = Date.now();
+    if (!matches || now < Date.parse(cert.validFrom) || now > Date.parse(cert.validTo)) {
+      throw new Error('Invalid TLS certificate for the public hostname.');
+    }
+  }
   if (config.auth) {
     const { auth } = config;
     const secret = (await readFile(auth.secret_file, 'utf8')).trim();
@@ -211,12 +286,16 @@ export async function prepareFeaturesStack(config: FeaturesConfig, revisionDirec
       operators: auth.cli?.operators, version: basename(revisionDirectory),
     }));
     if (auth.mode === 'production' && auth.smtp.password_file) {
+      if (!(await readFile(auth.smtp.password_file, 'utf8')).trim()) throw new Error('The SMTP password file is empty.');
       await writeFile(join(revisionDirectory, 'compose.smtp.json'), JSON.stringify({
         services: { access: { secrets: ['smtp_password'] } },
         secrets: { smtp_password: { file: auth.smtp.password_file } },
       }));
     }
     if (auth.cli) {
+      const [ca, cert, key] = await Promise.all([auth.cli.ca_file, auth.cli.cert_file, auth.cli.key_file]
+        .map((file) => readFile(file)));
+      createSecureContext({ ca, cert, key });
       const secretFiles = { cli_ca: auth.cli.ca_file, cli_cert: auth.cli.cert_file, cli_key: auth.cli.key_file };
       await writeFile(join(revisionDirectory, 'compose.admin.json'), JSON.stringify({
         services: { access: {
@@ -227,10 +306,53 @@ export async function prepareFeaturesStack(config: FeaturesConfig, revisionDirec
       }));
     }
   }
-  await Promise.all([
-    writeFile(join(revisionDirectory, 'pygeoapi.yml'), JSON.stringify(pygeoapiConfig(config), null, 2)),
-    writeFile(join(revisionDirectory, 'Caddyfile'), caddyConfig(config)),
-  ]);
+  const providerConfig = JSON.stringify(pygeoapiConfig(config), null, 2);
+  await writeFile(join(revisionDirectory, 'pygeoapi.yml'), providerConfig);
+  await writeFile(join(revisionDirectory, 'Caddyfile'), caddyConfig(config));
+  await compose(config, revisionDirectory, 'config', '--quiet');
+  await compose(config, revisionDirectory, 'run', '--rm', '--no-deps', '-T', '--entrypoint', 'caddy', 'caddy',
+    'validate', '--config', '/etc/caddy/gis/Caddyfile', '--adapter', 'caddyfile');
+
+  if (useArchivedOpenApi) {
+    const archived = await readFile(join(revisionDirectory, 'openapi.json'), 'utf8').catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error;
+    });
+    if (archived) {
+      checkOpenApi(archived, config, publicationEntries(config).map(([id]) => id));
+      return;
+    }
+  }
+  const sameSource = previous?.config.sourcePath === config.sourcePath;
+  const sourceHash = await sourceFingerprint(config.sourcePath);
+  const previousHash = previous && await savedSourceFingerprint(previous.directory);
+  if ((options.sourceHash && sourceHash && sourceHash !== options.sourceHash) ||
+      (options.sourceHash === null && sameSource && sourceHash && previousHash && sourceHash !== previousHash)) {
+    throw new Error('The GeoJSON source changed after planning.');
+  }
+  if (previous && previousHash && sameSource && (!sourceHash || sourceHash === previousHash) &&
+      (!options.sourceHash || options.sourceHash === previousHash) &&
+      !providerConfigurationChanged(config, previous.config)) {
+    await copyFile(join(previous.directory, 'openapi.json'), join(revisionDirectory, 'openapi.json'));
+    const provider = await providerDirectory(previous.directory);
+    await writeFile(join(revisionDirectory, 'provider-directory'), basename(provider));
+    await writeFile(join(revisionDirectory, 'source.sha256'), previousHash);
+    return;
+  }
+  if (!sourceHash) throw new Error('The GeoJSON source is unavailable.');
+  const output = await compose(config, revisionDirectory, 'run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', 'pygeoapi',
+    '-ec', [
+      `/venv/bin/python -c "from pygeoapi.provider.geojson import GeoJSONProvider; GeoJSONProvider({'name': 'GeoJSON', 'type': 'feature', 'data': '/source/data.geojson', 'id_field': 'id'}).query(limit=1)" >/dev/null`,
+      '/venv/bin/pygeoapi openapi generate "$PYGEOAPI_CONFIG" -f json -of /tmp/openapi.json >/dev/null',
+      'cat /tmp/openapi.json',
+    ].join('\n'));
+  checkOpenApi(output, config, publicationEntries(config).map(([id]) => id));
+  await writeFile(join(revisionDirectory, 'openapi.json'), output);
+  await writeFile(join(revisionDirectory, 'source.sha256'), sourceHash);
+}
+
+async function providerDirectory(directory: string) {
+  const revision = await readFile(join(directory, 'provider-directory'), 'utf8').catch(() => undefined);
+  return revision && /^plan-[a-f0-9]{64}$/.test(revision) ? join(directory, '..', revision) : directory;
 }
 
 export async function compose(config: FeaturesConfig, revisionDirectory: string, ...args: string[]) {
@@ -242,22 +364,25 @@ export async function compose(config: FeaturesConfig, revisionDirectory: string,
     else if (config.auth.smtp.password_file) files.push(join(revisionDirectory, 'compose.smtp.json'));
     if (config.auth.cli) files.push(join(revisionDirectory, 'compose.admin.json'));
   }
-  await run('docker', ['compose', ...files.flatMap((file) => ['-f', file]), ...args], {
+  const { stdout } = await run('docker', ['compose', ...(project ? ['-p', project] : []),
+    ...files.flatMap((file) => ['-f', file]), ...args], {
     env: {
       ...process.env,
       GIS_PUBLIC_PORT: String(config.port),
       GIS_CADDY_PORT: config.tls ? '443' : '80',
       GIS_TLS_CERT_FILE: config.tls?.cert_file,
       GIS_TLS_KEY_FILE: config.tls?.key_file,
-      GIS_PUBLICATION_ID: config.publicationId,
       GIS_REVISION_DIR: revisionDirectory,
+      GIS_PROVIDER_REVISION_DIR: await providerDirectory(revisionDirectory),
       GIS_SOURCE_FILE: config.sourcePath,
       GIS_AUTH_SECRET_FILE: config.auth?.secret_file,
       GIS_POSTGRES_PASSWORD_FILE: config.auth?.postgres_password_file,
       GIS_MAILPIT_PORT: config.auth?.mode === 'development' ? String(config.auth.mailpit_port ?? 8025) : undefined,
     },
     windowsHide: true,
+    maxBuffer: 16 * 1024 * 1024,
   });
+  return stdout;
 }
 
 function probeCollection(origin: URL, path: string, certificate: Buffer | undefined) {
@@ -282,34 +407,64 @@ function probeCollection(origin: URL, path: string, certificate: Buffer | undefi
   });
 }
 
+function checkOpenApi(body: string, config: FeaturesConfig, ids: string[]) {
+  const api = JSON.parse(body) as { openapi?: string; servers?: { url: string }[]; paths?: Record<string, unknown> };
+  if (!api.openapi?.startsWith('3.0.') || api.servers?.[0]?.url !== config.publicUrl ||
+      ids.some((id) => !api.paths?.[`/collections/${id}/items`])) {
+    throw new Error('The generated Features OpenAPI does not match the configuration.');
+  }
+}
+
+export async function closeGateway(directory: string) {
+  await writeFile(join(directory, 'closed'), '');
+}
+
+export async function openGateway(directory: string) {
+  await rm(join(directory, 'closed'), { force: true });
+}
+
 export async function startFeaturesStack(config: FeaturesConfig, revisionDirectory: string) {
   const origin = new URL(config.publicUrl);
   const certificate = config.tls ? await readFile(config.tls.cert_file) : undefined;
-  await compose(config, revisionDirectory, 'up', '-d', '--remove-orphans', '--wait', '--wait-timeout', '65',
-    ...(config.auth ? ['--build'] : []));
+  await compose(config, revisionDirectory, 'up', '-d', '--no-deps', 'caddy');
+  await compose(config, revisionDirectory, 'up', '-d', '--remove-orphans',
+    '--wait', '--wait-timeout', '65', ...(config.auth ? ['--build'] : []), 'pygeoapi',
+    ...(config.auth ? ['access', ...(config.auth.mode === 'development' ? ['mailpit'] : [])] : []));
 
   const collections = publicationEntries(config).map(([id, { access }]) => ({
     id, access, path: `/features/collections/${id}?f=json`,
   }));
-  let failure = 'no response';
+  const internal = async (path: string, status: number) => {
+    try {
+      const body = await compose(config, revisionDirectory, 'exec', '-T', 'caddy', 'wget', '-T', '3', '-S', '-O', '-',
+        `http://127.0.0.1:2080${path}`);
+      if (status === 200) return body;
+    } catch (error) {
+      if (status === 401 && error instanceof Error && 'stderr' in error &&
+          typeof error.stderr === 'string' && /HTTP\/1\.1 401\b/.test(error.stderr)) return '';
+    }
+    throw new Error('Candidate gateway returned an unexpected response.');
+  };
   for (let attempt = 0; attempt < 15; attempt++) {
     try {
+      const gate = await probeCollection(origin, '/features/collections?f=json', certificate);
+      if (gate.status !== 503 || gate.cacheControl !== 'no-store') throw new Error('The gateway is not closed.');
       for (const { id, access, path } of collections) {
-        const response = await probeCollection(origin, path, certificate);
-        const expectedStatus = access === 'public' ? 200 : 401;
-        if (response.status !== expectedStatus || response.cacheControl !== 'no-store') {
-          throw new Error(`${id}: expected HTTP ${expectedStatus} and no-store, got HTTP ${response.status}.`);
-        }
-        const collection = JSON.parse(response.body) as { id?: string; code?: string };
-        if (access === 'public' ? collection.id !== id : collection.code !== 'Unauthorized') {
-          throw new Error(`${id}: unexpected Features response.`);
+        const body = await internal(path, access === 'public' ? 200 : 401);
+        if (access === 'public') {
+          const collection = JSON.parse(body) as { id?: string; links?: { rel: string; href: string }[] };
+          if (collection.id !== id || !collection.links?.some(({ rel, href }) =>
+            rel === 'items' && href === `${config.publicUrl}/collections/${id}/items?f=json`)) {
+            throw new Error('Unexpected Features collection or canonical URL.');
+          }
         }
       }
+      checkOpenApi(await internal('/features/openapi?f=json', 200), config,
+        collections.filter(({ access }) => access === 'public').map(({ id }) => id));
       return;
     } catch (error) {
-      failure = String(error);
+      if (attempt === 14) throw error;
     }
     await setTimeout(500);
   }
-  throw new Error(`The publications did not become ready through Caddy at ${config.publicUrl}: ${failure}.`);
 }

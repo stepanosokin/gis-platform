@@ -1,6 +1,9 @@
+import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { publicationEntries, readFeaturesConfig } from './config.js';
-import { applyPlan, createPlan } from './plans.js';
+import { configurationStatus, createPlan, planRollback } from './plans.js';
+import type { ApplyReply } from './apply-worker.js';
 import { CliError } from './cli-result.js';
 import { runAdminCommand } from './admin-client.js';
 
@@ -15,42 +18,79 @@ function success(code: string, data: Record<string, unknown>, message: string) {
 }
 
 async function main() {
+  if (group === 'status' && !command) {
+    const admin = process.env.GIS_ADMIN_PORT ? await runAdminCommand(commandArguments).catch((error: unknown) => {
+      if (!(error instanceof CliError) || error.code !== 'FAILED') throw error;
+      return error;
+    }) : undefined;
+    const local = await configurationStatus().catch((error: unknown) => {
+      if (admin && !(admin instanceof Error) && error instanceof Error && 'code' in error && error.code === 'EACCES') return undefined;
+      throw error;
+    });
+    if (admin instanceof Error && !local?.currentVersion && !local?.pendingPlanId) throw admin;
+    const data = { ...(admin && !(admin instanceof Error) ? admin.data : {}), ...local,
+      currentVersion: local?.currentVersion ?? (admin && !(admin instanceof Error) ? admin.data.currentVersion : null) };
+    success('OK', data, `Current version: ${data.currentVersion ?? 'none'}\nPhase: ${local?.phase ?? 'ready'}` +
+      (local?.closedRoutes.length ? `\nClosed routes: ${local.closedRoutes.join(', ')}` : ''));
+    return;
+  }
   if (group === 'status' || group === 'doctor' || group === 'users' || group === 'access' || group === 'tokens') {
     const result = await runAdminCommand(commandArguments);
     success(result.code, result.data, formatAdminResult(result));
     return;
   }
-  if (group !== 'config' || !argument || extra.length ||
+  const rollback = group === 'config' && command === 'plan' && argument === '--rollback-to' && extra.length === 1 && !!extra[0];
+  if (group !== 'config' || !argument || (!rollback && (extra.length || argument === '--rollback-to')) ||
       (command !== 'validate' && command !== 'plan' && command !== 'apply')) {
     throw new CliError('INVALID_INPUT', 2,
-      'Usage: config validate <file> | config plan <file> | config apply <plan-id> [--json]');
+      'Usage: config validate <file> | config plan <file> | config plan --rollback-to <version> | config apply <plan-id> [--json]');
   }
 
   if (command === 'apply') {
     const result = await applyPlan(argument);
     const action = result.code === 'OK' ? 'Applied' : 'Already active';
-    success(result.code, result.data, `${action}: ${result.data.url}`);
+    success(result.code, result.data, `${action}: ${result.data.url}\nCurrent version: ${result.data.currentVersion ?? 'none'}`);
     return;
   }
 
-  const config = await readFeaturesConfig(resolve(argument)).catch((error: unknown) => {
-    throw new CliError('INVALID_CONFIG', 2, error instanceof Error ? error.message : String(error));
-  });
-  if (command === 'validate') {
-    const publicationIds = publicationEntries(config).map(([id]) => id);
-    success('OK', { publicationId: config.publicationId, publicationIds }, `Valid configuration: ${publicationIds.join(', ')}`);
-    return;
-  }
-
-  const plan = await createPlan(config);
+  const plan = rollback ? await planRollback(extra[0]!) : await planFile(command, argument);
+  if (!plan) return;
   success('OK', plan, [
     plan.planId,
+    `Base version: ${plan.baseVersion ?? 'none'}`,
+    ...(plan.targetVersion ? [`Rollback target: ${plan.targetVersion}`] : []),
     `Added: ${plan.added.join(', ') || 'none'}`,
     `Changed: ${plan.changed.join(', ') || 'none'}`,
     `Removed: ${plan.removed.join(', ') || 'none'}`,
     `URL: ${plan.previousUrl ?? '(none)'} → ${plan.newUrl}`,
+    ...plan.publications.map(({ publicationId, previousUrl, newUrl, previousAccess, newAccess, personalGrants }) =>
+      `${publicationId}: ${previousUrl ?? '(none)'} → ${newUrl ?? '(none)'} | access: ${previousAccess ?? 'none'} → ${newAccess ?? 'none'} | grants: ${personalGrants}`),
     `Services: ${plan.services.join(', ') || 'none'}`,
+    `Routes to close: ${plan.routesToClose.join(', ') || 'none'}`,
   ].join('\n'));
+}
+
+async function planFile(command: string, filename: string) {
+  const { config, yaml } = await readFeaturesConfig(resolve(filename)).catch((error: unknown) => {
+    throw new CliError('INVALID_CONFIG', 2, error instanceof Error ? error.message : String(error));
+  });
+  if (command === 'plan') return createPlan(config, yaml);
+  const publicationIds = publicationEntries(config).map(([id]) => id);
+  success('OK', { publicationId: config.publicationId, publicationIds }, `Valid configuration: ${publicationIds.join(', ')}`);
+}
+
+async function applyPlan(planId: string) {
+  // A disconnected CLI does not interrupt its independently running operation.
+  const worker = spawn(process.execPath, [fileURLToPath(new URL('./apply-worker.js', import.meta.url)), planId], {
+    detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'], windowsHide: true,
+  });
+  const reply = await new Promise<ApplyReply>((resolve, reject) => {
+    worker.once('message', (message: ApplyReply) => resolve(message));
+    worker.once('error', reject);
+    worker.once('exit', () => reject(new CliError('FAILED', 1, 'The configuration worker exited. Check status.')));
+  });
+  if (!reply.ok) throw new CliError(reply.code, reply.exitCode, reply.message, reply.data);
+  return reply.result;
 }
 
 function formatAdminResult({ code, data }: Awaited<ReturnType<typeof runAdminCommand>>) {
