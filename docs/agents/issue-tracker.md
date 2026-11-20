@@ -2,6 +2,7 @@
 
 Issues and specs live in GitHub Issues for `stepanosokin/gis-platform`.
 Use the `gh` CLI from this repository; infer the repo from `git remote -v`.
+If the sandbox proxy blocks `gh`, use the GitHub connector to read the issue and its comments.
 
 ## Conventions
 
