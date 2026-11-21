@@ -1,16 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataService, postgisSource, publicationEntries, publicationUrl, providerRoot,
   fileSource, serializeFeaturesConfig, usedFileSources, vectorFile, type FeaturesConfig, type Publication } from './config.js';
 import { pinProviderImages } from './provider-images.js';
-import { archiveLegacyOpenApi, closeGateway, compose, featuresStackRunning, openGateway, prepareFeaturesStack, providerConfigurationChanged,
+import { archiveLegacyOpenApi, closeGateway, compose, diagnoseStack, featuresStackRunning, openGateway, prepareFeaturesStack, providerConfigurationChanged,
   publicationGrantRemoval, resolveComposeProject, savedSourceFingerprint, savedFileFingerprints, sourceFingerprint,
   startFeaturesStack, fileFingerprints, FeaturesPreflightError } from './features-stack.js';
 import { CliError } from './cli-result.js';
 import { mapLibreFiles, mapLibreHashes, writeMapLibreFiles } from './maplibre-style.js';
+import { statusSnapshot, type ActiveState, type ApplyResult } from './configuration-state.js';
 
 interface Plan {
   planId: string;
@@ -26,25 +27,10 @@ interface Plan {
   edit?: { filename: string; before: string };
 }
 
-interface ActiveState {
-  planId: string | null;
-  previousVersion?: string | null;
-  pendingPlanId?: string;
-  phase?: 'preflight' | 'switch' | 'open' | 'finalize' | 'recovery';
-  finalizeFailed?: boolean;
-  openFailed?: boolean;
-  closedRoutes?: string[];
-  results?: Record<string, ApplyResult>;
-}
-
-interface ApplyResult {
-  code: 'OK' | 'NO_CHANGE' | 'APPLY_FAILED' | 'RECOVERY_INCOMPLETE';
-  message?: string;
-}
-
 const stateDirectory = resolve(process.env.GIS_STATE_DIR ??
   fileURLToPath(new URL('../.gis-platform', import.meta.url)));
-const activeFile = join(stateDirectory, 'active.json');
+const legacyActiveFile = join(stateDirectory, 'active.json');
+const activeFile = join(stateDirectory, 'status', 'active.json');
 const planDirectory = (planId: string) => join(stateDirectory, 'plans', planId);
 
 function missing(error: unknown) {
@@ -64,7 +50,15 @@ async function writeJson(filename: string, value: unknown) {
 
 async function readActive(): Promise<ActiveState> {
   try {
-    return JSON.parse(await readFile(activeFile, 'utf8')) as ActiveState;
+    const contents = await readFile(activeFile, 'utf8').catch((error) => {
+      if (!missing(error)) throw error;
+      return readFile(legacyActiveFile, 'utf8').catch((legacyError) => {
+        if (!missing(legacyError)) throw legacyError;
+        // An apply can move the legacy file between these two reads.
+        return readFile(activeFile, 'utf8');
+      });
+    });
+    return JSON.parse(contents) as ActiveState;
   } catch (error) {
     if (missing(error)) return { planId: null };
     if (error instanceof SyntaxError) throw new CliError('FAILED', 1, 'The saved configuration state is unreadable.');
@@ -93,16 +87,37 @@ function firstPublicationUrl(config: FeaturesConfig) {
   return config.publicationId === null ? null : publicationUrl(config, config.publicationId, config.publication);
 }
 
+async function writeActive(state: ActiveState) {
+  await writeJson(activeFile, state);
+}
+
+async function migrateActiveFile() {
+  try {
+    await stat(activeFile);
+  } catch (error) {
+    if (!missing(error)) throw error;
+    await mkdir(dirname(activeFile), { recursive: true, mode: 0o700 });
+    await rename(legacyActiveFile, activeFile).catch((moveError) => {
+      if (!missing(moveError)) throw moveError;
+    });
+  }
+}
+
 export async function configurationStatus() {
-  const state = await readActive();
-  const data = {
-    currentVersion: state.planId, previousVersion: state.previousVersion ?? null,
-    phase: state.phase ?? (state.pendingPlanId ? 'switch' : 'ready'),
-    pendingPlanId: state.pendingPlanId ?? null, closedRoutes: state.closedRoutes ?? [],
-  };
-  if (state.phase === 'recovery' || state.finalizeFailed || state.openFailed) throw new CliError('RECOVERY_INCOMPLETE', 7,
+  const { recoveryIncomplete, ...data } = statusSnapshot(await readActive());
+  if (recoveryIncomplete) throw new CliError('RECOVERY_INCOMPLETE', 7,
     `Configuration recovery is incomplete. Closed routes: ${data.closedRoutes.join(', ')}.`, data);
   return data;
+}
+
+export async function configurationDoctor(publicationId?: string) {
+  const { planId } = await readActive();
+  if (!planId) throw new CliError('NOT_FOUND', 3, 'There is no confirmed configuration.');
+  const current = await readPlan(planId);
+  if (publicationId && !publicationEntries(current.config).some(([id]) => id === publicationId)) {
+    throw new CliError('NOT_FOUND', 3, 'Publication not found.');
+  }
+  return { currentVersion: planId, publicationId, ...await diagnoseStack(revision(current), publicationId) };
 }
 
 export async function planRollback(version: string) {
@@ -326,12 +341,12 @@ async function restoreStack(state: ActiveState, candidate: Plan, current: Plan |
       await compose(candidate.config, directory, 'down', '--remove-orphans');
     }
     const outcome = state.results?.[candidate.planId] ?? { code: 'APPLY_FAILED', message };
-    await writeJson(activeFile, settled(state, candidate.planId, outcome));
+    await writeActive(settled(state, candidate.planId, outcome));
   } catch {
     await secureGateway(revision(candidate)).catch(() => {});
     if (current) await secureGateway(revision(current), !current.yaml).catch(() => {});
     const outcome = { code: 'RECOVERY_INCOMPLETE', message: 'The previous configuration could not be restored.' } as const;
-    await writeJson(activeFile, { ...state, phase: 'recovery', results: {
+    await writeActive({ ...state, phase: 'recovery', results: {
       ...state.results, [candidate.planId]: outcome,
     } });
   }
@@ -354,7 +369,7 @@ async function openConfirmedVersion(state: ActiveState, candidate: Plan) {
   const confirmed: ActiveState = {
     ...state, phase: 'open', planId: candidate.planId, previousVersion: state.planId,
   };
-  await writeJson(activeFile, confirmed);
+  await writeActive(confirmed);
   await finishOpen(confirmed, candidate);
 }
 
@@ -363,7 +378,7 @@ async function finishOpen(state: ActiveState, candidate: Plan) {
   const { directory } = revision(candidate);
   try {
     await openGateway(directory);
-    await writeJson(activeFile, settled(state, candidate.planId, { code: 'OK' }));
+    await writeActive(settled(state, candidate.planId, { code: 'OK' }));
   } catch (error) {
     if (!candidate.edit) throw error;
     await keepProviderOpenPending(state, candidate);
@@ -373,7 +388,7 @@ async function finishOpen(state: ActiveState, candidate: Plan) {
 async function keepProviderOpenPending(state: ActiveState, candidate: Plan) {
   // The operator YAML is already committed. Recover this version on retry.
   await secureGateway(revision(candidate)).catch(() => {});
-  await writeJson(activeFile, { ...state, openFailed: true }).catch(() => {});
+  await writeActive({ ...state, openFailed: true }).catch(() => {});
 }
 
 async function resumeProviderOpen(state: ActiveState, candidate: Plan, previous: Plan | null) {
@@ -460,7 +475,7 @@ async function finalizeRemoval(state: ActiveState, plan: Plan, current: Plan | n
       await startFeaturesStack(plan.config, candidate.directory, current ? revision(current) : undefined);
     }
     await openGateway(candidate.directory);
-    await writeJson(activeFile, settled({ ...state, planId: plan.planId, previousVersion: state.planId }, plan.planId, { code: 'OK' }));
+    await writeActive(settled({ ...state, planId: plan.planId, previousVersion: state.planId }, plan.planId, { code: 'OK' }));
   } catch {
     if (!deletionMayHaveRun) {
       await restoreStack(state, plan, current, 'The accounts database could not be started. The previous configuration was restored.');
@@ -469,17 +484,17 @@ async function finalizeRemoval(state: ActiveState, plan: Plan, current: Plan | n
     // A lost database response can conceal a commit. Keep the gate closed until
     // the marker is readable, then finish opening or restore the old revision.
     await secureGateway(candidate).catch(() => {});
-    await writeJson(activeFile, { ...state, finalizeFailed: true });
+    await writeActive({ ...state, finalizeFailed: true });
     throw new CliError('RECOVERY_INCOMPLETE', 7, 'Publication removal could not be finalized. Retry the same plan.', {
       planId: plan.planId, currentVersion: state.planId, closedRoutes: state.closedRoutes ?? [],
     });
   }
 }
 
-async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null, { restart = false } = {}) {
+async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null) {
   const candidate = revision(plan);
   const cleanup = await grantCleanup(plan, current);
-  await writeJson(activeFile, { ...state, pendingPlanId: plan.planId, phase: 'preflight' });
+  await writeActive({ ...state, pendingPlanId: plan.planId, phase: 'preflight' });
   try {
     if (plan.maplibreHashes) {
       const files = await mapLibreFiles(plan.config, candidate.directory).catch(() => null);
@@ -497,7 +512,7 @@ async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null
     if (plan.yaml !== undefined) await writeFile(join(candidate.directory, 'platform.yaml'),
       plan.config.providers ? serializeFeaturesConfig(plan.config) : plan.yaml, { mode: 0o600 });
   } catch (error) {
-    await writeJson(activeFile, settled(state, plan.planId, {
+    await writeActive(settled(state, plan.planId, {
       code: 'APPLY_FAILED', message: error instanceof FeaturesPreflightError ? error.message
         : 'Preflight failed while checking the source, TLS, native configuration or OpenAPI.',
     }));
@@ -506,13 +521,13 @@ async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null
   const pending: ActiveState = {
     ...state, pendingPlanId: plan.planId, phase: 'switch', closedRoutes: affectedRoutes(plan.config, current?.config ?? null),
   };
-  await writeJson(activeFile, pending);
+  await writeActive(pending);
   try {
     await closeGateway(candidate.directory);
     if (current) await secureGateway(revision(current), !current.yaml);
-    await startFeaturesStack(plan.config, candidate.directory, !restart && current ? revision(current) : undefined);
+    await startFeaturesStack(plan.config, candidate.directory, current ? revision(current) : undefined);
     if (!cleanup) await openConfirmedVersion(pending, plan);
-    else await writeJson(activeFile, { ...pending, phase: 'finalize' });
+    else await writeActive({ ...pending, phase: 'finalize' });
   } catch {
     await restoreStack(pending, plan, current, 'The candidate failed verification and the previous configuration was restored.');
     return;
@@ -562,6 +577,7 @@ export async function applyPlan(planId: string) {
   let projectLock: Awaited<ReturnType<typeof applicationLock>> | undefined;
   try {
     projectLock = await applicationLock(`compose:${await resolveComposeProject()}`);
+    await migrateActiveFile();
     let state = await readActive();
     if (state.results?.[planId]) return resultFor(state, plan);
     if (state.pendingPlanId) {
@@ -573,7 +589,7 @@ export async function applyPlan(planId: string) {
         if (!cleanup) throw new CliError('RECOVERY_INCOMPLETE', 7, 'The accounts database could not be found.');
         await finalizeRemoval(state, candidate, previous, cleanup, true);
       } else if (state.phase === 'preflight') {
-        await writeJson(activeFile, settled(state, candidate.planId, {
+        await writeActive(settled(state, candidate.planId, {
           code: 'APPLY_FAILED', message: 'The preflight check was interrupted.',
         }));
       } else if (state.phase === 'open' && candidate.edit) {
@@ -610,14 +626,14 @@ export async function applyPlan(planId: string) {
           (await fileContentChanges(liveFileHashes, current.planId)).size > 0);
       if (!sourceChangedAfterPlanning && !fileChangedAfterPlanning && plan.config.providers &&
           !await featuresStackRunning(current.config, revision(current).directory)) {
-        await activatePlan(state, plan, current, { restart: true });
+        await activatePlan(state, plan, current);
         return resultFor(await readActive(), plan);
       }
       const outcome = sourceChangedAfterPlanning || fileChangedAfterPlanning
         ? { code: 'APPLY_FAILED', message: `The ${sourceChangedAfterPlanning ? 'GeoJSON' : 'file'} source changed after planning. Create a new plan.` } as const
         : { code: 'NO_CHANGE' } as const;
       if (outcome.code === 'NO_CHANGE') await persistProviderEdit(plan);
-      await writeJson(activeFile, settled(state, planId, outcome));
+      await writeActive(settled(state, planId, outcome));
     } else {
       await activatePlan(state, plan, current);
     }

@@ -16,6 +16,7 @@ import { publicationAccess } from './publication-access.js';
 import type { PublicationReader } from './publication-access.js';
 import { prepareAccessStore, readPublicationReader } from './access-store.js';
 import { startAdminServer } from './admin-server.js';
+import type { PublicationHealth } from './publication-health.js';
 import { validTokenId, type AdminPermission } from './admin-command.js';
 import { CliError } from './cli-result.js';
 import { authorizePersonalToken, listPersonalTokens, preparePersonalTokens, publicationBearer, revokePersonalToken,
@@ -31,6 +32,7 @@ interface Settings {
   operators?: Record<string, AdminPermission[]>;
   version?: string;
   managedFeatures?: boolean;
+  publicationHealth?: Record<string, PublicationHealth>;
 }
 
 const settings = JSON.parse(await readFile('/etc/gis/access.json', 'utf8')) as Settings;
@@ -139,7 +141,8 @@ await prepareAccessStore(pool);
 await preparePersonalTokens(pool);
 if (settings.operators) {
   await startAdminServer(pool, { operators: settings.operators, version: settings.version ?? 'unknown',
-    publications: publicationModes, publicationTitles: settings.publicationTitles ?? {}, administratorEmails });
+    publications: publicationModes, publicationTitles: settings.publicationTitles ?? {}, administratorEmails,
+    publicationHealth: settings.publicationHealth, gatewayPort: secureCookies ? 443 : 80 });
 }
 
 const app = express();

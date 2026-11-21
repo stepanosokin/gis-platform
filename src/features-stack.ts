@@ -16,6 +16,7 @@ import { mapBboxDescription, mapRelation, mapSize } from './maps-profile.js';
 import { checkTileJson, martinConfig, martinService, runMartin, tileArchivePath } from './martin-profile.js';
 import { matrixSet, tilesRoutes, tilesRelation, tilesSource, vectorTileType } from './tiles-profile.js';
 import { mapLibreAssetRoute } from './maplibre-style.js';
+import { healthUrl, providerServiceName as serviceName, publicationChecks, publicationHealth } from './publication-health.js';
 import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataService, pinnedImage, postgisSource, providerRoot, publicationEntries, publicationsForProvider, publicationUrl,
   crs84, rasterFile, tileArchive, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
 
@@ -310,10 +311,6 @@ ${errors}
 `;
 }
 
-function serviceName(config: FeaturesConfig, id: string) {
-  return config.providers?.[id]?.image ? `provider-${id}` : 'pygeoapi';
-}
-
 function corsRoutes(name: string, path: string, origins: string[]) {
   const allowed = `header_regexp Origin ^(?:${origins.map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})$`;
   return `
@@ -425,11 +422,30 @@ function managedGatewayRoutes(config: FeaturesConfig,
 			request_header @tilesDefaultFormat Accept application/json
 			` : '';
       const base = api?.base_path === '/' ? '' : api?.base_path ?? '';
-      const proxy = (postgis = false) => `${mapRequest}${tileAccept}uri strip_prefix ${root}
+      const upstream = `${serviceName(config, id)}:${api?.port ?? 80}`;
+      const tileJsonChecks = mvt ? providerEntries.filter(([, entry]) => postgisSource(config, entry.source))
+        .map(([key, publication], index) => `
+			@tileJsonSource${index} path ${root}/${key}
+			forward_auth @tileJsonSource${index} ${upstream} {
+				uri ${publicationHealth(config, key, publication).source.path}
+				header_up -*
+				header_up Accept ${vectorTileType}
+				transport http {
+					response_header_timeout 15s
+				}
+				@tileJsonFailure status 3xx 4xx 5xx
+				handle_response @tileJsonFailure {
+					header Cache-Control no-store
+					header Content-Type application/json
+					respond \`{"code":"ServiceUnavailable"}\` 503
+				}
+			}
+			`).join('') : '';
+      const proxy = (postgis = false) => `${mapRequest}${tileAccept}${postgis ? tileJsonChecks : ''}uri strip_prefix ${root}
 			${tiles ? 'uri replace /tileMatrixSets /TileMatrixSets' : ''}
 			${base || mvt ? `rewrite * ${base}{http.request.uri.path}${mvt ? '?' : ''}` : ''}
-			reverse_proxy ${serviceName(config, id)}:${api?.port ?? 80} {
-				${tiles ? `transport http {
+			reverse_proxy ${upstream} {
+				${postgis || tiles ? `transport http {
 					response_header_timeout 15s
 				}` : ''}
 				header_up -Cookie
@@ -647,6 +663,8 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
       publicationTitles: Object.fromEntries(publicationEntries(config).map(([id, { title }]) => [id, title])),
       administratorEmails: auth.administrator_emails, managedFeatures: config.providers !== undefined,
       operators: auth.cli?.operators, version: basename(revisionDirectory),
+      ...(auth.cli && { publicationHealth: Object.fromEntries(publicationEntries(config)
+        .map(([id, publication]) => [id, publicationHealth(config, id, publication)])) }),
     }));
     if (auth.mode === 'production' && auth.smtp.password_file) {
       if (!(await readFile(auth.smtp.password_file, 'utf8')).trim()) throw new Error('The SMTP password file is empty.');
@@ -664,6 +682,8 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
         services: { access: {
           ports: [{ target: 3001, published: String(auth.cli.port), host_ip: '127.0.0.1' }],
           secrets: Object.keys(secretFiles),
+          volumes: [{ type: 'bind', source: join(revisionDirectory, '..', '..', 'status').replaceAll('$', () => '$$'),
+            target: '/etc/gis-status', read_only: true, bind: { create_host_path: false } }],
         } },
         secrets: Object.fromEntries(Object.entries(secretFiles).map(([name, file]) => [name, { file }])),
       }));
@@ -825,7 +845,7 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
       ...(connection && { secrets: connection }),
       healthcheck: {
         test: ['CMD', '/venv/bin/python', '-c',
-          `from urllib.request import urlopen; urlopen('${scheme}://127.0.0.1:${port}${base === '/' ? '' : base}${readiness}', timeout=2).read()`],
+          `from urllib.request import urlopen; urlopen('${scheme}://127.0.0.1:${port}${base === '/' ? '' : base}${connection ? '/openapi?f=json' : readiness}', timeout=2).read()`],
         interval: '2s', timeout: '3s', retries: 25,
       },
     };
@@ -1105,6 +1125,9 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
   }
   const roots = Object.fromEntries(Object.entries(documents).map(([root, { url, api }]) => [
     root, { url, api, conformsTo: fileConformance(config, root),
+      sourceProbes: Object.fromEntries(entries.filter(([, publication]) =>
+        postgisSource(config, publication.source) && providerRoot(config, publication.provider) === root)
+        .map(([id, publication]) => [id, publicationHealth(config, id, publication).source])),
       collections: entries.filter(([, publication]) => providerRoot(config, publication.provider) === root)
       .map(([id, publication]) => ({
         id, title: publication.title, description: publicationDescription(config, publication),
@@ -1202,6 +1225,36 @@ function probeCollection(origin: URL, path: string, certificate: Buffer | undefi
     });
     request.on('error', reject);
   });
+}
+
+export async function diagnoseStack({ config, directory }: Revision, publicationId?: string) {
+  const entries = Object.fromEntries(publicationEntries(config)
+    .map(([id, publication]) => [id, publicationHealth(config, id, publication)]));
+  const gateway = async () => {
+    try {
+      const certificate = config.tls ? await readFile(config.tls.cert_file) : undefined;
+      const { status, cacheControl } = await probeCollection(new URL(config.publicUrl), '/', certificate);
+      if (cacheControl === 'no-store') {
+        if (status === 404) return 'ready';
+        if (status === 503) return 'closed';
+      }
+    } catch {
+      // Diagnostic results do not include connection details.
+    }
+    return 'unavailable';
+  };
+  const [gatewayState, publications] = await Promise.all([
+    gateway(),
+    publicationChecks(entries, (endpoint) => {
+      const url = healthUrl(endpoint, '127.0.0.1');
+      const probe = endpoint.martin
+        ? ['wget', '-q', '-T', '3', '-O', '/dev/null', url]
+        : ['/venv/bin/python', '-c',
+          'import sys; from urllib.request import urlopen; urlopen(sys.argv[1], timeout=3).close()', url];
+      return compose(config, directory, 'exec', '-T', endpoint.service, ...probe).then(() => true, () => false);
+    }, publicationId),
+  ]);
+  return { gateway: gatewayState, publications };
 }
 
 interface FeaturesOpenApi {
@@ -1307,18 +1360,19 @@ export async function featuresStackRunning(config: FeaturesConfig, directory: st
 export async function startFeaturesStack(config: FeaturesConfig, revisionDirectory: string, confirmed?: Revision) {
   const origin = new URL(config.publicUrl);
   const certificate = config.tls ? await readFile(config.tls.cert_file) : undefined;
-  const confirmedMartin = new Set<string>();
+  const reusedProviders = new Set<string>();
   if (confirmed) {
     for (const [id, provider] of Object.entries(config.providers ?? {})) {
-      if (provider.type !== 'martin' || !managedProviderRuns(config, id) ||
+      if (!managedProviderRuns(config, id) ||
           JSON.stringify(confirmed.config.providers?.[id]) !== JSON.stringify(provider) ||
           providerConfigurationChanged(config, confirmed.config, id)) continue;
       const service = serviceName(config, id);
       if (await nativeProviderDirectory(revisionDirectory, service) === await nativeProviderDirectory(confirmed.directory, service)) {
-        confirmedMartin.add(id);
+        reusedProviders.add(id);
       }
     }
   }
+  const confirmedMartin = new Set([...reusedProviders].filter((id) => config.providers?.[id]?.type === 'martin'));
   const optionalServices = [...confirmedMartin].map((id) => serviceName(config, id));
   const requiredServices = stackServices(config).filter((service) => !optionalServices.includes(service));
   await compose(config, revisionDirectory, 'up', '-d', '--no-deps',
@@ -1335,9 +1389,9 @@ export async function startFeaturesStack(config: FeaturesConfig, revisionDirecto
   const collections = publicationEntries(config).map(([id, publication]) => ({
     id, ...publication, url: publicationUrl(config, id, publication),
   }));
-  const internal = async (path: string, status: number, base = 'http://127.0.0.1:2080') => {
+  const internal = async (path: string, status: number, base = 'http://127.0.0.1:2080', timeout = '3') => {
     try {
-      const body = await compose(config, revisionDirectory, 'exec', '-T', 'caddy', 'wget', '-T', '3', '-S', '-O', '-',
+      const body = await compose(config, revisionDirectory, 'exec', '-T', 'caddy', 'wget', '-T', timeout, '-S', '-O', '-',
         `${base}${path}`);
       if (status === 200) return body;
     } catch (error) {
@@ -1350,6 +1404,13 @@ export async function startFeaturesStack(config: FeaturesConfig, revisionDirecto
     try {
       const gate = await probeCollection(origin, '/features/collections?f=json', certificate);
       if (gate.status !== 503 || gate.cacheControl !== 'no-store') throw new Error('The gateway is not closed.');
+      for (const [id, provider] of Object.entries(config.providers ?? {})) {
+        if (!provider.image || provider.type !== 'pygeoapi' || reusedProviders.has(id) ||
+            provider.api.readiness === '/openapi?f=json' ||
+            !publicationsForProvider(config, id).some(([, publication]) => postgisSource(config, publication.source))) continue;
+        const { base_path: base, port, readiness } = provider.api;
+        await internal((base === '/' ? '' : base) + readiness, 200, `http://${serviceName(config, id)}:${port}`);
+      }
       for (const { id, provider, protocol, source, access, url } of collections) {
         const mvt = protocol === 'mvt';
         const path = new URL(url).pathname + (mvt ? '' : '?f=json');
@@ -1389,7 +1450,10 @@ export async function startFeaturesStack(config: FeaturesConfig, revisionDirecto
           access === 'public' && providerRoot(config, provider) === root);
         const api = checkOpenApi(await internal(`${root}/openapi?f=json`, 200), new URL(root, origin).href, visible);
         if (config.providers) {
-          const catalog = JSON.parse(await internal(`${root}/collections?f=json`, 200)) as { collections: { id: string }[] };
+          // Catalog entries include a bounded live source check.
+          const catalog = JSON.parse(await internal(`${root}/collections?f=json`, 200, undefined, '8')) as {
+            collections: { id: string }[];
+          };
           for (const { id, access, protocol, provider } of collections) {
             if (providerRoot(config, provider) === root &&
                 (catalog.collections.some((item) => item.id === id) !== (access === 'public') ||

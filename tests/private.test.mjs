@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { readFile, rename, writeFile } from 'node:fs/promises';
 import { get } from 'node:http';
 import { dirname, join } from 'node:path';
@@ -400,7 +401,12 @@ test('user summaries and the gateway reflect blocking and unblocking', async () 
 
 test('CLI validation and delegation return one JSON result with stable codes', () => {
   assert.equal(cli(['status'], 'OK', 0, operator('agent')).access, 'ready');
-  assert.equal(cli(['doctor', '--publication', 'private-places'], 'OK', 0, operator('agent')).publicationId, 'private-places');
+  const diagnostics = cli(['doctor', '--publication', 'private-places'], 'OK', 0, operator('agent'));
+  assert.equal(diagnostics.publicationId, 'private-places');
+  assert.equal(diagnostics.gateway, 'ready');
+  assert.deepEqual(diagnostics.publications, [
+    { publicationId: 'private-places', instance: 'ready', source: 'ready' },
+  ]);
   cli(['doctor', '--publication', 'absent'], 'NOT_FOUND', 3, operator('agent'));
   cli(['users', 'list'], 'FORBIDDEN', 4, operator('agent'));
   cli(['users', 'list'], 'FORBIDDEN', 4, operator('outsider'));
@@ -769,4 +775,37 @@ test('moving a private publication between provider instances preserves its URL,
   await freshGet(items, headers, 403);
   cli(['config', 'apply', cli(['config', 'plan', '--rollback-to', original]).planId]);
   await freshGet(items, headers, 403);
+});
+
+test('delegated status reports the confirmed version while gateway routes are closed', async () => {
+  const environment = { ...process.env, ...operator('agent'),
+    GIS_STATE_DIR: join(process.env.GIS_TEST_RESULTS, 'delegated-status-without-local-state') };
+  const { currentVersion } = cli(['status'], 'OK', 0, environment);
+  const change = await planPrivateConfig(({ publications }) => {
+    publications['private-places'].title = 'Renamed private places';
+  });
+  const worker = spawn(process.execPath, ['dist/cli.js', 'config', 'apply', change.planId, '--json'], { windowsHide: true });
+  const done = once(worker, 'close');
+  let output = '';
+  worker.stdout.on('data', (chunk) => { output += chunk; });
+  let during;
+  for (let attempt = 0; attempt < 80 && worker.exitCode === null; attempt++) {
+    const result = spawnSync(process.execPath, ['dist/cli.js', 'status', '--json'], {
+      env: environment, encoding: 'utf8', windowsHide: true, timeout: 10_000,
+    });
+    assert.ifError(result.error);
+    const reply = JSON.parse(result.stdout);
+    if (reply.data.phase === 'switch' && reply.data.closedRoutes?.length) {
+      during = reply.data;
+      break;
+    }
+    await setTimeout(100);
+  }
+  const [exitCode] = await done;
+  assert.equal(exitCode, 0, output);
+  assert.equal(during?.currentVersion, currentVersion);
+  assert.ok(during.closedRoutes.includes(new URL(privateCollection, gateway).href));
+  const settled = cli(['status'], 'OK', 0, environment);
+  assert.equal(settled.currentVersion, change.planId);
+  assert.deepEqual(settled.closedRoutes, []);
 });

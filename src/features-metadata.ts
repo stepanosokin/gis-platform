@@ -4,9 +4,10 @@ import { stringify } from 'yaml';
 import { page } from './account-pages.js';
 import type { Publication } from './config.js';
 import { publicationAccess, type PublicationReader } from './publication-access.js';
+import { probeHealth, type HealthEndpoint } from './publication-health.js';
 
 interface Catalog {
-  collections: { id: string; title: string; description?: string }[];
+  collections: { id: string; title: string; description?: string; status?: 'available' | 'unavailable' }[];
 }
 
 interface LinkedCatalog {
@@ -18,6 +19,7 @@ interface ManagedMetadata {
   api: OpenApi;
   collections: Catalog['collections'];
   conformsTo?: string[];
+  sourceProbes?: Record<string, HealthEndpoint>;
 }
 
 export async function readManagedMetadata() {
@@ -144,13 +146,19 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
     const representation = requestedFormat(req, ['json', 'html', 'jsonld']);
     if (!representation) return res.status(400).json({ code: 'InvalidParameterValue', description: 'Invalid format.' });
     const reader = await readReader(req, res);
+    const visible = async (collections: Catalog['collections']) => Promise.all(
+      collections.filter(({ id }) => canRead(publications, id, reader)).map(async (collection) => {
+        const probe = metadata?.sourceProbes?.[collection.id];
+        if (!probe) return collection;
+        return { ...collection, status: await probeHealth(probe) ? 'available' as const : 'unavailable' as const };
+      }));
     if (representation === 'jsonld') {
       if (metadata) return res.type(mediaTypes.jsonld).json({
         '@context': { '@vocab': 'https://schema.org/' },
         '@type': 'DataCatalog',
-        dataset: metadata.collections.filter(({ id }) => canRead(publications, id, reader))
-          .map(({ id, title, description }) => ({
-            '@id': `${metadata.url}/collections/${id}`, '@type': 'Dataset', name: title, description,
+        dataset: (await visible(metadata.collections))
+          .map(({ id, title, description, status }) => ({
+            '@id': `${metadata.url}/collections/${id}`, '@type': 'Dataset', name: title, description, status,
           })),
       });
       const catalog = await upstreamDocument<LinkedCatalog>('collections', 'jsonld');
@@ -167,10 +175,11 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
         type: mediaTypes[format as keyof typeof mediaTypes],
       })),
     } : await upstreamDocument<Catalog>('collections');
-    catalog.collections = catalog.collections.filter(({ id }) => canRead(publications, id, reader));
+    catalog.collections = await visible(catalog.collections);
     if (representation === 'html') {
-      const rows = catalog.collections.map(({ id, title, description }) =>
-        `<li><a href="${root}/collections/${encodeURIComponent(id)}?f=html">${escapeHtml(title)}</a>${description ? `<p>${escapeHtml(description)}</p>` : ''}</li>`);
+      const rows = catalog.collections.map(({ id, title, description, status }) =>
+        `<li><a href="${root}/collections/${encodeURIComponent(id)}?f=html">${escapeHtml(title)}</a>` +
+        `${status === 'unavailable' ? ' <span>Unavailable</span>' : ''}${description ? `<p>${escapeHtml(description)}</p>` : ''}</li>`);
       return res.send(page(`${title} collections`, rows.length ? `<ul>${rows.join('')}</ul>` : '<p>No collections available.</p>'));
     }
     res.json(catalog);

@@ -1,5 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
 import { createServer } from 'node:https';
+import { connect } from 'node:net';
 import type { TLSSocket } from 'node:tls';
 import express from 'express';
 import type { Pool } from 'pg';
@@ -8,6 +9,8 @@ import { parseAdminCommand, requiredPermission, type AdminPermission } from './a
 import { CliError } from './cli-result.js';
 import type { Publication } from './config.js';
 import { listPersonalTokens, revokePersonalToken } from './personal-tokens.js';
+import { probeHealth, publicationChecks, type PublicationHealth } from './publication-health.js';
+import { statusSnapshot, type ActiveState } from './configuration-state.js';
 
 interface AdminSettings {
   operators: Record<string, AdminPermission[]>;
@@ -15,6 +18,28 @@ interface AdminSettings {
   publications: ReadonlyMap<string, Publication['access']>;
   publicationTitles: Record<string, string>;
   administratorEmails: ReadonlySet<string>;
+  publicationHealth?: Record<string, PublicationHealth>;
+  gatewayPort: number;
+}
+
+function gatewayClosed() {
+  return stat('/etc/gis/closed').then(() => true, (error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  });
+}
+
+async function gatewayStatus(port: number) {
+  const reachable = await new Promise<boolean>((resolve) => {
+    const socket = connect({ host: 'caddy', port, signal: AbortSignal.timeout(2000) });
+    socket.once('error', () => resolve(false));
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+  });
+  if (!reachable) return 'unavailable';
+  return await gatewayClosed() ? 'closed' : 'ready';
 }
 
 export async function startAdminServer(pool: Pool, settings: AdminSettings) {
@@ -40,11 +65,7 @@ export async function startAdminServer(pool: Pool, settings: AdminSettings) {
       throw new CliError('FORBIDDEN', 4, 'This local account has no permission for this command.');
     }
     if (command.operation === 'access grant' || command.operation === 'access revoke') {
-      const closed = await stat('/etc/gis/closed').then(() => true, (error: NodeJS.ErrnoException) => {
-        if (error.code === 'ENOENT') return false;
-        throw error;
-      });
-      if (closed) throw new CliError('APPLY_IN_PROGRESS', 5, 'Publication access is being reconfigured.');
+      if (await gatewayClosed()) throw new CliError('APPLY_IN_PROGRESS', 5, 'Publication access is being reconfigured.');
     }
     let result;
     if (command.operation === 'tokens list' || command.operation === 'tokens revoke') {
@@ -70,7 +91,24 @@ export async function startAdminServer(pool: Pool, settings: AdminSettings) {
         throw new CliError('NOT_FOUND', 3, 'Publication not found.');
       }
       await pool.query('SELECT 1');
-      result = { code: 'OK', data: { currentVersion: settings.version, access: 'ready', publicationId } };
+      const snapshot = settings.publicationHealth
+        ? statusSnapshot(JSON.parse(await readFile('/etc/gis-status/active.json', 'utf8')) as ActiveState)
+        : undefined;
+      const { recoveryIncomplete, ...configuration } = snapshot ?? { currentVersion: settings.version };
+      if (command.operation === 'status' && recoveryIncomplete) {
+        throw new CliError('RECOVERY_INCOMPLETE', 7,
+          `Configuration recovery is incomplete. Closed routes: ${snapshot?.closedRoutes.join(', ')}.`, configuration);
+      }
+      let diagnostics;
+      if (command.operation === 'doctor' && settings.publicationHealth) {
+        const [gateway, publications] = await Promise.all([
+          gatewayStatus(settings.gatewayPort),
+          configuration.currentVersion === settings.version
+            ? publicationChecks(settings.publicationHealth, probeHealth, publicationId) : [],
+        ]);
+        diagnostics = { gateway, publications };
+      }
+      result = { code: 'OK', data: { ...configuration, access: 'ready', publicationId, ...diagnostics } };
     }
     res.set('Cache-Control', 'no-store').json({ status: 'ok', ...result });
   });
@@ -82,7 +120,7 @@ export async function startAdminServer(pool: Pool, settings: AdminSettings) {
         : new CliError('FAILED', 1, 'The administrator service is unavailable.');
     const status = { 1: 503, 2: 400, 3: 404, 4: 403 }[failure.exitCode] ?? 503;
     res.set('Cache-Control', 'no-store').status(status)
-      .json({ status: 'error', code: failure.code, data: { message: failure.message } });
+      .json({ status: 'error', code: failure.code, data: { ...failure.data, message: failure.message } });
   }) satisfies express.ErrorRequestHandler);
 
   const [ca, cert, key] = await Promise.all(['cli_ca', 'cli_cert', 'cli_key']

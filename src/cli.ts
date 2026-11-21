@@ -2,10 +2,11 @@ import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { publicationEntries, readFeaturesConfig } from './config.js';
-import { configurationStatus, createPlan, planRollback } from './plans.js';
+import { configurationDoctor, configurationStatus, createPlan, planRollback } from './plans.js';
 import type { ApplyReply } from './apply-worker.js';
 import { CliError } from './cli-result.js';
 import { runAdminCommand } from './admin-client.js';
+import { parseAdminCommand } from './admin-command.js';
 import { planProviderCommand } from './provider-command.js';
 import { mapLibreFiles } from './maplibre-style.js';
 
@@ -36,10 +37,18 @@ async function main() {
       throw error;
     });
     if (admin instanceof Error && !local?.currentVersion && !local?.pendingPlanId) throw admin;
-    const data = { ...(admin && !(admin instanceof Error) ? admin.data : {}), ...local,
-      currentVersion: local?.currentVersion ?? (admin && !(admin instanceof Error) ? admin.data.currentVersion : null) };
-    success('OK', data, `Current version: ${data.currentVersion ?? 'none'}\nPhase: ${local?.phase ?? 'ready'}` +
-      (local?.closedRoutes.length ? `\nClosed routes: ${local.closedRoutes.join(', ')}` : ''));
+    const delegated = admin && !(admin instanceof Error) ? admin.data : undefined;
+    const data = { ...delegated, ...(!delegated || local?.currentVersion || local?.pendingPlanId ? local : undefined) };
+    const closedRoutes = Array.isArray(data.closedRoutes) ? data.closedRoutes : [];
+    success('OK', data, `Current version: ${data.currentVersion ?? 'none'}\nPhase: ${data.phase ?? 'ready'}` +
+      (closedRoutes.length ? `\nClosed routes: ${closedRoutes.join(', ')}` : ''));
+    return;
+  }
+  if (group === 'doctor' && !process.env.GIS_ADMIN_PORT) {
+    const parsed = parseAdminCommand(commandArguments);
+    if (parsed.operation !== 'doctor') throw new CliError('INVALID_INPUT', 2, 'Invalid doctor command.');
+    const result = { code: 'OK', data: await configurationDoctor(parsed.publicationId) };
+    success(result.code, result.data, formatAdminResult(result));
     return;
   }
   if (group === 'status' || group === 'doctor' || group === 'users' || group === 'access' || group === 'tokens') {
@@ -104,7 +113,7 @@ async function applyPlan(planId: string) {
   return reply.result;
 }
 
-function formatAdminResult({ code, data }: Awaited<ReturnType<typeof runAdminCommand>>) {
+function formatAdminResult({ code, data }: Pick<Awaited<ReturnType<typeof runAdminCommand>>, 'code' | 'data'>) {
   if (group === 'users' && command === 'list') {
     const users = data.users as { email: string; name: string; registeredAt: string; status: string;
       publications: { id: string; anonymous: boolean }[] }[];
@@ -113,6 +122,14 @@ function formatAdminResult({ code, data }: Awaited<ReturnType<typeof runAdminCom
       const displayName = user.name.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
       return [user.email, displayName, user.registeredAt, user.status, publications.join(', ') || 'none'].join('\t');
     }).join('\n') || 'No users.';
+  }
+  if (group === 'doctor' && data.publications && typeof data.gateway === 'string') {
+    const publications = data.publications as Awaited<ReturnType<typeof configurationDoctor>>['publications'];
+    return [
+      `Current version: ${data.currentVersion}`,
+      `Gateway: ${data.gateway}`,
+      ...publications.map(({ publicationId, instance, source }) => `${publicationId} | instance: ${instance} | source: ${source}`),
+    ].join('\n');
   }
   if (typeof data.currentVersion === 'string') return `Access ready (version ${data.currentVersion}).`;
   if (group === 'tokens') {

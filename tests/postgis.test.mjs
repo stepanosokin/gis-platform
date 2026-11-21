@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { setTimeout } from 'node:timers/promises';
@@ -12,6 +12,7 @@ const filename = process.env.GIS_TEST_CONFIG;
 const gateway = process.env.GIS_TEST_PUBLIC_URL;
 const project = process.env.COMPOSE_PROJECT_NAME;
 const database = `${project}-external-postgis`;
+const archiveDatabase = `${project}-archive-postgis`;
 const providerImage = 'geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a';
 
 function command(executable, args, input) {
@@ -26,8 +27,8 @@ function docker(...args) {
   return result.stdout.trim();
 }
 
-function sql(statement) {
-  const result = command('docker', ['exec', '-i', database, 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres'], statement);
+function sql(statement, container = database) {
+  const result = command('docker', ['exec', '-i', container, 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres'], statement);
   assert.equal(result.status, 0, result.stderr);
 }
 
@@ -41,9 +42,25 @@ function cliResult(...args) {
   return command(process.execPath, ['dist/cli.js', 'config', ...args, '--json']);
 }
 
+function status() {
+  const result = command(process.execPath, ['dist/cli.js', 'status', '--json']);
+  assert.equal(result.status, 0, result.stdout);
+  return JSON.parse(result.stdout).data;
+}
+
+async function waitForDatabase(container) {
+  // The image initializes extensions before opening the network socket.
+  for (let attempt = 0; ; attempt++) {
+    const ready = command('docker', ['exec', container, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres']);
+    if (ready.status === 0) return;
+    assert.ok(attempt < 40, ready.stdout || ready.stderr);
+    await setTimeout(500);
+  }
+}
+
 async function request(path, expected = 200, options = {}) {
   const response = await fetch(gateway + path, {
-    ...options, headers: { Connection: 'close', ...options.headers }, signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(10_000), ...options, headers: { Connection: 'close', ...options.headers },
   });
   assert.equal(response.status, expected, `${path}: ${response.status}`);
   assert.equal(response.headers.get('cache-control'), 'no-store');
@@ -55,10 +72,10 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
   const network = `${project}_default`;
   docker('network', 'create', '--label', `com.docker.compose.project=${project}`,
     '--label', 'com.docker.compose.network=default', network);
-  let started = false;
+  const started = [];
   t.after(() => {
     try {
-      if (started) docker('stop', database);
+      if (started.length) docker('rm', '-f', '-v', ...started);
     } finally {
       docker('compose', '-p', project, '-f', 'compose.yaml', '-f', 'compose.auth.yaml', '-f', 'compose.mailpit.yaml',
         'down', '--remove-orphans', '--volumes');
@@ -67,17 +84,13 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
   const password = randomBytes(24).toString('hex');
   const passwordFile = join(dirname(filename), 'test-postgres-password');
   await writeFile(passwordFile, password, { mode: 0o600 });
-  docker('run', '-d', '--rm', '--name', database, '--network', network, '--network-alias', 'external-postgis',
-    '--mount', `type=bind,src=${passwordFile},dst=/run/secrets/password,readonly`,
-    '-e', 'POSTGRES_PASSWORD_FILE=/run/secrets/password', 'postgis/postgis:18-3.6');
-  started = true;
-  // The image starts a socket-only server to initialize extensions before opening the network socket.
-  for (let attempt = 0; ; attempt++) {
-    const ready = command('docker', ['exec', database, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres']);
-    if (ready.status === 0) break;
-    assert.ok(attempt < 40, ready.stdout || ready.stderr);
-    await setTimeout(500);
+  for (const [container, alias] of [[database, 'external-postgis'], [archiveDatabase, 'archive-postgis']]) {
+    docker('run', '-d', '--name', container, '--network', network, '--network-alias', alias,
+      '--mount', `type=bind,src=${passwordFile},dst=/run/secrets/password,readonly`,
+      '-e', 'POSTGRES_PASSWORD_FILE=/run/secrets/password', 'postgis/postgis:18-3.6');
+    started.push(container);
   }
+  await Promise.all(started.map(waitForDatabase));
   const readerPassword = randomBytes(24).toString('hex');
   const alternatePassword = randomBytes(24).toString('hex');
   sql(`
@@ -90,6 +103,8 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     CREATE VIEW gis.unlisted AS SELECT id, label, observed_at, geom FROM gis.observations;
     GRANT USAGE ON SCHEMA gis TO gis_reader;
     GRANT SELECT ON gis."Published observations", gis.unlisted TO gis_reader;
+  `);
+  sql(`
     CREATE ROLE gis_alternate LOGIN PASSWORD '${alternatePassword}';
     CREATE DATABASE alternate;
     \\connect alternate
@@ -99,11 +114,11 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     INSERT INTO gis."Published observations" VALUES ('alternate', 'Other archive', ST_SetSRID(ST_MakePoint(39, 57), 4326));
     GRANT USAGE ON SCHEMA gis TO gis_alternate;
     GRANT SELECT ON gis."Published observations" TO gis_alternate;
-  `);
-  const connection = async (dbname, user, password) => {
+  `, archiveDatabase);
+  const connection = async (host, dbname, user, password) => {
     const file = join(dirname(filename), `${dbname}.password`);
     await writeFile(file, password + '\n', { mode: 0o600 });
-    return { host: 'external-postgis', database: dbname, user, password_file: file };
+    return { host, database: dbname, user, password_file: file };
   };
   const authFiles = {};
   for (const name of ['secret_file', 'postgres_password_file']) {
@@ -133,8 +148,9 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
       'file-places': { type: 'geojson', path: geojsonFile },
     },
     providers: {
-      observations: { type: 'pygeoapi', postgis: await connection('postgres', 'gis_reader', readerPassword) },
-      archive: { ...managed, postgis: await connection('alternate', 'gis_alternate', alternatePassword) },
+      observations: { type: 'pygeoapi', postgis: await connection('external-postgis', 'postgres', 'gis_reader', readerPassword) },
+      archive: { ...managed, api: { ...managed.api, readiness: '/collections/archive/items?f=json' },
+        postgis: await connection('archive-postgis', 'alternate', 'gis_alternate', alternatePassword) },
       files: { ...managed },
     },
     publications: {
@@ -152,6 +168,7 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
   const ids = ({ features }) => features.map(({ id }) => id);
   const archive = '/features/collections/archive/items?f=json';
   const file = '/features/collections/file/items?f=json';
+  let registeredReader;
   await t.test('separate instances use independent connections and expose only explicit sources', async () => {
     const catalog = await request('/features/collections?f=json');
     assert.deepEqual(catalog.collections.map(({ id }) => id).sort(), ['archive', 'file', 'observations']);
@@ -224,9 +241,9 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     const email = 'postgis-reader@example.test';
     const password = randomBytes(24).toString('hex');
     await register(email, password);
-    const cookie = await signIn(email, password);
-    assert.deepEqual(ids(await request(path, 200, { ...filter, headers: { ...filter.headers, Cookie: cookie } })), ['middle']);
-    const api = await request('/features/openapi?f=json', 200, { headers: { Cookie: cookie } });
+    registeredReader = { headers: { Cookie: await signIn(email, password) } };
+    assert.deepEqual(ids(await request(path, 200, { ...filter, headers: { ...filter.headers, ...registeredReader.headers } })), ['middle']);
+    const api = await request('/features/openapi?f=json', 200, registeredReader);
     assert.deepEqual(api.paths['/collections/registered/items'].post.security, [{ session: [] }, { bearer: [] }]);
   });
   await t.test('loss of read access is reported as unavailable and other publications can still read', async () => {
@@ -241,8 +258,90 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     }
     assert.deepEqual(ids(await request(items)), ['early', 'late', 'middle']);
   });
-  await t.test('changing a GeoJSON file served by another instance does not require an unchanged PostGIS source', async () => {
-    sql('REVOKE SELECT ON gis."Published observations" FROM gis_reader;');
+  await t.test('a cold start serves saved OpenAPI and recovers from an offline database without apply', async () => {
+    const openapi = '/features/openapi?f=json';
+    const before = await request(openapi);
+    const item = '/features/collections/archive/items/alternate?f=json';
+    const existing = await request(item);
+    const containers = docker('ps', '-q', '--filter', `label=com.docker.compose.project=${project}`).split(/\s+/);
+    assert.ok(containers.length > 1);
+    const legacyState = join(process.env.GIS_STATE_DIR, 'active.json');
+    await rename(join(process.env.GIS_STATE_DIR, 'status', 'active.json'), legacyState);
+    assert.equal(status().currentVersion, confirmed);
+    docker('stop', archiveDatabase);
+    try {
+      docker('stop', ...containers);
+      const plan = cli('plan', filename);
+      cli('apply', plan.planId);
+      confirmed = plan.planId;
+      await assert.rejects(readFile(legacyState), { code: 'ENOENT' });
+      assert.deepEqual(await request(openapi), before);
+      assert.deepEqual(ids(await request(items)), ['early', 'late', 'middle']);
+      assert.equal(ids(await request(file)).length, 3);
+      assert.equal((await request(item, 503)).code, 'ServiceUnavailable');
+    } finally {
+      docker('start', archiveDatabase);
+      await waitForDatabase(archiveDatabase);
+    }
+    assert.deepEqual(await request(item), existing);
+    assert.deepEqual(ids(await request(archive + '&bbox=0,0,1,1')), []);
+    assert.equal(cli('apply', confirmed).currentVersion, confirmed);
+  });
+  await t.test('catalog and doctor distinguish a source outage from an instance or gateway outage', async () => {
+    const catalog = '/features/collections?f=json';
+    const item = collection + '/items/early?f=json';
+    const caddy = docker('ps', '-q', '--filter', `label=com.docker.compose.project=${project}`,
+      '--filter', 'label=com.docker.compose.service=caddy');
+    const provider = docker('ps', '-q', '--filter', `label=com.docker.compose.project=${project}`,
+      '--filter', 'label=com.docker.compose.service=pygeoapi');
+    assert.ok(caddy && provider);
+    const doctor = (gateway, instance, source) => {
+      const result = command(process.execPath, ['dist/cli.js', 'doctor', '--publication', 'observations', '--json']);
+      assert.equal(result.status, 0, result.stdout);
+      const reply = JSON.parse(result.stdout);
+      assert.equal(reply.data.currentVersion, confirmed);
+      assert.equal(reply.data.gateway, gateway);
+      assert.deepEqual(reply.data.publications, [{ publicationId: 'observations', instance, source }]);
+      assert.doesNotMatch(result.stdout + result.stderr, new RegExp(`external-postgis|gis_reader|${readerPassword}`));
+    };
+    doctor('ready', 'ready', 'ready');
+    docker('stop', database);
+    try {
+      const anonymous = (await request(catalog)).collections;
+      assert.equal(anonymous.find(({ id }) => id === 'observations').status, 'unavailable');
+      assert.equal(anonymous.find(({ id }) => id === 'archive').status, 'available');
+      assert.ok(!anonymous.some(({ id }) => id === 'registered'));
+      const admitted = (await request(catalog, 200, registeredReader)).collections;
+      assert.equal(admitted.find(({ id }) => id === 'registered').status, 'unavailable');
+      assert.match((await request('/features/openapi?f=json', 200, registeredReader)).openapi, /^3\.0\./);
+      const error = await request(item, 503);
+      assert.deepEqual(error, { code: 'ServiceUnavailable' });
+      doctor('ready', 'ready', 'unavailable');
+    } finally {
+      docker('start', database);
+      await waitForDatabase(database);
+    }
+    assert.equal((await request(catalog)).collections.find(({ id }) => id === 'observations').status, 'available');
+    docker('stop', provider);
+    try {
+      doctor('ready', 'unavailable', 'unknown');
+      assert.deepEqual(ids(await request(archive)), ['alternate']);
+    } finally {
+      docker('start', provider);
+    }
+    for (let attempt = 0; docker('inspect', '-f', '{{.State.Health.Status}}', provider) !== 'healthy'; attempt++) {
+      assert.ok(attempt < 20, 'Features did not become ready');
+      await setTimeout(500);
+    }
+    docker('stop', caddy);
+    try {
+      doctor('unavailable', 'ready', 'ready');
+    } finally {
+      docker('start', caddy);
+    }
+  });
+  await t.test('changing a GeoJSON file can proceed while an unchanged PostGIS server stops responding', async () => {
+    docker('pause', database);
     try {
       geojson.features[0].properties.name = 'New file value';
       await writeFile(geojsonFile, JSON.stringify(geojson));
@@ -251,9 +350,9 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
       cli('apply', plan.planId);
       confirmed = plan.planId;
       assert.equal((await request(file)).features[0].properties.name, 'New file value');
-      await request(items, 503);
+      assert.equal((await request(items, 503, { signal: AbortSignal.timeout(23_000) })).code, 'ServiceUnavailable');
     } finally {
-      sql('GRANT SELECT ON gis."Published observations" TO gis_reader;');
+      docker('unpause', database);
     }
   });
   await t.test('a rejected connection leaves the confirmed publications available without exposing credentials', async () => {
@@ -272,6 +371,29 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     assert.equal(reply.data.currentVersion, confirmed);
     assert.equal((result.stdout + result.stderr).includes(wrongPassword), false);
     assert.deepEqual(ids(await request(items)), ['early', 'late', 'middle']);
+  });
+  await t.test('a changed source schema needs a validated configuration before it can be applied', async () => {
+    sql('ALTER VIEW gis."Published observations" RENAME COLUMN observed_at TO captured_at;');
+    draft.providers.observations.postgis.password_file = join(dirname(filename), 'postgres.password');
+    // Confirm that candidate preflight checks the actual database column.
+    draft.publications.observations = { ...observation, time_field: 'label' };
+    draft.publications.registered = { ...draft.publications.registered, time_field: 'captured_at' };
+    await writeFile(filename, stringify(draft));
+    cli('validate', filename);
+    const rejected = cliResult('apply', cli('plan', filename).planId);
+    assert.equal(rejected.status, 6, rejected.stdout);
+    assert.equal(JSON.parse(rejected.stdout).data.currentVersion, confirmed);
+    assert.deepEqual(ids(await request(archive)), ['alternate']);
+
+    draft.publications.observations.time_field = 'captured_at';
+    await writeFile(filename, stringify(draft));
+    cli('validate', filename);
+    const plan = cli('plan', filename);
+    cli('apply', plan.planId);
+    confirmed = plan.planId;
+    const matching = await request(items + '&datetime=2026-11-02T12:00:00Z');
+    assert.deepEqual(ids(matching), ['middle']);
+    assert.equal(Date.parse(matching.features[0].properties.captured_at), Date.parse('2026-11-02T12:00:00Z'));
   });
   await t.test('active and retired PostGIS IDs stay bound to the original database and relation', async () => {
     draft.providers.observations.postgis.password_file = join(dirname(filename), 'postgres.password');

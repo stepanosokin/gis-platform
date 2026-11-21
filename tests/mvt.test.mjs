@@ -18,6 +18,7 @@ const filename = process.env.GIS_TEST_CONFIG;
 const gateway = process.env.GIS_TEST_PUBLIC_URL;
 const project = process.env.COMPOSE_PROJECT_NAME;
 const database = `${project}-external-postgis`;
+const otherDatabase = `${project}-other-postgis`;
 const martin = 'ghcr.io/maplibre/martin:1.16.1@sha256:59902019bf9038926ff0c71174237d6852e64c457830a6349abe7090be8818ca';
 
 function command(executable, args, input) {
@@ -36,8 +37,18 @@ function martinContainer() {
     '--filter', 'label=com.docker.compose.service=provider-martin-east');
 }
 
-function sql(statement) {
-  return command('docker', ['exec', '-i', database, 'psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres'], statement);
+async function waitForDatabase(container = database) {
+  for (let attempt = 0; ; attempt++) {
+    const ready = spawnSync('docker', ['exec', container, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres'],
+      { encoding: 'utf8', windowsHide: true });
+    if (ready.status === 0) return;
+    assert.ok(attempt < 40, ready.stdout || ready.stderr);
+    await setTimeout(500);
+  }
+}
+
+function sql(statement, container = database) {
+  return command('docker', ['exec', '-i', container, 'psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres'], statement);
 }
 
 function cli(...args) {
@@ -106,10 +117,10 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
   const network = `${project}_default`;
   docker('network', 'create', '--label', `com.docker.compose.project=${project}`,
     '--label', 'com.docker.compose.network=default', network);
-  let started = false;
+  const started = [];
   t.after(() => {
     try {
-      if (started) docker('stop', database);
+      if (started.length) docker('rm', '-f', '-v', ...started);
     } finally {
       docker('compose', '-p', project, '-f', 'compose.yaml', '-f', 'compose.auth.yaml', '-f', 'compose.mailpit.yaml',
         'down', '--remove-orphans', '--volumes');
@@ -129,19 +140,15 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
   const browserPort = await waitForPort(browserServer);
   await new Promise((resolve) => browserServer.close(resolve));
   const browserOrigin = `http://127.0.0.1:${browserPort}`;
-  docker('run', '-d', '--rm', '--name', database, '--network', network, '--network-alias', 'external-postgis',
-    '--mount', `type=bind,src=${adminFile},dst=/run/secrets/password,readonly`,
-    '-e', 'POSTGRES_PASSWORD_FILE=/run/secrets/password',
-    'postgis/postgis:18-3.6@sha256:4a43e3c3e5d55b9208240fc71db543b79c638766280c625a425bd0a2390989c4');
-  started = true;
-  for (let attempt = 0; ; attempt++) {
-    const ready = spawnSync('docker', ['exec', database, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres'],
-      { encoding: 'utf8', windowsHide: true });
-    if (ready.status === 0) break;
-    assert.ok(attempt < 40, ready.stdout || ready.stderr);
-    await setTimeout(500);
+  for (const [container, alias] of [[database, 'external-postgis'], [otherDatabase, 'other-postgis']]) {
+    docker('run', '-d', '--name', container, '--network', network, '--network-alias', alias,
+      '--mount', `type=bind,src=${adminFile},dst=/run/secrets/password,readonly`,
+      '-e', 'POSTGRES_PASSWORD_FILE=/run/secrets/password',
+      'postgis/postgis:18-3.6@sha256:4a43e3c3e5d55b9208240fc71db543b79c638766280c625a425bd0a2390989c4');
+    started.push(container);
   }
-  sql(`
+  await Promise.all(started.map(waitForDatabase));
+  const setup = `
     CREATE ROLE gis_reader LOGIN PASSWORD '${readerPassword}';
     CREATE SCHEMA gis;
     CREATE TABLE gis.observations (id text PRIMARY KEY, label text NOT NULL, geom geometry(Point, 4326) NOT NULL);
@@ -152,7 +159,9 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
     GRANT SELECT ON gis."Published observations", gis.unlisted TO gis_reader;
     COMMENT ON VIEW gis."Published observations" IS '{"tiles":["http://example.invalid/hidden/{z}/{x}/{y}"]}';
     INSERT INTO gis.observations VALUES ('row-1', 'Greenwich', ST_SetSRID(ST_MakePoint(1, 1), 4326));
-  `);
+  `;
+  sql(setup);
+  sql(setup + "UPDATE gis.observations SET label = 'Independent PostGIS';", otherDatabase);
   const publication = { provider: 'martin-east', source: 'observations', protocol: 'mvt', access: 'public',
     title: 'Observations', description: 'Known PostGIS points', extent: [-180, -85, 180, 85],
     mvt_properties: ['label', 'connection_mode'],
@@ -163,7 +172,7 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
     cors: { allowed_origins: [browserOrigin, 'https://maps.example.test', 'http://[::1]:5173'] },
     auth: { mode: 'development', mailpit_port: Number(new URL(process.env.GIS_TEST_MAILPIT).port), ...authFiles,
       cli: { port: Number(process.env.GIS_ADMIN_PORT), ca_file: 'ca.pem', cert_file: 'server.pem',
-        key_file: 'server-key.pem', operators: { operator: ['access-write'] } } },
+        key_file: 'server-key.pem', operators: { operator: ['access-write', 'diagnostics'] } } },
     sources: { observations: { type: 'postgis', schema: 'gis', relation: 'Published observations', id_field: 'id',
       geometry_field: 'geom', max_lag_seconds: 0 }, control: { type: 'geojson', path: join(process.cwd(), 'examples', 'places.geojson') } },
     providers: { 'control-features': { type: 'pygeoapi' }, 'martin-east': {
@@ -229,7 +238,7 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
     assert.equal(token.status, 201);
     const { secret } = await token.json();
     const headers = { Origin: browserOrigin, Authorization: `Bearer ${secret}` };
-    const metadata = await request(hidden, 200, { headers });
+    const metadata = await request(hidden, 200, { headers: { ...headers, Accept: 'application/json' } });
     assert.equal(metadata.headers.get('access-control-allow-origin'), browserOrigin);
     assert.deepEqual((await metadata.json()).tiles, [gateway + hidden + '/{z}/{x}/{y}']);
     assert.equal((await features(tile, 'observations-copy', { headers }))[0].properties.label, 'Greenwich');
@@ -569,11 +578,14 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
   const archiveTile = solidPng([214, 57, 49]);
   const withArchive = { ...platform,
     sources: { ...platform.sources, 'file-tile': { type: 'mbtiles', path: './isolated.mbtiles' } },
-    providers: { ...platform.providers, archives: { type: 'martin', image: martin, api: platform.providers['martin-east'].api } },
-    publications: { ...platform.publications, 'file-tile': { source: 'file-tile', provider: 'archives', protocol: 'mvt',
+    providers: { ...platform.providers, archives: { type: 'martin', image: martin, api: platform.providers['martin-east'].api },
+      'martin-other': { ...platform.providers['martin-east'],
+        postgis: { ...platform.providers['martin-east'].postgis, host: 'other-postgis' } } },
+    publications: { ...platform.publications, 'other-observations': { ...publication, provider: 'martin-other' },
+      'file-tile': { source: 'file-tile', provider: 'archives', protocol: 'mvt',
       access: 'public', title: 'Archive tile', description: 'Independent archive source', extent: [-180, -85, 180, 85] } },
   };
-  await t.test('the archive and external PostGIS use independent Martin instances at /mvt', async () => {
+  await t.test('the archive and two external databases use independent Martin instances at /mvt', async () => {
     const existing = martinContainer();
     writeMbtiles(join(dirname(filename), 'isolated.mbtiles'), archiveTile);
     await writeFile(filename, stringify(withArchive));
@@ -583,20 +595,66 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
     cli('config', 'apply', archive.planId);
     assert.equal(martinContainer(), existing);
     assert.equal((await features('/mvt/observations/1/1/0', 'observations'))[0].properties.id, 'row-1');
+    assert.equal((await features('/mvt/other-observations/1/1/0', 'other-observations'))[0].properties.label,
+      'Independent PostGIS');
     assert.deepEqual(Buffer.from(await (await request('/mvt/file-tile/0/0/0')).arrayBuffer()), archiveTile);
   });
 
-  await t.test('a down Martin instance does not block an update to an independent provider', async () => {
+  await t.test('confirmed Martin routes recover after a cold start with PostGIS offline', async () => {
+    const tile = '/mvt/observations/1/1/0';
+    const file = '/mvt/file-tile/0/0/0';
+    const openapi = '/features/openapi?f=json';
+    const before = await (await request(openapi)).json();
+    const containers = docker('ps', '-q', '--filter', `label=com.docker.compose.project=${project}`).split(/\s+/);
+    assert.ok(containers.length > 1);
     docker('stop', database);
-    started = false;
-    docker('stop', martinContainer());
+    try {
+      assert.equal((await (await request(tile, 503)).json()).code, 'ServiceUnavailable');
+      assert.equal((await (await request('/mvt/observations', 503)).json()).code, 'ServiceUnavailable');
+      docker('stop', ...containers);
+      const { planId } = cli('config', 'plan', filename);
+      cli('config', 'apply', planId);
+      assert.equal(cli('status').currentVersion, planId);
+      assert.deepEqual(await (await request(openapi)).json(), before);
+      assert.deepEqual(Buffer.from(await (await request(file)).arrayBuffer()), archiveTile);
+      assert.equal((await features('/mvt/other-observations/1/1/0', 'other-observations'))[0].properties.label,
+        'Independent PostGIS');
+      assert.equal((await (await request(tile, 503)).json()).code, 'ServiceUnavailable');
+    } finally {
+      docker('start', database);
+      await waitForDatabase();
+    }
+    let status;
+    for (let attempt = 0; attempt < 45; attempt++) {
+      const response = await fetch(gateway + tile, { signal: AbortSignal.timeout(5000) });
+      status = response.status;
+      await response.body?.cancel();
+      if (status === 200) break;
+      await setTimeout(1000);
+    }
+    assert.equal(status, 200);
+    assert.equal((await features(tile, 'observations'))[0].properties.id, 'row-1');
+  });
+
+  await t.test('a down Martin instance does not block an update to an independent provider', async () => {
+    const container = martinContainer();
+    assert.ok(container);
+    docker('stop', database);
+    docker('stop', container);
     await writeFile(filename, stringify({
       ...withArchive,
       publications: { ...withArchive.publications, control: { ...platform.publications.control, title: 'Updated control' } },
     }));
     const update = cli('config', 'plan', filename);
     cli('config', 'apply', update.planId);
-    const collection = await (await request('/features/collections/control?f=json')).json();
+    const control = '/features/collections/control?f=json';
+    const response = await request(control).catch(async (error) => {
+      // Docker Desktop can reset the first connection after replacing Caddy.
+      if (error.cause?.code !== 'ECONNRESET') throw error;
+      await setTimeout(100);
+      return request(control);
+    });
+    const collection = await response.json();
     assert.equal(collection.title, 'Updated control');
     await request('/mvt/observations/1/1/0', 503);
     assert.deepEqual(Buffer.from(await (await request('/mvt/file-tile/0/0/0')).arrayBuffer()), archiveTile);
