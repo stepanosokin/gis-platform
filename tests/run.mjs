@@ -351,6 +351,17 @@ const providerSuites = new Map([
 ]);
 
 console.log(`Results: ${results}`);
+if (!mode || mode === '--backup') {
+  try {
+    const output = run('restic-version', process.env.GIS_RESTIC_EXECUTABLE ?? 'restic', ['version']);
+    const version = /^restic (\d+)\.(\d+)\./m.exec(output);
+    if (!version || (Number(version[1]) === 0 && Number(version[2]) < 20)) {
+      throw new Error(`Unsupported version: ${output.trim()}`);
+    }
+  } catch (error) {
+    throw new Error('Backup tests require restic 0.20 or newer. Install it or set GIS_RESTIC_EXECUTABLE.', { cause: error });
+  }
+}
 if (!mode || mode === '--tls-layout') {
   console.log(run('test-tls-layout', process.execPath, ['--test', 'tests/gateway-layout.test.mjs']));
 }

@@ -85,7 +85,7 @@ async function reader(name) {
   return { email, cookie, token };
 }
 
-test('an encrypted off-host copy restores confirmed versions and only opens with current access', { skip: !fixture }, async () => {
+test('an encrypted snapshot on a separate HTTPS endpoint restores confirmed versions with current access', { skip: !fixture }, async () => {
   const recoveryProject = `gis-restore-${project}`;
   const noChangesProject = `${recoveryProject}-no-changes`;
   const restServer = `${project}-restic`;
