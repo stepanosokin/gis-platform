@@ -341,6 +341,10 @@ const providerSuites = new Map([
 ]);
 
 console.log(`Results: ${results}`);
+if (!mode || mode === '--tls-layout') {
+  console.log(run('test-tls-layout', process.execPath, ['--test', 'tests/gateway-layout.test.mjs']));
+}
+if (mode === '--tls-layout') process.exit(0);
 const selectedProviderSuite = providerSuites.get(mode);
 if (selectedProviderSuite) {
   await selectedProviderSuite();
