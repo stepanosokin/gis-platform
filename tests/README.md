@@ -66,6 +66,33 @@ npm test
 
 Тест загружает готовые контуры в отдельный PostGIS и выдаёт роли только чтение представления. Чтобы воспроизвести координаты контуров, выполните [запрос](h3-boundaries.sql) в отдельной тестовой БД с `h3_postgis`. Контрольные границы получены на `h3_postgis` 4.2.3 и PostGIS 3.6.4. В полном прогоне используются готовые контуры, поэтому для него достаточно обычного образа PostGIS.
 
+## Проверка кандидата pydggsapi для H3 из Parquet
+
+Для [#30](https://github.com/stepanosokin/gis-platform/issues/30) выбран полный уровень. Проверка запускается отдельно от `npm test` в контейнере Linux amd64 с pydggsapi 0.4.0. Два снимка Parquet подключаются только для чтения. Геометрия сверяется с WKB границ H3. Первый запуск DuckDB внутри контейнера загружает расширение `httpfs`.
+
+Команды PowerShell из корня репозитория.
+
+```powershell
+$image = 'ghcr.io/landscapegeoinformatics/pydggsapi@sha256:2c2b1683a474243639d59849679e32a434ab5581a7e54ce02879213bf509ea63'
+$script = (Resolve-Path tests/pydggsapi-acceptance.py).Path
+$results = (New-Item -ItemType Directory -Force "test_results/issue-30-native-$([guid]::NewGuid())").FullName
+docker run --rm --platform linux/amd64 --mount "type=bind,src=$script,dst=/probe.py,readonly" --mount "type=bind,src=$results,dst=/fixture" $image python /probe.py fixtures
+if ($LASTEXITCODE -ne 0) { throw 'Не созданы снимки Parquet' }
+docker run --rm --platform linux/amd64 --mount "type=bind,src=$script,dst=/probe.py,readonly" --mount "type=bind,src=$results,dst=/fixture,readonly" $image python /probe.py check
+```
+
+Запрос `GET /dggs-api/collections/sparse/dggs/h3/zones/871ea541affffff/data?zone-depth=0` с `Accept: */*` возвращает HTTP 200 и число `9007199254740992` в `values["sparse.tally"][0].data[0]`. Parquet содержит `BIGINT` со значением `9007199254740993`. В pydggsapi 0.4.0 целые показатели проходят через тип с плавающей точкой. Ожидаемый результат команды `check` на этом образе — код выхода 1 и ошибка утверждения с двумя указанными числами. Включение профиля отложено. Приёмка прав и ссылок через шлюз и замены снимка через CLI остаётся открытой. [Условие включения #12](https://github.com/stepanosokin/gis-platform/issues/12#issuecomment-7013342379) · [Преобразование показателей в pydggsapi 0.4.0](https://github.com/LandscapeGeoinformatics/pydggsapi/blob/v0.4.0/pydggsapi/models/ogc_dggs/data_retrieval.py)
+
+Для H3 уровня 7 запросы `f=geojson&geometry=zone-region&zone-level=7&compact-zones=false` дали следующие результаты. Полнота подтверждена для указанных окон и лимитов.
+
+| bbox в порядке запад, юг, восток, север | Лимит | Плотный снимок, получено / ожидалось | Разреженный снимок, получено / ожидалось |
+| --- | --- | ---: | ---: |
+| `12.28,45.41,12.36,45.47` | По умолчанию | 13 / 13 | 3 / 3 |
+| `11.8,45.0,12.9,45.9` | По умолчанию | 1 000 / 1 732 | 36 / 63 |
+| `11.8,45.0,12.9,45.9` | `10000` | 1 732 / 1 732 | 63 / 63 |
+
+В GeoJSON лимит отсекает геометрии кандидатов до отбора строк снимка. Даже короткий список ячеек может быть неполным. Для более широкого окна согласованный профиль предусматривает деление bbox. [Формирование списка зон в pydggsapi 0.4.0](https://github.com/LandscapeGeoinformatics/pydggsapi/blob/v0.4.0/pydggsapi/models/ogc_dggs/zone_query.py)
+
 ## Файловые источники Features и CRS
 
 Для #22 выбран полный уровень. Прогон создаёт GeoPackage, Shapefile в EPSG:3857 и GeoParquet с WKB в `test_results/`, применяет YAML во временном проекте Compose и обращается к Caddy по HTTP. Сценарии проверяют выбор слоя и ID, пагинацию, частичное пересечение bbox и пустой результат внутри отверстия полигона, временной отбор GeoParquet, сведения о фильтрах, отказ для отсутствующего sidecar и неизвестной CRS. Тесты проверяют координаты и порядок осей CRS84 и EPSG:4326, а также EPSG:3857, ESRI:102026, EPSG:5041 и дополнительно настроенной EPSG:32637.
