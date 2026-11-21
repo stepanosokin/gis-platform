@@ -1,0 +1,38 @@
+schema_version: 1
+server: {host: localhost, port: 8080}
+sources:
+  aerial:
+    type: mbtiles
+    path: ./aerial.mbtiles
+  hillshade:
+    type: pmtiles
+    path: ./hillshade.pmtiles
+providers:
+  archive-martin:
+    type: martin
+    image: ghcr.io/maplibre/martin:1.16.1@sha256:59902019bf9038926ff0c71174237d6852e64c457830a6349abe7090be8818ca
+    api:
+      protocol: mvt
+      scheme: http
+      port: 3000
+      base_path: /
+      public_root: /mvt
+      links: canonical
+      readiness: /health
+publications:
+  aerial:
+    source: aerial
+    provider: archive-martin
+    protocol: mvt
+    access: public
+    title: Aerial imagery
+    description: Ready-made raster tiles from MBTiles.
+    extent: [-180, -85, 180, 85]
+  hillshade:
+    source: hillshade
+    provider: archive-martin
+    protocol: mvt
+    access: public
+    title: Hillshade
+    description: Ready-made raster tiles from PMTiles.
+    extent: [-180, -85, 180, 85]

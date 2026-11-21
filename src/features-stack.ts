@@ -13,9 +13,9 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { parse, stringify } from 'yaml';
 import { mapBboxDescription, mapRelation, mapSize } from './maps-profile.js';
-import { checkTileJson, martinConfig, martinService, runMartin } from './martin-profile.js';
+import { checkTileJson, martinConfig, martinService, runMartin, tileArchivePath } from './martin-profile.js';
 import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataService, pinnedImage, postgisSource, providerRoot, publicationEntries, publicationUrl,
-  crs84, rasterFile, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
+  crs84, rasterFile, tileArchive, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
 
 const run = promisify(execFile);
 const composeFile = (name: string) => fileURLToPath(new URL(`../${name}`, import.meta.url));
@@ -121,13 +121,16 @@ function pygeoapiSource(config: FeaturesConfig, publication: Publication) {
 
 export function providerConfigurationChanged(candidate: FeaturesConfig, previous: FeaturesConfig | null,
   id = builtInProviderId(candidate)) {
+  if (!previous) return true;
+  if (id !== undefined && JSON.stringify(usedFileSources(candidate, id)) !== JSON.stringify(usedFileSources(previous, id))) {
+    return true;
+  }
   if (id && candidate.providers?.[id]?.type === 'martin') {
-    return !previous || JSON.stringify(martinConfig(candidate, id)) !== JSON.stringify(martinConfig(previous, id)) ||
+    return JSON.stringify(martinConfig(candidate, id)) !== JSON.stringify(martinConfig(previous, id)) ||
       JSON.stringify(candidate.providers[id].postgis) !== JSON.stringify(previous.providers?.[id]?.postgis);
   }
-  return !previous || (id !== undefined && (
+  return (id !== undefined && (
     ((hasGeoJson(candidate, id) || hasGeoJson(previous, id)) && candidate.sourcePath !== previous.sourcePath) ||
-    JSON.stringify(usedFileSources(candidate, id)) !== JSON.stringify(usedFileSources(previous, id)) ||
     candidate.providers?.[id]?.postgis?.password_file !== previous.providers?.[id]?.postgis?.password_file)) ||
     JSON.stringify(pygeoapiConfig(candidate, id)) !== JSON.stringify(pygeoapiConfig(previous, id));
 }
@@ -358,7 +361,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
 			reverse_proxy ${serviceName(config, id)}:${api?.port ?? 80} {
 				header_up -Cookie
 				header_up -Authorization${canonical}
-				header_down Cache-Control no-store${htmlPolicy}${postgis || maps ? `
+				header_down Cache-Control no-store${htmlPolicy}${postgis || mvt || maps ? `
 				@sourceFailure status 5xx
 				handle_response @sourceFailure {
 					header Cache-Control no-store
@@ -479,6 +482,9 @@ function sourceMountPath(id: string, filename: string) {
 }
 
 function fileParts(id: string, source: FileSource) {
+  if (source.type === 'mbtiles' || source.type === 'pmtiles') {
+    return [{ path: source.path, target: tileArchivePath(id, source), optional: false }];
+  }
   if (source.type === 'geotiff' || source.type === 'cog') {
     return [{ path: source.path, target: sourceMountPath(id, 'raster.tif'), optional: false }];
   }
@@ -543,14 +549,14 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
   const offlineFiles = new Set<string>();
   for (const [id, hash] of Object.entries(fileHashes)) {
     const expected = options.fileHashes?.[id];
-    const label = rasterFile(config, id) ? 'Raster file' : 'Vector file';
+    const label = tileArchive(config, id) ? 'Tile archive' : rasterFile(config, id) ? 'Raster file' : 'Vector file';
     if (!hash) {
       const unchanged = previous && expected === null && Object.hasOwn(previousFileHashes, id) &&
         publicationEntries(config).filter(([, publication]) => publication.source === id).every(([, { provider }]) =>
           !providerConfigurationChanged(config, previous.config, provider) &&
           usedFileSources(config, provider).every(([key]) => Object.hasOwn(previousFileHashes, key) &&
             (fileHashes[key] === previousFileHashes[key] || options.fileHashes?.[key] === null && !fileHashes[key])));
-      if (!unchanged) throw new FeaturesPreflightError(`${label} source '${id}'${rasterFile(config, id) ? '' : ' or its sidecar'} is unavailable.`);
+      if (!unchanged) throw new FeaturesPreflightError(`${label} source '${id}'${vectorFile(config, id) ? ' or its sidecar' : ''} is unavailable.`);
       offlineFiles.add(id);
     } else if (options.fileHashes && hash !== (expected ?? previousFileHashes[id])) {
       throw new FeaturesPreflightError(`${label} source '${id}' changed after planning. Create a new plan.`);
@@ -685,14 +691,6 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
       ? [{ source: secret, target: 'postgis_password' }] : undefined;
     const native = service === 'pygeoapi' ? directory : join(directory, service);
     await mkdir(native, { recursive: true });
-    if (provider.type === 'martin') {
-      if (!managedProviderRuns(config, id)) continue;
-      await writeFile(join(native, 'martin.yaml'), stringify(martinConfig(config, id)));
-      await writeFile(join(native, 'run.sh'), runMartin);
-      if (connection) secrets[secret] = { file: escapeCompose(passwordFile!) };
-      services[service] = martinService(provider, escapeCompose(await nativeProviderDirectory(directory, service)), connection);
-      continue;
-    }
     const files = usedFileSources(config, id);
     const vectorFiles = files.some(([key]) => vectorFile(config, key));
     const fileMounts = (await Promise.all(files.map(async ([key, file]) => {
@@ -706,6 +704,15 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
           bind: { create_host_path: false } }];
       }))).flat();
     }))).flat();
+    if (provider.type === 'martin') {
+      if (!managedProviderRuns(config, id)) continue;
+      await writeFile(join(native, 'martin.yaml'), stringify(martinConfig(config, id)));
+      await writeFile(join(native, 'run.sh'), runMartin);
+      if (connection) secrets[secret] = { file: escapeCompose(passwordFile!) };
+      const serviceSettings = martinService(provider, escapeCompose(await nativeProviderDirectory(directory, service)), connection);
+      services[service] = { ...serviceSettings, volumes: [...serviceSettings.volumes, ...fileMounts] };
+      continue;
+    }
     const pluginEnvironment = connection || vectorFiles ? {
       PYTHONPATH: '/etc/pygeoapi/gis' + (provider.image && provider.environment?.PYTHONPATH
         ? `:${escapeCompose(provider.environment.PYTHONPATH)}` : ''),
@@ -866,12 +873,20 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
         try {
           const output = await compose(config, directory, 'run', '--rm', '--no-deps', '-T', service,
             '--check', ...publications.map(([key]) => key));
-          const documents = output.trim().split('\n');
+          const [catalog, ...documents] = output.trim().split('\n');
+          const { tiles } = JSON.parse(catalog ?? '') as { tiles: Record<string, { content_type: string }> };
           for (const [index, [key, publication]] of publications.entries()) {
+            const source = postgisSource(config, publication.source);
+            if (!source && !tiles[key]?.content_type?.startsWith('image/')) {
+              throw new Error(`Publication '${key}' does not contain raster tiles.`);
+            }
             checkTileJson(documents[index] ?? '', `http://127.0.0.1:${instance.api.port}${root}/${key}`, key,
-              postgisSource(config, publication.source)!.id_field);
+              source?.id_field);
           }
         } catch {
+          if (!instance.postgis) {
+            throw new FeaturesPreflightError(`Martin provider '${id}' failed to open its tile archives. Check the archive format, raster tiles and TileJSON.`);
+          }
           throw new FeaturesPreflightError(`Martin provider '${id}' failed to open its PostGIS sources. Check connectivity, access and source definitions.`);
         }
       }
@@ -1174,13 +1189,21 @@ export async function featuresStackRunning(config: FeaturesConfig, directory: st
   return ['caddy', ...stackServices(config)].every((service) => running.includes(service));
 }
 
-export async function startFeaturesStack(config: FeaturesConfig, revisionDirectory: string, confirmed?: FeaturesConfig) {
+export async function startFeaturesStack(config: FeaturesConfig, revisionDirectory: string, confirmed?: Revision) {
   const origin = new URL(config.publicUrl);
   const certificate = config.tls ? await readFile(config.tls.cert_file) : undefined;
-  const confirmedMartin = new Set(Object.entries(config.providers ?? {}).filter(([id, provider]) =>
-    provider.type === 'martin' && managedProviderRuns(config, id) &&
-    JSON.stringify(confirmed?.providers?.[id]) === JSON.stringify(provider) &&
-    !providerConfigurationChanged(config, confirmed ?? null, id)).map(([id]) => id));
+  const confirmedMartin = new Set<string>();
+  if (confirmed) {
+    for (const [id, provider] of Object.entries(config.providers ?? {})) {
+      if (provider.type !== 'martin' || !managedProviderRuns(config, id) ||
+          JSON.stringify(confirmed.config.providers?.[id]) !== JSON.stringify(provider) ||
+          providerConfigurationChanged(config, confirmed.config, id)) continue;
+      const service = serviceName(config, id);
+      if (await nativeProviderDirectory(revisionDirectory, service) === await nativeProviderDirectory(confirmed.directory, service)) {
+        confirmedMartin.add(id);
+      }
+    }
+  }
   const optionalServices = [...confirmedMartin].map((id) => serviceName(config, id));
   const requiredServices = stackServices(config).filter((service) => !optionalServices.includes(service));
   await compose(config, revisionDirectory, 'up', '-d', '--no-deps',
@@ -1231,7 +1254,7 @@ export async function startFeaturesStack(config: FeaturesConfig, revisionDirecto
         }
         if (body) {
           if (mvt) {
-            checkTileJson(body, tileJsonUrl, id, postgisSource(config, source)!.id_field);
+            checkTileJson(body, tileJsonUrl, id, postgisSource(config, source)?.id_field);
             continue;
           }
           const collection = JSON.parse(body) as { id?: string; links?: { rel: string; href: string }[] };

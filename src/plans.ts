@@ -190,7 +190,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   await pinProviderImages(config, current);
   const sourceHash = hasGeoJson(config) ? await sourceFingerprint(config.sourcePath) : null;
   const changedSource = await sourceContentChanged(sourceHash, baseVersion);
-  const fileHashes = config.vectorFiles || config.rasterFiles ? await fileFingerprints(config) : undefined;
+  const fileHashes = config.vectorFiles || config.rasterFiles || config.tileArchives ? await fileFingerprints(config) : undefined;
   const changedFiles = await fileContentChanges(fileHashes, baseVersion);
   const edit = editFile && { filename: editFile.filename, before: digest(editFile.original) };
   const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash, vectorHashes: fileHashes, edit };
@@ -300,7 +300,7 @@ async function restoreStack(state: ActiveState, candidate: Plan, current: Plan |
       const previous = revision(current);
       if (!current.yaml) await prepareFeaturesStack(previous, { useArchivedOpenApi: true });
       await closeGateway(previous.directory);
-      await startFeaturesStack(current.config, previous.directory, candidate.config);
+      await startFeaturesStack(current.config, previous.directory, revision(candidate));
       await openGateway(previous.directory);
     } else {
       await compose(candidate.config, directory, 'down', '--remove-orphans');
@@ -361,7 +361,7 @@ async function resumeProviderOpen(state: ActiveState, candidate: Plan, previous:
   try {
     await checkProviderEdit(candidate);
     await closeGateway(directory);
-    await startFeaturesStack(config, directory, previous?.config);
+    await startFeaturesStack(config, directory, previous ? revision(previous) : undefined);
     await finishOpen(state, candidate);
   } catch {
     const saved = await readFile(candidate.edit!.filename, 'utf8').catch(() => null);
@@ -437,7 +437,7 @@ async function finalizeRemoval(state: ActiveState, plan: Plan, current: Plan | n
     }
     if (resume) {
       await closeGateway(candidate.directory);
-      await startFeaturesStack(plan.config, candidate.directory, current?.config);
+      await startFeaturesStack(plan.config, candidate.directory, current ? revision(current) : undefined);
     }
     await openGateway(candidate.directory);
     await writeJson(activeFile, settled({ ...state, planId: plan.planId, previousVersion: state.planId }, plan.planId, { code: 'OK' }));
@@ -484,7 +484,7 @@ async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null
   try {
     await closeGateway(candidate.directory);
     if (current) await secureGateway(revision(current), !current.yaml);
-    await startFeaturesStack(plan.config, candidate.directory, restart ? undefined : current?.config);
+    await startFeaturesStack(plan.config, candidate.directory, !restart && current ? revision(current) : undefined);
     if (!cleanup) await openConfirmedVersion(pending, plan);
     else await writeJson(activeFile, { ...pending, phase: 'finalize' });
   } catch {

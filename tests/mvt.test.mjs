@@ -11,6 +11,7 @@ import { VectorTile } from '@mapbox/vector-tile';
 import { PbfReader } from 'pbf';
 import { auth, register, signIn } from './access-client.mjs';
 import { renderMvt } from './mvt-browser.mjs';
+import { solidPng, writeMbtiles } from './raster-tile-fixtures.mjs';
 
 const filename = process.env.GIS_TEST_CONFIG;
 const gateway = process.env.GIS_TEST_PUBLIC_URL;
@@ -309,18 +310,39 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
     assert.equal((await features('/mvt/observations/1/1/0', 'observations'))[0].properties.id, 'row-1');
   });
 
+  const archiveTile = solidPng([214, 57, 49]);
+  const withArchive = { ...platform,
+    sources: { ...platform.sources, 'file-tile': { type: 'mbtiles', path: './isolated.mbtiles' } },
+    providers: { ...platform.providers, archives: { type: 'martin', image: martin, api: platform.providers['martin-east'].api } },
+    publications: { ...platform.publications, 'file-tile': { source: 'file-tile', provider: 'archives', protocol: 'mvt',
+      access: 'public', title: 'Archive tile', description: 'Independent archive source', extent: [-180, -85, 180, 85] } },
+  };
+  await t.test('the archive and external PostGIS use independent Martin instances at /mvt', async () => {
+    const existing = martinContainer();
+    writeMbtiles(join(dirname(filename), 'isolated.mbtiles'), archiveTile);
+    await writeFile(filename, stringify(withArchive));
+    const archive = cli('config', 'plan', filename);
+    assert.ok(archive.services.includes('provider-archives'));
+    assert.ok(!archive.services.includes('provider-martin-east'));
+    cli('config', 'apply', archive.planId);
+    assert.equal(martinContainer(), existing);
+    assert.equal((await features('/mvt/observations/1/1/0', 'observations'))[0].properties.id, 'row-1');
+    assert.deepEqual(Buffer.from(await (await request('/mvt/file-tile/0/0/0')).arrayBuffer()), archiveTile);
+  });
+
   await t.test('a down Martin instance does not block an update to an independent provider', async () => {
     docker('stop', database);
     started = false;
     docker('stop', martinContainer());
     await writeFile(filename, stringify({
-      ...platform,
-      publications: { ...platform.publications, control: { ...platform.publications.control, title: 'Updated control' } },
+      ...withArchive,
+      publications: { ...withArchive.publications, control: { ...platform.publications.control, title: 'Updated control' } },
     }));
     const update = cli('config', 'plan', filename);
     cli('config', 'apply', update.planId);
     const collection = await (await request('/features/collections/control?f=json')).json();
     assert.equal(collection.title, 'Updated control');
     await request('/mvt/observations/1/1/0', 503);
+    assert.deepEqual(Buffer.from(await (await request('/mvt/file-tile/0/0/0')).arrayBuffer()), archiveTile);
   });
 });

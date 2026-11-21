@@ -55,7 +55,8 @@ export type VectorFileSource =
   ({ type: 'geopackage' | 'shapefile'; layer: string } | { type: 'geoparquet'; layer?: never }) &
   { path: string; id_field: string };
 export type RasterFileSource = { type: 'geotiff' | 'cog'; path: string; epsg?: number };
-export type FileSource = VectorFileSource | RasterFileSource;
+export type TileArchiveSource = { type: 'mbtiles' | 'pmtiles'; path: string };
+export type FileSource = VectorFileSource | RasterFileSource | TileArchiveSource;
 type Source = { type: 'geojson'; path: string } | FileSource | PostgisSource;
 
 interface PlatformConfig {
@@ -104,6 +105,7 @@ export type FeaturesConfig = {
   geojsonSourceId?: string;
   vectorFiles?: Record<string, VectorFileSource>;
   rasterFiles?: Record<string, RasterFileSource>;
+  tileArchives?: Record<string, TileArchiveSource>;
   postgisSources?: Record<string, PostgisSource>;
   providers?: Record<string, Provider>;
   auth?: AuthConfig;
@@ -137,8 +139,12 @@ export function rasterFile(config: FeaturesConfig, id: string) {
   return config.rasterFiles && Object.hasOwn(config.rasterFiles, id) ? config.rasterFiles[id] : undefined;
 }
 
+export function tileArchive(config: FeaturesConfig, id: string) {
+  return config.tileArchives && Object.hasOwn(config.tileArchives, id) ? config.tileArchives[id] : undefined;
+}
+
 export function fileSource(config: FeaturesConfig, id: string) {
-  return vectorFile(config, id) ?? rasterFile(config, id);
+  return vectorFile(config, id) ?? rasterFile(config, id) ?? tileArchive(config, id);
 }
 
 export const crs84 = 'http://www.opengis.net/def/crs/OGC/1.3/CRS84';
@@ -226,6 +232,7 @@ export function serializeFeaturesConfig(config: FeaturesConfig) {
       ...config.postgisSources,
       ...config.vectorFiles,
       ...config.rasterFiles,
+      ...config.tileArchives,
     },
     providers: config.providers ?? { [builtInProviderId(config)!]: { type: 'pygeoapi' } },
     publications: Object.fromEntries(publicationEntries(config)),
@@ -280,6 +287,13 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     source.path = resolve(directory, source.path);
     source.epsg ??= 4326;
   }
+  const tileArchives = sources.filter((entry): entry is [string, TileArchiveSource] =>
+    entry[1].type === 'mbtiles' || entry[1].type === 'pmtiles');
+  for (const [id, source] of tileArchives) {
+    const extension = `.${source.type}`;
+    if (extname(source.path).toLowerCase() !== extension) throw new Error(`Source '${id}' requires a ${extension} file.`);
+    source.path = resolve(directory, source.path);
+  }
   if (providers.filter(([, provider]) => !provider.image).length > 1) {
     throw new Error('Only one provider can use the built-in image. Configure an image and API for each additional instance.');
   }
@@ -289,8 +303,8 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       provider.postgis.password_file = resolve(directory, provider.postgis.password_file);
       provider.postgis.port ??= 5432;
     }
-    if (provider.type === 'martin' && (!provider.image || !provider.postgis)) {
-      throw new Error(`Martin provider '${id}' requires an image, API and PostGIS connection.`);
+    if (provider.type === 'martin' && !provider.image) {
+      throw new Error(`Martin provider '${id}' requires an image and API.`);
     }
     if (!provider.image && !Object.hasOwn(provider, 'image')) {
       roots.add('/features');
@@ -358,9 +372,16 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Publication '${id}' uses a protocol unsupported by provider '${provider}'.`);
     }
     const sourceConfig = config.sources[source]!;
+    const archive = sourceConfig.type === 'mbtiles' || sourceConfig.type === 'pmtiles';
     if (protocol === 'mvt') {
-      if (sourceConfig.type !== 'postgis' || publication.crs || time_field) {
-        throw new Error(`Publication '${id}': MVT requires PostGIS and uses Web Mercator without CRS or time overrides.`);
+      if ((!archive && sourceConfig.type !== 'postgis') || publication.crs || time_field) {
+        throw new Error(`Publication '${id}': Martin requires PostGIS, MBTiles or PMTiles and uses Web Mercator without CRS or time overrides.`);
+      }
+      if (archive && instance?.postgis) {
+        throw new Error(`Provider '${provider}' specifies PostGIS for file sources. Use separate provider instances.`);
+      }
+      if (archive && publication.mvt_properties) {
+        throw new Error(`Publication '${id}': mvt_properties requires a PostGIS source.`);
       }
       if (['catalog', 'config', 'font', 'health', 'help', 'index', 'manifest', 'metrics', 'refresh',
         'reload', 'sprite', 'status'].includes(id)) {
@@ -370,7 +391,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Publication '${id}': mvt_properties is only supported for MVT.`);
     }
     const raster = sourceConfig.type === 'geotiff' || sourceConfig.type === 'cog';
-    if (raster !== (protocol === 'maps')) {
+    if (raster !== (protocol === 'maps') || (archive && protocol !== 'mvt')) {
       throw new Error(`Publication '${id}' has a source type unsupported by protocol '${protocol}'.`);
     }
     if (raster && publication.crs) throw new Error(`Publication '${id}': set the raster source epsg instead of crs.`);
@@ -427,8 +448,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     ...(postgisSources.length && { postgisSources: Object.fromEntries(postgisSources) }),
     ...(vectorFiles.length && { vectorFiles: Object.fromEntries(vectorFiles) }),
     ...(rasterFiles.length && { rasterFiles: Object.fromEntries(rasterFiles) }),
-    ...((postgisSources.length || vectorFiles.length || rasterFiles.length) && geojson && { geojsonSourceId: geojson[0] }),
-    ...(postgisSources.length || vectorFiles.length || rasterFiles.length || entries.some(([, pub]) => pub.crs) ||
+    ...(tileArchives.length && { tileArchives: Object.fromEntries(tileArchives) }),
+    ...((postgisSources.length || vectorFiles.length || rasterFiles.length || tileArchives.length) && geojson && { geojsonSourceId: geojson[0] }),
+    ...(postgisSources.length || vectorFiles.length || rasterFiles.length || tileArchives.length || entries.some(([, pub]) => pub.crs) ||
       providers.length !== 1 || providers.some(([, provider]) => provider.image || provider.postgis)
       ? { providers: config.providers } : {}),
     ...(first ? { publicationId: first[0], publication: first[1],

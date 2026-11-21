@@ -177,14 +177,14 @@ async function runMapsTests() {
   }
 }
 
-async function runMvtTests() {
-  run('build-mvt-cli', process.execPath, ['node_modules/typescript/bin/tsc']);
-  const name = `${project}-mvt`;
-  const filter = mode === '--mvt' && process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
+async function runMartinTests(suite) {
+  run(`build-${suite}-cli`, process.execPath, ['node_modules/typescript/bin/tsc']);
+  const name = `${project}-${suite}`;
+  const filter = mode === `--${suite}` && process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
   try {
-    console.log(run('test-mvt', process.execPath, ['--test', ...filter, 'tests/mvt.test.mjs'], {
-      COMPOSE_PROJECT_NAME: name, GIS_STATE_DIR: join(results, 'mvt-state'),
-      GIS_TEST_PUBLIC_URL: `http://localhost:${await freePort()}`, GIS_TEST_CONFIG: join(results, 'mvt.yaml'),
+    console.log(run(`test-${suite}`, process.execPath, ['--test', ...filter, `tests/${suite}.test.mjs`], {
+      COMPOSE_PROJECT_NAME: name, GIS_STATE_DIR: join(results, `${suite}-state`),
+      GIS_TEST_PUBLIC_URL: `http://localhost:${await freePort()}`, GIS_TEST_CONFIG: join(results, `${suite}.yaml`),
       GIS_TEST_MAILPIT: `http://localhost:${await freePort()}`,
     }));
   } finally {
@@ -303,7 +303,8 @@ const providerSuites = new Map([
   ['--postgis', runPostgisTests],
   ['--features-files', runFeaturesFilesTests],
   ['--maps', runMapsTests],
-  ['--mvt', runMvtTests],
+  ['--mvt', () => runMartinTests('mvt')],
+  ['--raster-tiles', () => runMartinTests('raster-tiles')],
 ]);
 
 console.log(`Results: ${results}`);
