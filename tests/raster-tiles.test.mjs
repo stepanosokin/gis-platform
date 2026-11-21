@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { stringify } from 'yaml';
 import { auth, register, signIn } from './access-client.mjs';
-import { renderMapLibre } from './maplibre-browser.mjs';
+import { mapLibreBrowserOptions, renderMapLibre } from './maplibre-browser.mjs';
 import { solidPng, writeMbtiles, writePmtiles } from './raster-tile-fixtures.mjs';
 
 const filename = process.env.GIS_TEST_CONFIG;
@@ -162,7 +162,7 @@ test('Martin serves both raster archives through canonical, authorized gateway r
     for (const path of ['/mvt', '/mvt/catalog', '/mvt/health', '/mvt/unlisted', '/mvt/fixture', '/mvt/red,blue/0/0/0',
       '/mvt/red/0/0/0.png', '/mvt/red/0/0/0/extra', '/native/red']) await request(path, 404);
 
-    if (process.env.GIS_TEST_CHROME) {
+    await t.test('MapLibre GL JS renders the control image from each archive', mapLibreBrowserOptions, async () => {
       const sources = [{ url: gateway + '/mvt/red' }, { url: gateway + '/mvt/blue', secret }];
       const script = `
         for (const { url: source, secret } of ${JSON.stringify(sources)}) {
@@ -196,7 +196,7 @@ test('Martin serves both raster archives through canonical, authorized gateway r
         [sources[0].url, [214, 57, 49, 255]],
         [sources[1].url, [32, 108, 218, 255]],
       ]);
-    }
+    });
 
     await t.test('a vector archive cannot replace an active raster archive', async () => {
       const candidate = { ...config, sources: { ...config.sources,

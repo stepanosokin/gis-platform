@@ -4,6 +4,10 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 
+export const mapLibreBrowserOptions = {
+  skip: process.env.GIS_TEST_CHROME ? false : 'Set GIS_TEST_CHROME and GIS_TEST_MAPLIBRE_DIST to run MapLibre GL JS.',
+};
+
 export async function renderMapLibre({ origin, results, name, script, frameCount, afterFirstRender }) {
   const dist = process.env.GIS_TEST_MAPLIBRE_DIST;
   assert.ok(dist, 'Set GIS_TEST_MAPLIBRE_DIST to the MapLibre GL JS dist directory.');

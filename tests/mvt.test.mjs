@@ -10,6 +10,7 @@ import { stringify } from 'yaml';
 import { VectorTile } from '@mapbox/vector-tile';
 import { PbfReader } from 'pbf';
 import { auth, register, signIn } from './access-client.mjs';
+import { mapLibreBrowserOptions } from './maplibre-browser.mjs';
 import { renderMvt } from './mvt-browser.mjs';
 import { solidPng, writeMbtiles } from './raster-tile-fixtures.mjs';
 
@@ -168,7 +169,7 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
   assert.ok(id);
   assert.deepEqual(JSON.parse(docker('inspect', '--format', '{{json .HostConfig.PortBindings}}', id)) ?? {}, {});
 
-  await t.test('an authorized MapLibre origin can read both linked requests', async () => {
+  await t.test('an authorized MapLibre origin can read both linked requests', async (t) => {
     const hidden = '/mvt/observations-copy';
     const tile = hidden + '/1/1/0';
     await request(hidden, 401);
@@ -193,12 +194,12 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
     assert.equal(metadata.headers.get('access-control-allow-origin'), browserOrigin);
     assert.deepEqual((await metadata.json()).tiles, [gateway + hidden + '/{z}/{x}/{y}']);
     assert.equal((await features(tile, 'observations-copy', { headers }))[0].properties.label, 'Greenwich');
-    if (process.env.GIS_TEST_CHROME) {
+    await t.test('MapLibre GL JS renders the updated feature after COMMIT', mapLibreBrowserOptions, async () => {
       await renderMvt({ origin: browserOrigin, source: gateway + hidden, layer: 'observations-copy', secret,
         results: dirname(filename), afterFirstRender: () => {
           sql("BEGIN; UPDATE gis.observations SET label = 'Greenwich after COMMIT' WHERE id = 'row-1'; COMMIT;");
         } });
-    }
+    });
   });
 
   await t.test('the same XYZ URL reflects committed inserts, updates and deletes', async () => {
