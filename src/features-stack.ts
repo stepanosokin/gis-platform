@@ -618,7 +618,7 @@ function sourceMountPath(id: string, filename: string) {
   return `/source/${id}/${filename}`;
 }
 
-function fileParts(id: string, source: FileSource) {
+export function fileParts(id: string, source: FileSource) {
   if (source.type === 'parquet') {
     return [{ path: source.path, target: dggsSnapshotPath(id), optional: false }];
   }

@@ -9,6 +9,7 @@ import { runAdminCommand } from './admin-client.js';
 import { parseAdminCommand } from './admin-command.js';
 import { planProviderCommand } from './provider-command.js';
 import { mapLibreFiles } from './maplibre-style.js';
+import { runBackupCommand } from './backup.js';
 
 const arguments_ = process.argv.slice(2);
 const json = arguments_.includes('--json');
@@ -21,6 +22,11 @@ function success(code: string, data: Record<string, unknown>, message: string) {
 }
 
 async function main() {
+  if (group === 'backup') {
+    const data = await runBackupCommand(commandArguments.slice(1));
+    success('OK', data, JSON.stringify(data, null, 2));
+    return;
+  }
   if (group === 'provider') {
     const plan = await planProviderCommand(command, commandArguments.slice(2));
     const result = await applyPlan(plan.planId);

@@ -39,7 +39,7 @@ function missing(error: unknown) {
   return error instanceof Error && 'code' in error && error.code === 'ENOENT';
 }
 
-async function writeJson(filename: string, value: unknown) {
+export async function writeStateJson(filename: string, value: unknown) {
   await mkdir(dirname(filename), { recursive: true, mode: 0o700 });
   const temporaryFile = `${filename}.${randomUUID()}.tmp`;
   try {
@@ -90,7 +90,7 @@ function firstPublicationUrl(config: FeaturesConfig) {
 }
 
 async function writeActive(state: ActiveState) {
-  await writeJson(activeFile, state);
+  await writeStateJson(activeFile, state);
 }
 
 async function migrateActiveFile() {
@@ -106,7 +106,15 @@ async function migrateActiveFile() {
 }
 
 export async function configurationStatus() {
-  const { recoveryIncomplete, ...data } = statusSnapshot(await readActive());
+  const state = await readActive();
+  const { recoveryIncomplete, ...data } = statusSnapshot(state);
+  if (await restoreRequired(state.planId)) {
+    const plan = state.planId ? await readPlan(state.planId) : null;
+    throw new CliError('RECOVERY_INCOMPLETE', 7, 'Restore the verified current accounts database before opening the gateway.', {
+      ...data, phase: 'restore', closedRoutes: plan ? publicationEntries(plan.config).map(([id, publication]) =>
+        publicationUrl(plan.config, id, publication)) : [],
+    });
+  }
   if (recoveryIncomplete) throw new CliError('RECOVERY_INCOMPLETE', 7,
     `Configuration recovery is incomplete. Closed routes: ${data.closedRoutes.join(', ')}.`, data);
   return data;
@@ -241,7 +249,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     maplibreHashes, tlsFingerprint };
   const planId = fingerprint(snapshot);
   await writeMapLibreFiles(planDirectory(planId), mapFiles);
-  await writeJson(join(planDirectory(planId), 'plan.json'), { ...snapshot, planId });
+  await writeStateJson(join(planDirectory(planId), 'plan.json'), { ...snapshot, planId });
 
   const previousUrl = current ? firstPublicationUrl(current) : null;
   const newUrl = firstPublicationUrl(config);
@@ -590,6 +598,79 @@ async function applicationLock(scope: string) {
   return lock;
 }
 
+export const restoreMarker = join(stateDirectory, 'status', 'restore-required.json');
+
+export interface RestoreMarker {
+  snapshotId: string;
+  project?: string;
+  reconciled?: { postgres: string; databaseCapturedAt: string };
+}
+
+export async function readRestoreMarker(): Promise<RestoreMarker | undefined> {
+  return readFile(restoreMarker, 'utf8').then(JSON.parse, (error) => {
+    if (missing(error)) return undefined;
+    throw error;
+  });
+}
+
+export function writeRestoreMarker(marker: RestoreMarker) {
+  return writeStateJson(restoreMarker, marker);
+}
+
+export async function restoredGatewayClosed(planId: string) {
+  return stat(join(planDirectory(planId), 'closed')).then(() => true, (error) => {
+    if (missing(error)) return false;
+    throw error;
+  });
+}
+
+async function restoreRequired(planId: string | null) {
+  const marker = await readRestoreMarker();
+  return !!marker && (!marker.reconciled || !planId || await restoredGatewayClosed(planId));
+}
+
+async function lockConfiguration(directory: string) {
+  const stateLock = await applicationLock(`state:${process.platform === 'win32' ? directory.toLowerCase() : directory}`);
+  try {
+    const project = await resolveComposeProject();
+    const projectLock = await applicationLock(`compose:${project}`);
+    return {
+      project,
+      release() {
+        projectLock.close();
+        stateLock.close();
+      },
+    };
+  } catch (error) {
+    stateLock.close();
+    throw error;
+  }
+}
+
+export async function withConfirmedConfiguration<T>(run: (snapshot: {
+  directory: string; project: string; current: Plan; previous: Plan | null; history: AsyncIterable<Plan>;
+}) => Promise<T>) {
+  const directory = await realpath(stateDirectory);
+  const lock = await lockConfiguration(directory);
+  try {
+    const state = await readActive();
+    if (!state.planId || state.pendingPlanId || state.phase) {
+      throw new CliError('RECOVERY_INCOMPLETE', 7, 'A settled, confirmed configuration is required. Check status.');
+    }
+    const current = await readPlan(state.planId);
+    return await run({ directory, project: lock.project, current,
+      previous: state.previousVersion ? await readPlan(state.previousVersion) : null, history: confirmedHistory(current) });
+  } finally {
+    lock.release();
+  }
+}
+
+export async function startRestoredGateway(plan: Plan) {
+  const selected = revision(plan);
+  await closeGateway(selected.directory);
+  await startFeaturesStack(selected);
+}
+
 function resultFor(state: ActiveState, plan: Plan) {
   const data = {
     planId: plan.planId, currentVersion: state.planId, url: firstPublicationUrl(plan.config),
@@ -608,11 +689,11 @@ function resultFor(state: ActiveState, plan: Plan) {
 
 export async function applyPlan(planId: string) {
   const plan = await readPlan(planId);
-  const directory = await realpath(stateDirectory);
-  const stateLock = await applicationLock(`state:${process.platform === 'win32' ? directory.toLowerCase() : directory}`);
-  let projectLock: Awaited<ReturnType<typeof applicationLock>> | undefined;
+  const lock = await lockConfiguration(await realpath(stateDirectory));
   try {
-    projectLock = await applicationLock(`compose:${await resolveComposeProject()}`);
+    if (await readRestoreMarker()) {
+      throw new CliError('RECOVERY_INCOMPLETE', 7, 'Restore the verified current accounts database before applying configuration.');
+    }
     await migrateActiveFile();
     let state = await readActive();
     if (state.results?.[planId]) return resultFor(state, plan);
@@ -681,7 +762,6 @@ export async function applyPlan(planId: string) {
     }
     return resultFor(await readActive(), plan);
   } finally {
-    projectLock?.close();
-    stateLock.close();
+    lock.release();
   }
 }

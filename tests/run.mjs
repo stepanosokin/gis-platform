@@ -245,6 +245,7 @@ function makeGatewayChain() {
 
 async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = false, standardPorts = false } = {}) {
   run(`build-${suite}-cli`, process.execPath, ['node_modules/typescript/bin/tsc']);
+  const backup = suite === 'backup';
   const accessProject = `${project}-${suite}`;
   const accessEnvironment = { COMPOSE_PROJECT_NAME: accessProject, GIS_STATE_DIR: join(results, `${suite}-state`) };
   const port = standardPorts ? 80 : await freePort();
@@ -257,13 +258,18 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
     writeFileSync(join(results, name), randomBytes(32).toString('hex'), { mode: 0o600 });
   }
   if (suite === 'access') makeGatewayChain();
+  if (backup) {
+    makeGatewayCertificate(suite);
+    copyFileSync(join(results, 'https-cert.pem'), join(results, 'backup-trusted.pem'));
+  }
   const config = readFileSync(join(root, 'examples/features.yaml'), 'utf8').replace(/\r\n/g, '\n');
   const entryStart = config.indexOf('  places:');
   const publicPublication = config.slice(entryStart);
   const registered = publicPublication.replace('  places:', '  registered-places:')
     .replace('access: public', 'access: registered').replace('title: Example places', 'title: Registered example');
-  const platform = config.slice(0, entryStart).replace('  port: 8080\n', standardPorts ? '' : `  port: ${port}\n`);
-  const closed = suite === 'private' ? ['private-places', 'other-private'].map((id) => publicPublication
+  const platform = config.slice(0, entryStart).replace('  port: 8080\n', standardPorts ? '' : `  port: ${port}\n` +
+    (backup ? '  tls: {cert_file: https-cert.pem, key_file: https-key.pem, ca_file: https-cert.pem}\n' : ''));
+  const closed = suite === 'private' || backup ? ['private-places', 'other-private'].map((id) => publicPublication
     .replace('  places:', `  ${id}:`).replace('access: public', 'access: private')
     .replace('title: Example places', `title: ${id === 'private-places' ? 'Closed places' : 'Other closed places'}`)).join('') : '';
   writeFileSync(file, `${platform}${registered}${publicPublication}${closed}\nauth:\n  mode: development\n  secret_file: auth-secret\n  postgres_password_file: postgres-password\n  mailpit_port: ${mailPort}\n`);
@@ -291,7 +297,7 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
     const filter = pattern ? [`--test-name-pattern=${pattern}`] : [];
     const environment = {
       ...accessEnvironment,
-      GIS_TEST_PUBLIC_URL: new URL(`http://localhost:${port}`).origin,
+      GIS_TEST_PUBLIC_URL: new URL(`${backup ? 'https' : 'http'}://localhost:${port}`).origin,
       GIS_TEST_HTTPS_URL: new URL(`https://localhost:${standardPorts ? 443 : port}`).origin,
       GIS_TEST_HTTP_REDIRECT_URL: new URL(`http://localhost:${httpRedirect}`).origin,
       GIS_TEST_EMPTY_TLS_PORT: String(await freePort()),
@@ -299,6 +305,10 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
       GIS_TEST_MAILPIT: `http://localhost:${mailPort}`,
       GIS_TEST_CONFIG: file,
       ...(suite === 'access' && { NODE_EXTRA_CA_CERTS: join(results, 'gateway-root.pem') }),
+      ...(backup && {
+        NODE_EXTRA_CA_CERTS: join(results, 'backup-trusted.pem'),
+        GIS_TEST_BACKUP_SERVER_PORT: String(await freePort()),
+      }),
       GIS_REVISION_DIR: join(accessEnvironment.GIS_STATE_DIR, 'plans', plan.planId),
       GIS_AUTH_SECRET_FILE: join(results, 'auth-secret'),
       GIS_POSTGRES_PASSWORD_FILE: join(results, 'postgres-password'),
@@ -354,6 +364,10 @@ if (mode === '--access') {
   await runAccessTests(mode.slice(2));
   process.exit(0);
 }
+if (mode === '--backup') {
+  await runAccessTests('backup');
+  process.exit(0);
+}
 if (mode === '--tls-standard') {
   await runAccessTests('access', { standardPorts: true });
   process.exit(0);
@@ -385,4 +399,5 @@ if (!mode) {
     (process.env.GIS_QGIS_MCP === '1' || await qgisPluginIsListening());
   if (!qgis) console.log('QGIS desktop check skipped. Run npm test -- --qgis to require it.');
   await runAccessTests('private', { qgis });
+  await runAccessTests('backup');
 }
