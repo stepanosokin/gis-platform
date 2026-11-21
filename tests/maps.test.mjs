@@ -5,6 +5,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { auth, register, signIn } from './access-client.mjs';
+import { measureGateway } from './acceptance-probe.mjs';
 
 const filename = process.env.GIS_TEST_CONFIG;
 const origin = process.env.GIS_TEST_PUBLIC_URL;
@@ -230,6 +231,11 @@ auth:
   const revoke = cli('access', 'revoke', 'private-map', '--email', email);
   assert.equal(revoke.status, 0, JSON.stringify(revoke.result));
   await get(privatePath + '/map', query, 403, bearer);
+  measureGateway('maps-features', [
+    { path: '/features/collections/places/items?f=json', features: 3 },
+    { path: `${mapPath}?bbox=10,20,14,24&width=500&height=300`, png: [500, 300] },
+    { path: `${mapPath}?bbox=10,20,14,24&width=2048&height=2048`, png: [2048, 2048] },
+  ], origin);
 });
 
 test('applying an unreadable raster leaves the active publication available', async () => {

@@ -351,6 +351,9 @@ const providerSuites = new Map([
 ]);
 
 console.log(`Results: ${results}`);
+if (!mode && process.env.GIS_TEST_PYTHON) {
+  console.log(run('test-acceptance-probe', process.execPath, ['--test', 'tests/acceptance.test.mjs']));
+}
 if (!mode || mode === '--backup') {
   try {
     const output = run('restic-version', process.env.GIS_RESTIC_EXECUTABLE ?? 'restic', ['version']);

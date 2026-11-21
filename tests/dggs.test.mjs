@@ -8,6 +8,7 @@ import { text } from 'node:stream/consumers';
 import { test } from 'node:test';
 import { stringify } from 'yaml';
 import { auth, register, request, signIn } from './access-client.mjs';
+import { measureGateway } from './acceptance-probe.mjs';
 
 const gateway = process.env.GIS_TEST_PUBLIC_URL;
 const filename = process.env.GIS_TEST_CONFIG;
@@ -177,6 +178,10 @@ test('pydggsapi serves H3 snapshots through the configured gateway', async (t) =
     params.append('compact-zones', 'false');
     params.set('bbox', '12.28,0,NaN,45.47');
     await get(`${base}?${params}`, 400);
+    measureGateway('dggs', ['dense', 'sparse'].map((collection) => ({
+      path: `${zonesPath(collection)}?${bboxQuery(large, 10000)}`,
+      features: Object.keys(fixture.cells[collection]).length,
+    })), gateway, join(directory, 'https-cert.pem'));
   });
 
   await t.test('canonical catalogs, Swagger, OpenAPI and collection routes obey access grants', async () => {
