@@ -181,7 +181,7 @@ async function runTileTests(suite) {
   run(`build-${suite}-cli`, process.execPath, ['node_modules/typescript/bin/tsc']);
   const name = `${project}-${suite}`;
   const filter = mode === `--${suite}` && process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
-  const withAdmin = suite === 'tiles' || suite === 'mvt';
+  const withAdmin = suite === 'tiles' || suite === 'mvt' || suite === 'dggs';
   const admin = withAdmin ? {
     GIS_ADMIN_PORT: String(await freePort()),
     GIS_ADMIN_CA_FILE: join(results, 'ca.pem'),
@@ -189,11 +189,14 @@ async function runTileTests(suite) {
     GIS_ADMIN_KEY_FILE: join(results, 'operator-key.pem'),
   } : {};
   if (withAdmin) makeAdminCertificates();
+  const tls = suite === 'dggs';
+  if (tls) makeGatewayCertificate(suite);
   try {
     console.log(run(`test-${suite}`, process.execPath, ['--test', ...filter, `tests/${suite}.test.mjs`], {
       COMPOSE_PROJECT_NAME: name, GIS_STATE_DIR: join(results, `${suite}-state`),
-      GIS_TEST_PUBLIC_URL: `http://localhost:${await freePort()}`, GIS_TEST_CONFIG: join(results, `${suite}.yaml`),
+      GIS_TEST_PUBLIC_URL: `${tls ? 'https' : 'http'}://localhost:${await freePort()}`, GIS_TEST_CONFIG: join(results, `${suite}.yaml`),
       GIS_TEST_MAILPIT: `http://localhost:${await freePort()}`,
+      ...(tls && { NODE_EXTRA_CA_CERTS: join(results, 'https-cert.pem') }),
       ...admin,
     }));
   } finally {
@@ -316,6 +319,7 @@ const providerSuites = new Map([
   ['--raster-tiles', () => runTileTests('raster-tiles')],
   ['--tiles', () => runTileTests('tiles')],
   ['--h3', () => runTileTests('h3')],
+  ['--dggs', () => runTileTests('dggs')],
 ]);
 
 console.log(`Results: ${results}`);

@@ -207,15 +207,21 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   await pinProviderImages(config, current);
   const sourceHash = hasGeoJson(config) ? await sourceFingerprint(config.sourcePath) : null;
   const changedSource = await sourceContentChanged(sourceHash, baseVersion);
-  const fileHashes = config.vectorFiles || config.rasterFiles || config.tileArchives ? await fileFingerprints(config) : undefined;
+  const fileHashes = config.vectorFiles || config.rasterFiles || config.tileArchives || config.dggsSources
+    ? await fileFingerprints(config) : undefined;
   const changedFiles = await fileContentChanges(fileHashes, baseVersion);
   const edit = editFile && { filename: editFile.filename, before: digest(editFile.original) };
   const mapFiles = await mapLibreFiles(config, targetVersion && planDirectory(targetVersion)).catch((error: Error) => {
     throw new CliError('INVALID_CONFIG', 2, error.message);
   });
   const maplibreHashes = mapLibreHashes(mapFiles);
-  if (targetVersion && JSON.stringify(maplibreHashes) !== JSON.stringify((await readPlan(targetVersion)).maplibreHashes)) {
+  const target = targetVersion && await readPlan(targetVersion);
+  if (target && JSON.stringify(maplibreHashes) !== JSON.stringify(target.maplibreHashes)) {
     throw new CliError('INVALID_CONFIG', 2, 'The archived MapLibre style or resources no longer match the selected version.');
+  }
+  if (target && Object.keys(config.dggsSources ?? {}).some((id) => Object.hasOwn(fileHashes ?? {}, id) &&
+      fileHashes?.[id] !== target.vectorHashes?.[id])) {
+    throw new CliError('INVALID_CONFIG', 2, 'The archived DGGS snapshot no longer matches the selected version.');
   }
   const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash, vectorHashes: fileHashes, edit,
     maplibreHashes };

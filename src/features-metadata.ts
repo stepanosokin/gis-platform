@@ -2,7 +2,7 @@ import type { Express, Request, Response } from 'express';
 import { readFile } from 'node:fs/promises';
 import { stringify } from 'yaml';
 import { page } from './account-pages.js';
-import type { Publication } from './config.js';
+import { dggsRoot, type Publication } from './config.js';
 import { publicationAccess, type PublicationReader } from './publication-access.js';
 import { probeHealth, type HealthEndpoint } from './publication-health.js';
 
@@ -32,6 +32,7 @@ interface OpenApiOperation {
 }
 
 interface OpenApi {
+  openapi?: string;
   paths: Record<string, { get?: OpenApiOperation; post?: OpenApiOperation }>;
   tags?: { name: string }[];
   info?: { title: string };
@@ -129,6 +130,17 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
   readReader: (req: Request, res: Response) => Promise<PublicationReader | null>, root: string, metadata?: ManagedMetadata) {
   const publications = new Map(Object.entries(modes));
   const title = metadata?.api.info?.title ?? 'Features';
+  if (root === dggsRoot && metadata?.api.openapi?.startsWith('3.1.')) app.get(root, (_req, res) => {
+    res.json({
+      title,
+      links: [
+        { rel: 'self', href: metadata.url, type: mediaTypes.json },
+        { rel: 'data', href: `${metadata.url}/collections`, type: mediaTypes.json },
+        { rel: 'service-desc', href: `${metadata.url}/openapi`, type: 'application/vnd.oai.openapi+json;version=3.1' },
+        { rel: 'service-doc', href: `${metadata.url}/docs`, type: mediaTypes.html },
+      ],
+    });
+  });
   const conformsTo = metadata?.conformsTo;
   if (conformsTo) app.get(`${root}/conformance`, (req, res) => {
     const representation = requestedFormat(req, ['json', 'html']);
@@ -195,6 +207,6 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
       return res.send(page(`${title} OpenAPI`, `<p><a href="${root}/openapi?f=json">OpenAPI JSON</a></p>` +
         `<pre>${escapeHtml(JSON.stringify(api, null, 2))}</pre>`));
     }
-    res.type('application/vnd.oai.openapi+json;version=3.0').json(api);
+    res.type(`application/vnd.oai.openapi+json;version=${api.openapi?.startsWith('3.1.') ? '3.1' : '3.0'}`).json(api);
   });
 }

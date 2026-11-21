@@ -127,6 +127,21 @@
           },
           {
             "type": "object",
+            "required": ["type", "path", "id_field", "resolution", "properties"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "const": "parquet" },
+              "path": { "type": "string", "minLength": 1 },
+              "id_field": { "$ref": "#/$defs/dggsColumn" },
+              "resolution": { "type": "integer", "minimum": 0, "maximum": 15 },
+              "properties": {
+                "type": "array", "minItems": 1, "uniqueItems": true,
+                "items": { "$ref": "#/$defs/dggsColumn" }
+              }
+            }
+          },
+          {
+            "type": "object",
             "required": ["type", "path"],
             "additionalProperties": false,
             "properties": {
@@ -168,7 +183,7 @@
         "required": ["type"],
         "additionalProperties": false,
         "properties": {
-          "type": { "enum": ["pygeoapi", "martin"] },
+          "type": { "enum": ["pygeoapi", "martin", "pydggsapi"] },
           "postgis": {
             "type": "object",
             "required": ["host", "database", "user", "password_file"],
@@ -188,7 +203,7 @@
             "required": ["protocol", "scheme", "port", "base_path", "public_root", "links", "readiness"],
             "additionalProperties": false,
             "properties": {
-              "protocol": { "enum": ["features", "maps", "mvt", "tiles"] },
+              "protocol": { "enum": ["features", "maps", "mvt", "tiles", "dggs"] },
               "scheme": { "const": "http" },
               "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
               "base_path": { "type": "string", "pattern": "^/(?:[a-z][a-z0-9-]*(?:/[a-z][a-z0-9-]*)*)?$" },
@@ -223,7 +238,7 @@
         "properties": {
           "source": { "$ref": "#/$defs/id" },
           "provider": { "$ref": "#/$defs/id" },
-          "protocol": { "enum": ["features", "maps", "mvt", "tiles"] },
+          "protocol": { "enum": ["features", "maps", "mvt", "tiles", "dggs"] },
           "tile_provider": { "$ref": "#/$defs/id" },
           "access": { "enum": ["public", "registered", "private"] },
           "title": { "type": "string", "minLength": 1 },
@@ -277,6 +292,7 @@
   },
   "$defs": {
     "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
+    "dggsColumn": { "type": "string", "pattern": "^[a-z_][a-z0-9_]{0,62}$" },
     "sqlIdentifier": { "type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[^\\u0000-\\u001F\\u007F]+$" }
   }
 }

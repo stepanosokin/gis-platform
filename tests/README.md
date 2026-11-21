@@ -18,6 +18,7 @@ npm test
 | Экземпляры сервис-провайдеров через CLI, Caddy и Compose | `npm test -- --providers` |
 | Динамические публикации внешнего PostGIS через CLI и Caddy | `npm test -- --postgis` |
 | Ячейки H3 из одного представления PostGIS через Features и Martin | `npm test -- --h3` |
+| Ячейки H3 из Parquet через DGGS и шлюз | `npm test -- --dggs` |
 | Файловые источники Features и CRS через CLI и Caddy | `npm test -- --features-files` |
 | Растровые публикации Maps через CLI и Caddy | `npm test -- --maps` |
 | Динамические тайлы MVT и TileJSON через Martin, CLI и Caddy | `npm test -- --mvt` |
@@ -29,7 +30,7 @@ npm test
 | Один сценарий закрытых публикаций | `npm test -- --private 'personal grants'` |
 | Обнаружение закрытого слоя в открытом QGIS через QGIS MCP | `npm test -- --qgis` |
 
-Последний аргумент после `--access`, `--private`, `--versions`, `--providers`, `--h3`, `--features-files`, `--maps`, `--mvt`, `--raster-tiles` или `--tiles` задаёт фильтр Node.js по имени теста. Путь к результатам указан в строке `Results:`. Раннер сохраняет вывод каждой команды после её завершения.
+Последний аргумент после `--access`, `--private`, `--versions`, `--providers`, `--h3`, `--dggs`, `--features-files`, `--maps`, `--mvt`, `--raster-tiles` или `--tiles` задаёт фильтр Node.js по имени теста. Путь к результатам указан в строке `Results:`. Раннер сохраняет вывод каждой команды после её завершения.
 
 При разборе нестабильного теста повторите сценарий отдельно. Разные временные проекты Compose используют общий `dist/` рабочей копии и общий тег тестового образа Docker. Отдельный прогон исключает пересборку этих файлов и образа другим прогоном.
 
@@ -66,9 +67,11 @@ npm test
 
 Тест загружает готовые контуры в отдельный PostGIS и выдаёт роли только чтение представления. Чтобы воспроизвести координаты контуров, выполните [запрос](h3-boundaries.sql) в отдельной тестовой БД с `h3_postgis`. Контрольные границы получены на `h3_postgis` 4.2.3 и PostGIS 3.6.4. В полном прогоне используются готовые контуры, поэтому для него достаточно обычного образа PostGIS.
 
-## Проверка кандидата pydggsapi для H3 из Parquet
+## Ячейки H3 из Parquet
 
-Для [#30](https://github.com/stepanosokin/gis-platform/issues/30) выбран полный уровень. Проверка запускается отдельно от `npm test` в контейнере Linux amd64 с pydggsapi 0.4.0. Два снимка Parquet подключаются только для чтения. Геометрия сверяется с WKB границ H3. Первый запуск DuckDB внутри контейнера загружает расширение `httpfs`.
+Для [#30](https://github.com/stepanosokin/gis-platform/issues/30) выбран полный уровень. `npm test -- --dggs` создаёт снимки в `test_results/`, применяет YAML во временном Compose и запрашивает данные и геометрию через Caddy по HTTPS. Тест проверяет точные показатели `BIGINT` в безопасном диапазоне целых JSON, три режима доступа, ссылки, Swagger и OpenAPI, отклонение дублированного ID и неподдерживаемого `INTEGER`, замену снимка и откат через CLI. Запускайте сценарий целиком. Вложенные проверки используют один стек последовательно. Результат записывается в `test-dggs.log`.
+
+Нативная проверка точности за пределами безопасного диапазона запускается отдельно в контейнере Linux amd64 с pydggsapi 0.4.0. Снимки Parquet подключаются только для чтения. Геометрия сверяется с WKB границ H3. Первый запуск DuckDB внутри контейнера загружает расширение `httpfs`.
 
 Команды PowerShell из корня репозитория.
 
@@ -81,7 +84,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Не созданы снимки Parquet' }
 docker run --rm --platform linux/amd64 --mount "type=bind,src=$script,dst=/probe.py,readonly" --mount "type=bind,src=$results,dst=/fixture,readonly" $image python /probe.py check
 ```
 
-Запрос `GET /dggs-api/collections/sparse/dggs/h3/zones/871ea541affffff/data?zone-depth=0` с `Accept: */*` возвращает HTTP 200 и число `9007199254740992` в `values["sparse.tally"][0].data[0]`. Parquet содержит `BIGINT` со значением `9007199254740993`. В pydggsapi 0.4.0 целые показатели проходят через тип с плавающей точкой. Ожидаемый результат команды `check` на этом образе — код выхода 1 и ошибка утверждения с двумя указанными числами. Включение профиля отложено. Приёмка прав и ссылок через шлюз и замены снимка через CLI остаётся открытой. [Условие включения #12](https://github.com/stepanosokin/gis-platform/issues/12#issuecomment-7013342379) · [Преобразование показателей в pydggsapi 0.4.0](https://github.com/LandscapeGeoinformatics/pydggsapi/blob/v0.4.0/pydggsapi/models/ogc_dggs/data_retrieval.py)
+Запрос `GET /dggs-api/collections/sparse/dggs/h3/zones/871ea541affffff/data?zone-depth=0` с `Accept: */*` возвращает HTTP 200 и число `9007199254740992` в `values["sparse.tally"][0].data[0]`. Parquet содержит `BIGINT` со значением `9007199254740993`. В pydggsapi 0.4.0 целые показатели проходят через тип с плавающей точкой. Ожидаемый результат команды `check` на этом образе — код выхода 1 и ошибка утверждения с двумя указанными числами. Это согласованное ограничение профиля за пределами безопасного диапазона JSON. [Воспроизведение #30](https://github.com/stepanosokin/gis-platform/issues/30#issuecomment-7059798430) · [Преобразование показателей в pydggsapi 0.4.0](https://github.com/LandscapeGeoinformatics/pydggsapi/blob/v0.4.0/pydggsapi/models/ogc_dggs/data_retrieval.py)
 
 Для H3 уровня 7 запросы `f=geojson&geometry=zone-region&zone-level=7&compact-zones=false` дали следующие результаты. Полнота подтверждена для указанных окон и лимитов.
 
@@ -92,6 +95,8 @@ docker run --rm --platform linux/amd64 --mount "type=bind,src=$script,dst=/probe
 | `11.8,45.0,12.9,45.9` | `10000` | 1 732 / 1 732 | 63 / 63 |
 
 В GeoJSON лимит отсекает геометрии кандидатов до отбора строк снимка. Даже короткий список ячеек может быть неполным. Для более широкого окна согласованный профиль предусматривает деление bbox. [Формирование списка зон в pydggsapi 0.4.0](https://github.com/LandscapeGeoinformatics/pydggsapi/blob/v0.4.0/pydggsapi/models/ogc_dggs/zone_query.py)
+
+На том же образе `INTEGER` со значением `16777217` дал `16777216` при чтении с глубиной 0. CLI отклоняет `INTEGER` и принимает целочисленные показатели в формате `BIGINT`.
 
 При ручной диагностике проверьте готовность API по `/dggs-api/collections` и отправляйте `Accept: */*` в запросах к зонам. Без заголовка эти маршруты могут вернуть HTTP 406. При ошибке `Read-only file system` для TinyDB используйте временную копию JSON-конфигурации с правом записи. Снимки Parquet подключайте только для чтения.
 

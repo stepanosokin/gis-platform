@@ -32,7 +32,7 @@ def boundary(cell):
     return Polygon([(lon, lat) for lat, lon in h3.cell_to_boundary(cell)])
 
 
-def fixtures():
+def fixtures(safe_integers):
     # Enumerate cells using a neighbor disk. Use polygon intersection as the
     # oracle for the bbox endpoint, which uses H3's overlap polyfill.
     center = h3.latlng_to_cell(45.45, 12.35, LEVEL)
@@ -54,14 +54,15 @@ def fixtures():
 
     collections = {}
     sources = {}
-    oracle = {"zero": zero, "null": null, "missing": missing, "positive": positive, "cells": {}}
+    oracle = {"zero": zero, "null": null, "missing": missing, "positive": positive, "cells": {}, "small": {}}
+    tally = EXACT_BIGINT - 2 if safe_integers else EXACT_BIGINT
     with duckdb.connect() as db:
         db.execute("CREATE TABLE snapshot (h3_id VARCHAR PRIMARY KEY, tally BIGINT, metric DOUBLE)")
         for name, polygons in (("dense", dense), ("sparse", sparse)):
             rows = [
                 (cell, 0, 0.0) if cell == zero else
                 (cell, None, None) if cell == null else
-                (cell, EXACT_BIGINT, 4.25) if cell == positive else
+                (cell, tally, 4.25) if cell == positive else
                 (cell, 5, 4.25)
                 for cell in polygons
             ]
@@ -77,6 +78,23 @@ def fixtures():
             oracle["cells"][name] = {
                 cell: polygon.wkb_hex for cell, polygon in polygons.items()
             }
+            oracle["small"][name] = sorted(set(small).intersection(polygons))
+            if safe_integers and name == "sparse":
+                db.execute("UPDATE snapshot SET tally = 9, metric = 3.5 WHERE h3_id = ?", [zero])
+                db.execute("COPY snapshot TO ? (FORMAT PARQUET)", [str(FIXTURE / "sparse-v2.parquet")])
+                db.execute(
+                    "COPY (SELECT * FROM snapshot UNION ALL SELECT * FROM snapshot) TO ? (FORMAT PARQUET)",
+                    [str(FIXTURE / "sparse-duplicate.parquet")],
+                )
+                db.execute(
+                    "COPY (SELECT h3_id, CAST(CASE WHEN tally > 2147483647 THEN 16777217 ELSE tally END AS INTEGER) "
+                    "AS tally, metric FROM snapshot) TO ? (FORMAT PARQUET)",
+                    [str(FIXTURE / "sparse-int32.parquet")],
+                )
+                db.execute(
+                    'COPY (SELECT h3_id, tally AS "select", metric FROM snapshot) TO ? (FORMAT PARQUET)',
+                    [str(FIXTURE / "sparse-reserved-column.parquet")],
+                )
             collections[str(len(collections) + 1)] = {name: {
                 "title": f"{name.title()} H3 fixture",
                 "description": "H3 resolution 7 near Venice",
@@ -254,7 +272,9 @@ def check_server(config):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["fixtures", "check"])
-    if parser.parse_args().action == "fixtures":
-        fixtures()
+    parser.add_argument("--safe-integers", action="store_true")
+    arguments = parser.parse_args()
+    if arguments.action == "fixtures":
+        fixtures(arguments.safe_integers)
     else:
         raise SystemExit(0 if check() else 1)

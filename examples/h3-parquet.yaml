@@ -1,0 +1,33 @@
+schema_version: 1
+server:
+  host: localhost
+  port: 8080
+sources:
+  measurements:
+    type: parquet
+    path: ../data/h3-v1.parquet
+    id_field: h3_id
+    resolution: 7
+    properties: [tally, metric]
+providers:
+  grids:
+    type: pydggsapi
+    image: ghcr.io/landscapegeoinformatics/pydggsapi:0.4.0
+    digest: sha256:2c2b1683a474243639d59849679e32a434ab5581a7e54ce02879213bf509ea63
+    api:
+      protocol: dggs
+      scheme: http
+      port: 8000
+      base_path: /dggs
+      public_root: /dggs
+      links: canonical
+      readiness: /conformance
+publications:
+  h3-measurements:
+    source: measurements
+    provider: grids
+    protocol: dggs
+    access: public
+    title: H3 measurements
+    description: Measurements by H3 cell near Venice
+    extent: [11.8, 45.0, 12.9, 45.9]

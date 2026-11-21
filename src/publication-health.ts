@@ -5,6 +5,7 @@ export interface HealthEndpoint {
   port: number;
   path: string;
   martin: boolean;
+  python?: string;
 }
 
 export interface PublicationHealth {
@@ -27,6 +28,7 @@ export function publicationHealth(config: FeaturesConfig, id: string, publicatio
       port: api?.port ?? 80,
       path: (base && base !== '/' ? base : '') + path,
       martin: provider?.type === 'martin',
+      ...(provider?.type === 'pydggsapi' && { python: 'python' }),
     };
   }
   const rendererId = publication.tile_provider;
@@ -37,9 +39,11 @@ export function publicationHealth(config: FeaturesConfig, id: string, publicatio
     maps: `${collection}/map?f=png&width=32&height=32&bbox=${publication.extent.join(',')}`,
     mvt: dynamic ? martinTile(id, publication.extent) : `/${id}`,
     tiles: martinTile(id, publication.extent),
+    dggs: `${collection}/schema`,
   }[publication.protocol];
   return {
-    instance: endpoint(publication.provider, publication.protocol === 'mvt' ? '/health' : '/openapi?f=json'),
+    instance: endpoint(publication.provider, publication.protocol === 'mvt' ? '/health' :
+      publication.protocol === 'dggs' ? '/conformance' : '/openapi?f=json'),
     ...(rendererId && { renderer: endpoint(rendererId, '/health') }),
     source: endpoint(rendererId ?? publication.provider, sourcePath),
   };

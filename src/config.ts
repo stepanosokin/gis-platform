@@ -8,7 +8,7 @@ import type { AdminPermission } from './admin-command.js';
 export interface Publication {
   source: string;
   provider: string;
-  protocol: 'features' | 'maps' | 'mvt' | 'tiles';
+  protocol: 'features' | 'maps' | 'mvt' | 'tiles' | 'dggs';
   tile_provider?: string;
   access: 'public' | 'registered' | 'private';
   title: string;
@@ -26,7 +26,7 @@ interface ProviderConnection {
 }
 
 export interface ManagedProvider extends ProviderConnection {
-  type: 'pygeoapi' | 'martin';
+  type: 'pygeoapi' | 'martin' | 'pydggsapi';
   image: string;
   digest?: string;
   api: {
@@ -58,7 +58,8 @@ export type VectorFileSource =
   { path: string; id_field: string };
 export type RasterFileSource = { type: 'geotiff' | 'cog'; path: string; epsg?: number };
 export type TileArchiveSource = { type: 'mbtiles' | 'pmtiles'; path: string };
-export type FileSource = VectorFileSource | RasterFileSource | TileArchiveSource;
+export type DggsSource = { type: 'parquet'; path: string; id_field: string; resolution: number; properties: string[] };
+export type FileSource = VectorFileSource | RasterFileSource | TileArchiveSource | DggsSource;
 type Source = { type: 'geojson'; path: string } | FileSource | PostgisSource;
 
 interface PlatformConfig {
@@ -108,6 +109,7 @@ export type FeaturesConfig = {
   vectorFiles?: Record<string, VectorFileSource>;
   rasterFiles?: Record<string, RasterFileSource>;
   tileArchives?: Record<string, TileArchiveSource>;
+  dggsSources?: Record<string, DggsSource>;
   postgisSources?: Record<string, PostgisSource>;
   providers?: Record<string, Provider>;
   auth?: AuthConfig;
@@ -151,7 +153,8 @@ export function tileArchive(config: FeaturesConfig, id: string) {
 }
 
 export function fileSource(config: FeaturesConfig, id: string) {
-  return vectorFile(config, id) ?? rasterFile(config, id) ?? tileArchive(config, id);
+  return vectorFile(config, id) ?? rasterFile(config, id) ?? tileArchive(config, id) ??
+    (config.dggsSources && Object.hasOwn(config.dggsSources, id) ? config.dggsSources[id] : undefined);
 }
 
 export const crs84 = 'http://www.opengis.net/def/crs/OGC/1.3/CRS84';
@@ -188,7 +191,7 @@ export function usedFileSources(config: FeaturesConfig, provider?: string) {
 
 export function needsMetadataService(config: FeaturesConfig) {
   return config.providers !== undefined &&
-    (Object.keys(config.providers).length === 0 || Object.values(config.providers).some((provider) => provider.type === 'pygeoapi')) &&
+    (Object.keys(config.providers).length === 0 || Object.values(config.providers).some((provider) => provider.type !== 'martin')) &&
     (!config.auth || publicationEntries(config).some(([, publication]) => publication.protocol === 'maps') ||
       publicationEntries(config).every(([, publication]) => publication.access === 'public'));
 }
@@ -228,6 +231,10 @@ export function pinnedImage(provider: ManagedProvider) {
   return `${repository}@${provider.digest}`;
 }
 
+const pydggsapiRepository = 'ghcr.io/landscapegeoinformatics/pydggsapi';
+const pydggsapiDigest = 'sha256:2c2b1683a474243639d59849679e32a434ab5581a7e54ce02879213bf509ea63';
+export const dggsRoot = '/dggs';
+
 export function serializeFeaturesConfig(config: FeaturesConfig) {
   const geojsonSourceId = config.geojsonSourceId ??
     (config.publicationId === null ? config.sourceId : config.publication.source);
@@ -240,6 +247,7 @@ export function serializeFeaturesConfig(config: FeaturesConfig) {
       ...config.vectorFiles,
       ...config.rasterFiles,
       ...config.tileArchives,
+      ...config.dggsSources,
     },
     providers: config.providers ?? { [builtInProviderId(config)!]: { type: 'pygeoapi' } },
     publications: Object.fromEntries(publicationEntries(config)),
@@ -301,6 +309,13 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     if (extname(source.path).toLowerCase() !== extension) throw new Error(`Source '${id}' requires a ${extension} file.`);
     source.path = resolve(directory, source.path);
   }
+  const dggsSources = sources.filter((entry): entry is [string, DggsSource] => entry[1].type === 'parquet');
+  for (const [id, source] of dggsSources) {
+    if (extname(source.path).toLowerCase() !== '.parquet' || source.properties.includes(source.id_field)) {
+      throw new Error(`Source '${id}' requires a .parquet snapshot and properties distinct from the H3 ID field.`);
+    }
+    source.path = resolve(directory, source.path);
+  }
   if (providers.filter(([, provider]) => !provider.image).length > 1) {
     throw new Error('Only one provider can use the built-in image. Configure an image and API for each additional instance.');
   }
@@ -313,12 +328,15 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     if (provider.type === 'martin' && !provider.image) {
       throw new Error(`Martin provider '${id}' requires an image and API.`);
     }
+    if (provider.type === 'pydggsapi' && !provider.image) {
+      throw new Error(`pydggsapi provider '${id}' requires an image and API.`);
+    }
     if (!provider.image && !Object.hasOwn(provider, 'image')) {
       roots.add('/features');
       continue;
     }
     if (!provider.image || id.length > 54) throw new Error(`Invalid managed provider '${id}'.`);
-    const { digest } = imageReference(provider.image);
+    const { repository, digest } = imageReference(provider.image);
     if (digest && provider.digest && digest !== provider.digest) throw new Error(`Provider '${id}' has conflicting digests.`);
     const { public_root: root } = provider.api;
     if (provider.type === 'martin') {
@@ -334,6 +352,20 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     }
     if (provider.api.protocol === 'tiles' && (root !== '/tiles' || provider.postgis)) {
       throw new Error(`Tiles provider '${id}' requires public_root /tiles and a separate Martin instance for PostGIS.`);
+    }
+    if (provider.type === 'pydggsapi') {
+      const { protocol, base_path: base, readiness } = provider.api;
+      if (protocol !== 'dggs' || root !== dggsRoot || base !== root || readiness !== '/conformance' ||
+          provider.postgis || provider.environment || provider.volumes) {
+        throw new Error(`pydggsapi provider '${id}' requires protocol dggs, base_path and public_root /dggs, and readiness /conformance.`);
+      }
+      if (repository !== pydggsapiRepository || (digest ?? provider.digest ?? pydggsapiDigest) !== pydggsapiDigest ||
+          (provider.image !== `${repository}:0.4.0` && provider.image !== `${repository}@${pydggsapiDigest}`)) {
+        throw new Error(`Provider '${id}' requires the accepted pydggsapi 0.4.0 image.`);
+      }
+      provider.digest ??= pydggsapiDigest;
+    } else if (provider.api.protocol === 'dggs') {
+      throw new Error(`Provider '${id}': protocol dggs requires pydggsapi.`);
     }
     if (['/account', '/api', '/internal'].some((reserved) => root === reserved || root.startsWith(reserved + '/'))) {
       throw new Error(`Provider '${id}' uses a reserved public root.`);
@@ -357,7 +389,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Ambiguous public root '${root}'.`);
     }
   }
-  for (const root of ['/maps', '/tiles']) {
+  for (const root of ['/maps', '/tiles', dggsRoot]) {
     const protocols = new Set(providers.flatMap(([, provider]) =>
       provider.image && provider.api.public_root === root ? [provider.api.protocol] : []));
     if (protocols.size > 1) throw new Error(`Providers at '${root}' must use the same protocol.`);
@@ -392,6 +424,10 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Publication '${id}' uses a protocol unsupported by provider '${provider}'.`);
     }
     const sourceConfig = config.sources[source]!;
+    if ((protocol === 'dggs') !== (sourceConfig.type === 'parquet') ||
+        (protocol === 'dggs' && (publication.crs || time_field || freshness))) {
+      throw new Error(`Publication '${id}': DGGS requires a Parquet H3 snapshot without CRS, time or freshness overrides.`);
+    }
     const archive = sourceConfig.type === 'mbtiles' || sourceConfig.type === 'pmtiles';
     const renderer: string | undefined = protocol === 'tiles' ? publication.tile_provider : provider;
     if (protocol === 'tiles') {
@@ -473,6 +509,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       auth.smtp.password_file = resolve(directory, auth.smtp.password_file);
     }
   }
+  const fileSources = postgisSources.length || vectorFiles.length || rasterFiles.length || tileArchives.length || dggsSources.length;
   return {
     port,
     publicUrl: new URL('/features', `${tls ? 'https' : 'http'}://${host}:${port}`).href,
@@ -481,8 +518,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     ...(vectorFiles.length && { vectorFiles: Object.fromEntries(vectorFiles) }),
     ...(rasterFiles.length && { rasterFiles: Object.fromEntries(rasterFiles) }),
     ...(tileArchives.length && { tileArchives: Object.fromEntries(tileArchives) }),
-    ...((postgisSources.length || vectorFiles.length || rasterFiles.length || tileArchives.length) && geojson && { geojsonSourceId: geojson[0] }),
-    ...(postgisSources.length || vectorFiles.length || rasterFiles.length || tileArchives.length || entries.some(([, pub]) => pub.crs) ||
+    ...(dggsSources.length && { dggsSources: Object.fromEntries(dggsSources) }),
+    ...(fileSources && geojson && { geojsonSourceId: geojson[0] }),
+    ...(fileSources || entries.some(([, pub]) => pub.crs) ||
       providers.length !== 1 || providers.some(([, provider]) => provider.image || provider.postgis)
       ? { providers: config.providers } : {}),
     ...(first ? { publicationId: first[0], publication: first[1],
