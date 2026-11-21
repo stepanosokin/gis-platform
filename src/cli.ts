@@ -7,6 +7,7 @@ import type { ApplyReply } from './apply-worker.js';
 import { CliError } from './cli-result.js';
 import { runAdminCommand } from './admin-client.js';
 import { planProviderCommand } from './provider-command.js';
+import { mapLibreFiles } from './maplibre-style.js';
 
 const arguments_ = process.argv.slice(2);
 const json = arguments_.includes('--json');
@@ -82,6 +83,9 @@ async function planFile(command: string, filename: string) {
     throw new CliError('INVALID_CONFIG', 2, error instanceof Error ? error.message : String(error));
   });
   if (command === 'plan') return createPlan(config, yaml);
+  await mapLibreFiles(config).catch((error: Error) => {
+    throw new CliError('INVALID_CONFIG', 2, error.message);
+  });
   const publicationIds = publicationEntries(config).map(([id]) => id);
   success('OK', { publicationId: config.publicationId, publicationIds }, `Valid configuration: ${publicationIds.join(', ') || 'no publications'}`);
 }

@@ -15,6 +15,7 @@ import { parse, stringify } from 'yaml';
 import { mapBboxDescription, mapRelation, mapSize } from './maps-profile.js';
 import { checkTileJson, martinConfig, martinService, runMartin, tileArchivePath } from './martin-profile.js';
 import { matrixSet, tilesRoutes, tilesRelation, tilesSource, vectorTileType } from './tiles-profile.js';
+import { mapLibreAssetRoute } from './maplibre-style.js';
 import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataService, pinnedImage, postgisSource, providerRoot, publicationEntries, publicationsForProvider, publicationUrl,
   crs84, rasterFile, tileArchive, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
 
@@ -152,10 +153,13 @@ function caddyConfig(config: FeaturesConfig) {
   const mvtIds = publications.filter(([, publication]) => publication.protocol === 'mvt').map(([id]) => id);
   const allCollections = ogcIds.length ? collectionRoute(ogcIds) : '';
   const allTiles = mvtIds.length ? `/mvt/${collectionRoute(mvtIds, 'mvt')}` : '';
+  const styledIds = publications.filter(([, publication]) => publication.maplibre).map(([id]) => id);
+  const mapLibreAssets = styledIds.length ? `/mvt/(${styledIds.join('|')})/${mapLibreAssetRoute}` : '';
+  const mapRoutes = [allTiles, mapLibreAssets].filter(Boolean).join('|');
   const roots = config.providers ? [...new Set(Object.keys(config.providers).map((id) => providerRoot(config, id)))] : ['/features'];
   const rootPattern = roots.length ? `(?:${roots.join('|')})` : '/features';
   const loggedRoutes = `${rootPattern}/(${['openapi', 'collections', ...(allCollections ? [allCollections] : [])].join('|')})`;
-  const logged = [loggedRoutes, allTiles].filter(Boolean).join('|');
+  const logged = [loggedRoutes, mapRoutes].filter(Boolean).join('|');
   const journal = `
 	log
 	@loggedFeatures path_regexp ^(?:${logged})$
@@ -166,6 +170,8 @@ function caddyConfig(config: FeaturesConfig) {
 	log_append @loggedPublication publicationId {http.regexp.loggedPublication.1}` : ''}
 	${allTiles ? `@loggedMvt path_regexp loggedMvt ^${allTiles}$
 	log_append @loggedMvt publicationId {http.regexp.loggedMvt.1}` : ''}
+  ${mapLibreAssets ? `@loggedMapLibre path_regexp loggedMapLibre ^${mapLibreAssets}$
+	log_append @loggedMapLibre publicationId {http.regexp.loggedMapLibre.1}` : ''}
 	header @loggedFeatures >X-Request-Id {http.request.uuid}
 `;
   const publicRoutes = ['conformance', 'static/.+'];
@@ -308,17 +314,17 @@ function serviceName(config: FeaturesConfig, id: string) {
   return config.providers?.[id]?.image ? `provider-${id}` : 'pygeoapi';
 }
 
-function corsRoutes(name: string, path: string, origins: string[] | undefined) {
-  if (!origins?.length) return '';
-  const allowed = `header_regexp Origin ^(?:${origins.map((value) => value.replaceAll('.', '\\.')).join('|')})$`;
+function corsRoutes(name: string, path: string, origins: string[]) {
+  const allowed = `header_regexp Origin ^(?:${origins.map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})$`;
   return `
+	@${name}Path ${path}
+	header @${name}Path +Vary Origin
 	@${name} {
 		${path}
 		${allowed}
 	}
 	header @${name} {
 		Access-Control-Allow-Origin {http.request.header.Origin}
-		+Vary Origin
 	}
 	@${name}Preflight {
 		${path}
@@ -335,11 +341,25 @@ function corsRoutes(name: string, path: string, origins: string[] | undefined) {
 `;
 }
 
+function mapLibreFileServer(recover = false) {
+  // Caddy preserves the proxy failure status in an error route. Serve the whole public file there.
+  const recoveryHeaders = ['Range', 'If-Match', 'If-None-Match', 'If-Modified-Since', 'If-Unmodified-Since'];
+  const fullResponse = recover ? recoveryHeaders.map((header) => `request_header -${header}\n\t\t\t`).join('') : '';
+  return `${fullResponse}header X-Content-Type-Options nosniff
+			header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+			file_server {
+				root /etc/caddy/gis/maplibre
+				pass_thru${recover ? '\n\t\t\t\tstatus 200' : ''}
+			}
+			respond 404`;
+}
+
 function managedGatewayRoutes(config: FeaturesConfig,
   collectionRoute: (ids: string[], protocol?: Publication['protocol']) => string, htmlPolicy: string) {
   const routes: string[] = [];
   const fallback: string[] = [];
   const publications = publicationEntries(config);
+  const origins = [...new Set([new URL(config.publicUrl).origin, ...config.cors?.allowed_origins ?? []])];
   const metadataFallback = config.auth && publications.every(([, publication]) => publication.access === 'public');
   const byRoot = new Map<string, string[]>();
   for (const id of Object.keys(config.providers ?? {})) {
@@ -358,10 +378,10 @@ function managedGatewayRoutes(config: FeaturesConfig,
     const rootProvider = (tiles && entries[0]?.[1].provider) || ids[0];
     const metadata = config.auth ? 'access' : 'metadata';
     const managedConformance = entries.some(([, publication]) => vectorFile(config, publication.source));
-    if (tiles && config.cors?.allowed_origins.length) {
+    if (tiles) {
       const paths = ['/?', '/collections', '/openapi', '/conformance', '/[Tt]ileMatrixSets(/[^/]+)?'];
       if (entries.length) paths.push('/' + collectionRoute(entries.map(([id]) => id), 'tiles'));
-      routes.push(corsRoutes(`cors${rootIndex}`, `path_regexp ^${root}(${paths.join('|')})$`, config.cors.allowed_origins));
+      routes.push(corsRoutes(`cors${rootIndex}`, `path_regexp ^${root}(${paths.join('|')})$`, origins));
     }
     if (!mvt) routes.push(`
 	@metadata${rootIndex} {
@@ -377,6 +397,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
 	}
 `);
     for (const id of ids) {
+      const providerEntries = entries.filter(([, entry]) => entry.provider === id);
       const instance = config.providers?.[id];
       const api = instance?.image ? instance.api : undefined;
       const maps = api?.protocol === 'maps';
@@ -437,16 +458,15 @@ function managedGatewayRoutes(config: FeaturesConfig,
 	}
 `);
       }
-      if (mvt && config.cors?.allowed_origins.length) {
-        const visible = entries.filter(([, entry]) => entry.provider === id).map(([key]) => key);
-        if (visible.length) {
-          const path = `path_regexp ^${root}/${collectionRoute(visible, 'mvt')}$`;
-          routes.push(corsRoutes(`cors${routes.length}`, path, config.cors.allowed_origins));
-        }
+      if (mvt && providerEntries.length) {
+        const paths = [collectionRoute(providerEntries.map(([key]) => key), 'mvt')];
+        const styled = providerEntries.filter(([, entry]) => entry.maplibre).map(([key]) => key);
+        if (styled.length) paths.push(`(?:${styled.join('|')})/${mapLibreAssetRoute}`);
+        routes.push(corsRoutes(`cors${routes.length}`, `path_regexp ^${root}/(?:${paths.join('|')})$`, origins));
       }
-      function addPublicationRoute(anonymous: boolean, postgis: boolean, match: (name: string) => string) {
+      function addPublicationRoute(anonymous: boolean, upstream: string, match: (name: string) => string,
+        recovery = upstream) {
         const name = `provider${routes.length}`;
-        const upstream = proxy(postgis);
         routes.push(`
 	@${name} {
 		${match(name)}
@@ -464,22 +484,26 @@ function managedGatewayRoutes(config: FeaturesConfig,
         if (config.auth && anonymous) fallback.push(`
 		@${name}Unavailable vars public_provider ${name}
 		handle @${name}Unavailable {
-			route {
-				${upstream}
+			route {${mvt ? '\n\t\t\t\theader >Cache-Control no-store' : ''}
+				${recovery}
 			}
 		}`);
       }
       for (const anonymous of [true, false]) {
         for (const postgis of [false, true]) {
-          const visible = entries.filter(([, entry]) => entry.provider === id && (entry.access === 'public') === anonymous &&
+          const visible = providerEntries.filter(([, entry]) => (entry.access === 'public') === anonymous &&
             Boolean(postgisSource(config, entry.source)) === postgis).map(([key]) => key);
           if (!visible.length) continue;
-          addPublicationRoute(anonymous, postgis, (name) => `method GET HEAD
+          addPublicationRoute(anonymous, proxy(postgis), (name) => `method GET HEAD
 		path_regexp ${name} ^${root}/${collectionRoute(visible, api?.protocol ?? 'features')}$`);
-          if (postgis && !mvt && !tiles) addPublicationRoute(anonymous, true, (name) => `method POST
+          if (postgis && !mvt && !tiles) addPublicationRoute(anonymous, proxy(true), (name) => `method POST
 		header_regexp Content-Type (?i)^application/json(?:\\s*;.*)?$
 		path_regexp ${name} ^${root}/collections/(${visible.join('|')})/items$`);
         }
+        const styled = providerEntries.filter(([, entry]) => entry.maplibre && (entry.access === 'public') === anonymous)
+          .map(([key]) => key);
+        if (styled.length) addPublicationRoute(anonymous, mapLibreFileServer(), (name) => `method GET HEAD
+		path_regexp ${name} ^${root}/(${styled.join('|')})/${mapLibreAssetRoute}$`, mapLibreFileServer(true));
       }
     }
   }

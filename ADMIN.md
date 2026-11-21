@@ -156,6 +156,45 @@ TileJSON доступен по `/mvt/observations`. Ссылки в докуме
 
 Для доступа к MVT с другого сайта добавьте его origin, например `http://localhost:5173`, в `cors.allowed_origins`. Токен для защищённой публикации передавайте через `transformRequest` MapLibre с заголовком `Authorization: Bearer <токен>`. Добавляйте заголовок только для запросов к URL этой публикации, включая TileJSON и связанные тайлы.
 
+#### Стиль и связанные ресурсы MapLibre
+
+Для публикации прямых веб-тайлов добавьте `maplibre` в запись публикации. Пути к локальным файлам считаются от каталога YAML. Ключи `resources` задают адреса файлов внутри публикации.
+Выберите ID публикации и имена ресурсов, допустимые в файловой системе Windows. Например, `con` и `nul` зарезервированы.
+
+```yaml
+cors:
+  allowed_origins: ['https://maps.example.org']
+publications:
+  observations:
+    # Остальные поля публикации из examples/mvt.yaml
+    maplibre:
+      style_file: observations-style.json
+      resources:
+        markers.json: markers.json
+        markers.png: markers.png
+        markers@2x.json: markers@2x.json
+        markers@2x.png: markers@2x.png
+        labels.geojson: labels.geojson
+        fonts/MapSans/0-255.pbf: fonts/MapSans/0-255.pbf
+```
+
+Стиль версии 8 открывается по `/mvt/observations/style.json`. В исходном стиле укажите `"url": "./"` для TileJSON этой публикации, `"sprite": "./resources/markers"` для атласа, `"data": "./resources/labels.geojson"` для связанного источника GeoJSON и `"glyphs": "./resources/fonts/{fontstack}/{range}.pbf"` для глифов. Для этого шрифта используйте `"text-font": ["MapSans"]`. Платформа преобразует ссылки в абсолютные URL шлюза при планировании. Добавьте в YAML оба файла каждого используемого разрешения атласа. Используйте латинские буквы, цифры, дефисы и подчёркивания в именах ресурсов. Для атласа допустим суффикс `@2x`, а для каталогов глифов — пробелы и запятые в имени стека шрифтов.
+
+```js
+const publication = 'https://gis.example.org/mvt/observations';
+const map = new maplibregl.Map({
+  container: 'map',
+  style: `${publication}/style.json`,
+  transformRequest: (url) => url === publication || url.startsWith(`${publication}/`)
+    ? { url, headers: { Authorization: `Bearer ${token}` } }
+    : { url },
+});
+```
+
+Origin платформы допускается по умолчанию. `cors.allowed_origins` добавляет явные origins сайтов с картами. Вход и управление учётной записью доступны на адресе платформы. Предварительный запрос `OPTIONS` получает пустой ответ, а каждый запрос стиля, тайла или ресурса проходит проверку актуальных прав. При отзыве права или токена шлюз закрывает доступ со следующего запроса.
+
+Команда `config plan` сохраняет стиль и ресурсы в план. После изменения файлов создайте и примените новый план. При откате шлюз выдаёт файлы выбранной версии.
+
 ### Векторные тайлы через OGC API — Tiles
 
 Скопируйте [пример YAML](examples/tiles.yaml), укажите источник PostGIS и его подключение в экземпляре Martin. Поле `provider` указывает отдельный экземпляр pygeoapi с корнем `/tiles`. Поле `tile_provider` указывает экземпляр Martin, который формирует MVT. pygeoapi получает тайлы по внутренней сети Compose через MVT-proxy. Для выдачи того же источника через прямой TileJSON настройте отдельную публикацию MVT со своим ID и правами.

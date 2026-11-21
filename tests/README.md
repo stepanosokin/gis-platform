@@ -142,6 +142,8 @@ tar -xf test_results/maplibre-6.19.0/maplibre-gl-6.19.0.tgz -C test_results/mapl
 
 Если `GIS_TEST_CHROME` не задан, отчёт помечает браузерные сценарии MVT и растровых архивов как пропущенные. Проверки CLI и HTTP выполняются.
 
+Для #27 выбран полный уровень. Прогон `npm test -- --mvt` также проверяет открытие стиля закрытой публикации по каноническому URL, загрузку TileJSON, MVT, атласа, глифов и GeoJSON в Chrome с Bearer-токеном. Результаты разрешённого и запрещённого origin сохраняются в `protected-maplibre.json` и `disallowed-maplibre.json`. HTTP-проверки сверяют пустые ответы OPTIONS, область действия CORS, отзыв токена и разрешения, а также применение и откат версии стиля через CLI.
+
 ## Растровые веб-тайлы из MBTiles и PMTiles
 
 Для #25 выбран полный уровень. Прогон `--raster-tiles` создаёт контрольные архивы в `test_results/` и проверяет CLI, публикации через Caddy и монтирование файлов только для чтения. Браузерная проверка использует `GIS_TEST_CHROME` и `GIS_TEST_MAPLIBRE_DIST` из раздела MVT. MapLibre GL JS запрашивает MBTiles анонимно и PMTiles с Bearer-токеном, затем сверяет RGBA контрольного изображения каждого архива. Результаты сохраняются в `raster-tiles-browser.json`.

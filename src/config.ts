@@ -16,6 +16,7 @@ export interface Publication {
   extent: [number, number, number, number];
   time_field?: string;
   mvt_properties?: string[];
+  maplibre?: { style_file: string; resources?: Record<string, string> };
   crs?: string[];
   freshness?: { max_delay_seconds: number };
 }
@@ -363,15 +364,23 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   }
 
   const entries = Object.entries(config.publications).map((
-    [id, { source, provider, protocol, access, title, description, extent, time_field, freshness, crs, mvt_properties, tile_provider }],
+    [id, { source, provider, protocol, access, title, description, extent, time_field, freshness, crs, mvt_properties, tile_provider, maplibre }],
   ): [string, Publication] => [id, {
     source, provider, protocol, access, title, description, extent,
     ...(time_field !== undefined && { time_field }), ...(freshness && { freshness }), ...(crs && { crs }),
     ...(mvt_properties && { mvt_properties }), ...(tile_provider && { tile_provider }),
+    ...(maplibre && { maplibre: {
+      style_file: resolve(directory, maplibre.style_file),
+      ...(maplibre.resources && { resources: Object.fromEntries(Object.entries(maplibre.resources)
+        .map(([path, file]) => [path, resolve(directory, file)])) }),
+    } }),
   }]);
   const sourceTypes = new Map<string, 'file' | 'postgis'>();
   for (const [id, publication] of entries) {
     const { source, provider, protocol, access, extent, time_field, freshness } = publication;
+    if (publication.maplibre && protocol !== 'mvt') {
+      throw new Error(`Publication '${id}': maplibre is only supported for direct web tiles.`);
+    }
     if (!Object.hasOwn(config.sources, source)) {
       throw new Error(`Publication '${id}' references unknown source '${source}'.`);
     }

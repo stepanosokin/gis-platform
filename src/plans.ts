@@ -10,6 +10,7 @@ import { archiveLegacyOpenApi, closeGateway, compose, featuresStackRunning, open
   publicationGrantRemoval, resolveComposeProject, savedSourceFingerprint, savedFileFingerprints, sourceFingerprint,
   startFeaturesStack, fileFingerprints, FeaturesPreflightError } from './features-stack.js';
 import { CliError } from './cli-result.js';
+import { mapLibreFiles, mapLibreHashes, writeMapLibreFiles } from './maplibre-style.js';
 
 interface Plan {
   planId: string;
@@ -21,6 +22,7 @@ interface Plan {
   sourceHash?: string | null;
   // Keep the persisted field name for plans created before raster file support.
   vectorHashes?: Record<string, string | null>;
+  maplibreHashes?: Record<string, string>;
   edit?: { filename: string; before: string };
 }
 
@@ -164,8 +166,8 @@ function digest(value: string) {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function fingerprint({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, vectorHashes, edit }: Omit<Plan, 'planId'>) {
-  return `plan-${digest(JSON.stringify({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, vectorHashes, edit }))}`;
+function fingerprint({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, vectorHashes, edit, maplibreHashes }: Omit<Plan, 'planId'>) {
+  return `plan-${digest(JSON.stringify({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, vectorHashes, edit, maplibreHashes }))}`;
 }
 
 export async function createPlan(config: FeaturesConfig, yaml?: string,
@@ -193,13 +195,23 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   const fileHashes = config.vectorFiles || config.rasterFiles || config.tileArchives ? await fileFingerprints(config) : undefined;
   const changedFiles = await fileContentChanges(fileHashes, baseVersion);
   const edit = editFile && { filename: editFile.filename, before: digest(editFile.original) };
-  const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash, vectorHashes: fileHashes, edit };
+  const mapFiles = await mapLibreFiles(config, targetVersion && planDirectory(targetVersion)).catch((error: Error) => {
+    throw new CliError('INVALID_CONFIG', 2, error.message);
+  });
+  const maplibreHashes = mapLibreHashes(mapFiles);
+  if (targetVersion && JSON.stringify(maplibreHashes) !== JSON.stringify((await readPlan(targetVersion)).maplibreHashes)) {
+    throw new CliError('INVALID_CONFIG', 2, 'The archived MapLibre style or resources no longer match the selected version.');
+  }
+  const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash, vectorHashes: fileHashes, edit,
+    maplibreHashes };
   const planId = fingerprint(snapshot);
+  await writeMapLibreFiles(planDirectory(planId), mapFiles);
   await writeJson(join(planDirectory(planId), 'plan.json'), { ...snapshot, planId });
 
   const previousUrl = current ? firstPublicationUrl(current) : null;
   const newUrl = firstPublicationUrl(config);
-  const changed = changedSource || changedFiles.size > 0 || JSON.stringify(current) !== JSON.stringify(config);
+  const changed = changedSource || changedFiles.size > 0 || JSON.stringify(current) !== JSON.stringify(config) ||
+    JSON.stringify(currentPlan?.maplibreHashes) !== JSON.stringify(maplibreHashes);
   const previous = new Map(current ? publicationEntries(current) : []);
   const next = new Map(publicationEntries(config));
   const fileChanged = changedSource || current?.sourcePath !== config.sourcePath;
@@ -227,13 +239,19 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   const restarted = new Set([...changedProviders, ...Object.keys(config.providers ?? {}).filter((id) =>
     !!config.providers?.[id]?.image && (dataChanged(id) || providerConfigurationChanged(config, current, id)))]);
   const builtIn = builtInProviderId(config);
+  const mapLibreChanged = (id: string, publication: Publication) => {
+    if (!publication.maplibre) return false;
+    const prefix = new URL(publicationUrl(config, id, publication)).pathname.slice(1) + '/';
+    return Object.entries(maplibreHashes ?? {}).some(([path, hash]) =>
+      path.startsWith(prefix) && currentPlan?.maplibreHashes?.[path] !== hash);
+  };
   return {
     planId,
     baseVersion,
     targetVersion,
     added: [...next.keys()].filter((id) => !previous.has(id)),
     changed: [...next].filter(([id, publication]) => previous.has(id) &&
-      (platformChanged || changedProviders.has(publication.provider) ||
+      (platformChanged || mapLibreChanged(id, publication) || changedProviders.has(publication.provider) ||
        (publication.tile_provider !== undefined && changedProviders.has(publication.tile_provider)) ||
        changedFiles.has(publication.source) ||
        JSON.stringify(current && fileSource(current, publication.source)) !== JSON.stringify(fileSource(config, publication.source)) ||
@@ -463,6 +481,12 @@ async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null
   const cleanup = await grantCleanup(plan, current);
   await writeJson(activeFile, { ...state, pendingPlanId: plan.planId, phase: 'preflight' });
   try {
+    if (plan.maplibreHashes) {
+      const files = await mapLibreFiles(plan.config, candidate.directory).catch(() => null);
+      if (!files || JSON.stringify(mapLibreHashes(files)) !== JSON.stringify(plan.maplibreHashes)) {
+        throw new FeaturesPreflightError('The archived MapLibre style or resources no longer match the plan.');
+      }
+    }
     if (current && !current.yaml) {
       const previous = revision(current);
       await writeFile(join(previous.directory, 'platform.yaml'), serializeFeaturesConfig(current.config), { mode: 0o600 });
@@ -574,6 +598,7 @@ export async function applyPlan(planId: string) {
     await checkProviderEdit(plan);
     await checkPublicationIdentities(plan.config, current);
     if (current && JSON.stringify(current.config) === JSON.stringify(plan.config) &&
+        JSON.stringify(current.maplibreHashes) === JSON.stringify(plan.maplibreHashes) &&
         !await sourceContentChanged(plan.sourceHash, current.planId) &&
         !(await fileContentChanges(plan.vectorHashes, current.planId)).size) {
       const sourceChangedAfterPlanning = hasGeoJson(plan.config) &&
