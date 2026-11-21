@@ -1,0 +1,56 @@
+schema_version: 1
+server: {host: localhost, port: 8080}
+sources:
+  h3-observations:
+    type: postgis
+    schema: h3_data
+    relation: published_observations
+    id_field: feature_id
+    geometry_field: geom
+    max_lag_seconds: 0
+providers:
+  h3-features:
+    type: pygeoapi
+    postgis:
+      host: postgis.example.org
+      database: gis
+      user: h3_reader
+      password_file: ./secrets/h3-reader-password
+  h3-martin:
+    type: martin
+    image: ghcr.io/maplibre/martin:1.16.1@sha256:59902019bf9038926ff0c71174237d6852e64c457830a6349abe7090be8818ca
+    api:
+      protocol: mvt
+      scheme: http
+      port: 3000
+      base_path: /
+      public_root: /mvt
+      links: canonical
+      readiness: /health
+    postgis:
+      host: postgis.example.org
+      database: gis
+      user: h3_reader
+      password_file: ./secrets/h3-reader-password
+publications:
+  h3-observations:
+    source: h3-observations
+    provider: h3-features
+    protocol: features
+    access: public
+    title: H3 observations
+    description: Observations by H3 cell and time.
+    extent: [-180, -85, 180, 85]
+    time_field: observed_at
+    crs: [CRS84, 'EPSG:4326', 'EPSG:3857']
+    freshness: {max_delay_seconds: 0}
+  h3-observation-tiles:
+    source: h3-observations
+    provider: h3-martin
+    protocol: mvt
+    access: public
+    title: H3 observation tiles
+    description: H3 cell boundaries and observations in Web Mercator.
+    extent: [-180, -85, 180, 85]
+    mvt_properties: [h3_id, resolution, measurement]
+    freshness: {max_delay_seconds: 0}

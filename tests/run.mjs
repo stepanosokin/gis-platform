@@ -177,7 +177,7 @@ async function runMapsTests() {
   }
 }
 
-async function runMartinTests(suite) {
+async function runTileTests(suite) {
   run(`build-${suite}-cli`, process.execPath, ['node_modules/typescript/bin/tsc']);
   const name = `${project}-${suite}`;
   const filter = mode === `--${suite}` && process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
@@ -312,9 +312,10 @@ const providerSuites = new Map([
   ['--postgis', runPostgisTests],
   ['--features-files', runFeaturesFilesTests],
   ['--maps', runMapsTests],
-  ['--mvt', () => runMartinTests('mvt')],
-  ['--raster-tiles', () => runMartinTests('raster-tiles')],
-  ['--tiles', () => runMartinTests('tiles')],
+  ['--mvt', () => runTileTests('mvt')],
+  ['--raster-tiles', () => runTileTests('raster-tiles')],
+  ['--tiles', () => runTileTests('tiles')],
+  ['--h3', () => runTileTests('h3')],
 ]);
 
 console.log(`Results: ${results}`);

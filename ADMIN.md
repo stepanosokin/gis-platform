@@ -144,6 +144,32 @@ publications:
 
 Для смены пароля задайте в YAML новый путь `password_file` и примените свежий план. Для отката прежний файл должен содержать пароль, который всё ещё действует в PostgreSQL. Чтобы перенести публикацию на другой экземпляр с сохранением ID, настройте тот же адрес, порт и БД.
 
+### Ячейки H3 из PostGIS
+
+Подготовьте одно представление DBA и опубликуйте его через два экземпляра, pygeoapi для Features и Martin для MVT. Укажите подключение, пароль и охват в [примере YAML](examples/h3-postgis.yaml), затем выполните `config validate`, `config plan` и `config apply`. Пример открывает публичные маршруты `/features/collections/h3-observations` и `/mvt/h3-observation-tiles`.
+
+Если таблица наблюдений хранит `cell` типа `h3index`, DBA может использовать такой запрос. `observation_id` — постоянный уникальный ключ наблюдения. Несколько строк одной ячейки имеют одинаковый `h3_id` и разные `feature_id`. При хранении готовых границ и уровня выберите эти колонки напрямую. Расширения H3 нужны в БД, где выполняются функции H3.
+
+```sql
+CREATE VIEW h3_data.published_observations AS
+SELECT observation_id::text AS feature_id,
+       cell::text AS h3_id,
+       h3_get_resolution(cell) AS resolution,
+       observed_at,
+       measurement,
+       ST_Multi(h3_cell_to_boundary_geometry(cell))::geometry(MultiPolygon, 4326) AS geom
+FROM h3_data.observations;
+
+GRANT USAGE ON SCHEMA h3_data TO h3_reader;
+GRANT SELECT ON h3_data.published_observations TO h3_reader;
+```
+
+Проверьте непустые ID, валидность геометрии и её SRID перед публикацией. `h3_cell_to_boundary_geometry` разрезает границу ячейки по 180°, а `ST_Multi` даёт одинаковый тип геометрии для всех строк. Роли чтения достаточно доступа к представлению. [Функции h3_postgis](https://pgxn.org/dist/h3/4.5.0/docs/h3-pg-skill/SKILL.html)
+
+На pygeoapi 0.24.0 проверены CRS84, EPSG:4326 и EPSG:3857, пространственный отбор, CQL2 Text/JSON и `datetime`. Features сохраняет всю границу выбранной ячейки. Martin 1.16.1 выдаёт XYZ в Web Mercator и обрезает геометрию по области тайла с буфером. Оба маршрута сохраняют готовые показатели и строковый `h3_id`. Для отсутствующего значения Features возвращает `null`, а MVT опускает свойство. Нулевое значение присутствует в обоих форматах. Ячейка без наблюдений отсутствует в выдаче.
+
+Один запрос Features с `bbox`, пересекающим 180°, отложен до поддержки в движке. На pygeoapi 0.24.0 запрос `bbox=179.9,-0.1,-179.9,0.2` вернул HTTP 200 и пустую коллекцию, хотя ячейка `857eb573fffffff` пересекает эту область. PostgreSQL-провайдер строит один прямоугольник через `ST_MakeEnvelope`. Для такой области отправьте два запроса, по одному с каждой стороны 180°, и объедините результаты по `feature_id`. [Код pygeoapi 0.24.0](https://github.com/geopython/pygeoapi/blob/0.24.0/pygeoapi/provider/sql.py#L751-L763) · [Правило bbox в OGC API — Features](https://docs.ogc.org/is/17-069r4/17-069r4.html#_parameter_bbox)
+
 ### Векторные веб-тайлы MVT через Martin
 
 Скопируйте [пример YAML](examples/mvt.yaml) и укажите внешний PostGIS, доступный из контейнера Martin. Подготовьте таблицу или представление с типизированной геометрией и SRID. Выдайте роли `USAGE` на схему и `SELECT` на подготовленный источник. Martin открывает соединения в режиме чтения. Укажите файл пароля UTF-8 рядом с YAML и примените конфигурацию через `config validate`, `config plan` и `config apply`.
