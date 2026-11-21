@@ -1,5 +1,5 @@
 import { isIP } from 'node:net';
-import { pinnedImage, postgisSource, providerRoot, publicationEntries, tileArchive, type FeaturesConfig,
+import { pinnedImage, postgisSource, providerRoot, publicationsForProvider, tileArchive, type FeaturesConfig,
   type ManagedProvider, type TileArchiveSource } from './config.js';
 
 export function tileArchivePath(id: string, source: TileArchiveSource) {
@@ -10,7 +10,7 @@ export function martinConfig(config: FeaturesConfig, id: string) {
   const provider = config.providers?.[id];
   if (!provider?.image || provider.type !== 'martin') return undefined;
   const base = provider.api.base_path;
-  const publications = publicationEntries(config).filter(([, publication]) => publication.provider === id);
+  const publications = publicationsForProvider(config, id);
   const archives: Partial<Record<TileArchiveSource['type'], { sources: Record<string, string> }>> = {};
   const tables = Object.fromEntries(publications.flatMap(([key, publication]) => {
     const archive = tileArchive(config, publication.source);

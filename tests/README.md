@@ -21,13 +21,14 @@ npm test
 | Растровые публикации Maps через CLI и Caddy | `npm test -- --maps` |
 | Динамические тайлы MVT и TileJSON через Martin, CLI и Caddy | `npm test -- --mvt` |
 | Растровые архивы MBTiles и PMTiles через Martin, CLI и Caddy | `npm test -- --raster-tiles` |
+| Профиль OGC API — Tiles, метаданные и доступ через CLI и Caddy | `npm test -- --tiles` |
 | Все сценарии регистрации и доступа | `npm test -- --access` |
 | Один сценарий регистрации и доступа | `npm test -- --access HTTPS` |
 | Закрытые публикации и локальный CLI | `npm test -- --private` |
 | Один сценарий закрытых публикаций | `npm test -- --private 'personal grants'` |
 | Обнаружение закрытого слоя в открытом QGIS через QGIS MCP | `npm test -- --qgis` |
 
-Последний аргумент после `--access`, `--private`, `--versions`, `--providers`, `--features-files`, `--maps`, `--mvt` или `--raster-tiles` задаёт фильтр Node.js по имени теста. Путь к результатам указан в строке `Results:`. Раннер сохраняет вывод каждой команды после её завершения.
+Последний аргумент после `--access`, `--private`, `--versions`, `--providers`, `--features-files`, `--maps`, `--mvt`, `--raster-tiles` или `--tiles` задаёт фильтр Node.js по имени теста. Путь к результатам указан в строке `Results:`. Раннер сохраняет вывод каждой команды после её завершения.
 
 При разборе нестабильного теста повторите сценарий отдельно. Разные временные проекты Compose используют общий `dist/` рабочей копии и общий тег тестового образа Docker. Отдельный прогон исключает пересборку этих файлов и образа другим прогоном.
 
@@ -142,6 +143,10 @@ tar -xf test_results/maplibre-6.19.0/maplibre-gl-6.19.0.tgz -C test_results/mapl
 ## Растровые веб-тайлы из MBTiles и PMTiles
 
 Для #25 выбран полный уровень. Прогон `--raster-tiles` создаёт контрольные архивы в `test_results/` и проверяет CLI, публикации через Caddy и монтирование файлов только для чтения. Браузерная проверка использует `GIS_TEST_CHROME` и `GIS_TEST_MAPLIBRE_DIST` из раздела MVT. MapLibre GL JS запрашивает MBTiles анонимно и PMTiles с Bearer-токеном, затем сверяет RGBA контрольного изображения каждого архива. Результаты сохраняются в `raster-tiles-browser.json`.
+
+## OGC API — Tiles
+
+`npm test -- --tiles` поднимает отдельные экземпляры pygeoapi, Martin и временный PostGIS. Тесты проходят от коллекции до тайла, проверяют границы WebMercatorQuad, актуальные права, CORS и ответ при сбое PostGIS. С теми же переменными Chrome и MapLibre GL JS браузер открывает TileJSON закрытой публикации и проверяет отрисованную точку. Результат сохраняется в `ogc-tiles-browser.json`.
 
 ## QGIS Desktop
 

@@ -8,7 +8,8 @@ import type { AdminPermission } from './admin-command.js';
 export interface Publication {
   source: string;
   provider: string;
-  protocol: 'features' | 'maps' | 'mvt';
+  protocol: 'features' | 'maps' | 'mvt' | 'tiles';
+  tile_provider?: string;
   access: 'public' | 'registered' | 'private';
   title: string;
   description: string;
@@ -121,6 +122,11 @@ export function publicationEntries(config: FeaturesConfig): [string, Publication
   return [[config.publicationId, config.publication], ...Object.entries(config.additionalPublications ?? {})];
 }
 
+export function publicationsForProvider(config: FeaturesConfig, id: string) {
+  return publicationEntries(config).filter(([, publication]) =>
+    publication.provider === id || publication.tile_provider === id);
+}
+
 export function postgisSource(config: FeaturesConfig, id: string) {
   return config.postgisSources && Object.hasOwn(config.postgisSources, id) ? config.postgisSources[id] : undefined;
 }
@@ -198,7 +204,7 @@ export function providerRoot(config: FeaturesConfig, id: string) {
 export function managedProviderRuns(config: FeaturesConfig, id: string) {
   const provider = config.providers?.[id];
   return Boolean(provider?.image && (provider.type !== 'martin' ||
-    publicationEntries(config).some(([, publication]) => publication.provider === id)));
+    publicationsForProvider(config, id).length));
 }
 
 export function publicationUrl(config: FeaturesConfig, id: string, publication: Publication) {
@@ -325,6 +331,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     if (provider.api.protocol === 'maps' && (root !== '/maps' || provider.postgis)) {
       throw new Error(`Maps provider '${id}' requires public_root /maps and file sources.`);
     }
+    if (provider.api.protocol === 'tiles' && (root !== '/tiles' || provider.postgis)) {
+      throw new Error(`Tiles provider '${id}' requires public_root /tiles and a separate Martin instance for PostGIS.`);
+    }
     if (['/account', '/api', '/internal'].some((reserved) => root === reserved || root.startsWith(reserved + '/'))) {
       throw new Error(`Provider '${id}' uses a reserved public root.`);
     }
@@ -347,16 +356,18 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Ambiguous public root '${root}'.`);
     }
   }
-  const providersAtMaps = providers.flatMap(([, provider]) =>
-    provider.image && provider.api.public_root === '/maps' ? [provider.api.protocol] : []);
-  if (new Set(providersAtMaps).size > 1) throw new Error("Providers at '/maps' must use the same protocol.");
+  for (const root of ['/maps', '/tiles']) {
+    const protocols = new Set(providers.flatMap(([, provider]) =>
+      provider.image && provider.api.public_root === root ? [provider.api.protocol] : []));
+    if (protocols.size > 1) throw new Error(`Providers at '${root}' must use the same protocol.`);
+  }
 
   const entries = Object.entries(config.publications).map((
-    [id, { source, provider, protocol, access, title, description, extent, time_field, freshness, crs, mvt_properties }],
+    [id, { source, provider, protocol, access, title, description, extent, time_field, freshness, crs, mvt_properties, tile_provider }],
   ): [string, Publication] => [id, {
     source, provider, protocol, access, title, description, extent,
     ...(time_field !== undefined && { time_field }), ...(freshness && { freshness }), ...(crs && { crs }),
-    ...(mvt_properties && { mvt_properties }),
+    ...(mvt_properties && { mvt_properties }), ...(tile_provider && { tile_provider }),
   }]);
   const sourceTypes = new Map<string, 'file' | 'postgis'>();
   for (const [id, publication] of entries) {
@@ -367,13 +378,22 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     if (!Object.hasOwn(config.providers, provider)) {
       throw new Error(`Publication '${id}' references unknown provider '${provider}'.`);
     }
-    const instance = config.providers[provider];
+    const instance: Provider | undefined = config.providers[provider];
     if ((instance?.image ? instance.api.protocol : 'features') !== protocol) {
       throw new Error(`Publication '${id}' uses a protocol unsupported by provider '${provider}'.`);
     }
     const sourceConfig = config.sources[source]!;
     const archive = sourceConfig.type === 'mbtiles' || sourceConfig.type === 'pmtiles';
-    if (protocol === 'mvt') {
+    const renderer: string | undefined = protocol === 'tiles' ? publication.tile_provider : provider;
+    if (protocol === 'tiles') {
+      const martin = renderer && Object.hasOwn(config.providers, renderer) ? config.providers[renderer] : undefined;
+      if (sourceConfig.type !== 'postgis' || martin?.type !== 'martin' || !martin.postgis) {
+        throw new Error(`Publication '${id}': Tiles requires a PostGIS source and tile_provider referencing a PostGIS Martin instance.`);
+      }
+    } else if (publication.tile_provider) {
+      throw new Error(`Publication '${id}': tile_provider is only supported for Tiles.`);
+    }
+    if (protocol === 'mvt' || protocol === 'tiles') {
       if ((!archive && sourceConfig.type !== 'postgis') || publication.crs || time_field) {
         throw new Error(`Publication '${id}': Martin requires PostGIS, MBTiles or PMTiles and uses Web Mercator without CRS or time overrides.`);
       }
@@ -397,14 +417,17 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     if (raster && publication.crs) throw new Error(`Publication '${id}': set the raster source epsg instead of crs.`);
     if (publication.crs) publication.crs = supportedCrs(id, sourceConfig, publication.crs);
     const sourceType = sourceConfig.type === 'postgis' ? 'postgis' : 'file';
-    const suppliedType = sourceTypes.get(provider);
+    const sourceProvider = renderer ?? provider;
+    const suppliedType = sourceTypes.get(sourceProvider);
     if (suppliedType && suppliedType !== sourceType) {
       const fileFormats = vectorFiles.length ? 'file sources' : 'GeoJSON';
-      throw new Error(`Provider '${provider}' serves ${fileFormats} and PostGIS. Use separate provider instances.`);
+      throw new Error(`Provider '${sourceProvider}' serves ${fileFormats} and PostGIS. Use separate provider instances.`);
     }
-    sourceTypes.set(provider, sourceType);
+    sourceTypes.set(sourceProvider, sourceType);
     if (sourceConfig.type === 'postgis') {
-      if (!instance?.postgis) throw new Error(`Publication '${id}' requires a PostGIS connection on provider '${provider}'.`);
+      if (!config.providers[sourceProvider]?.postgis) {
+        throw new Error(`Publication '${id}' requires a PostGIS connection on provider '${sourceProvider}'.`);
+      }
       const max_delay_seconds = freshness?.max_delay_seconds ?? 60;
       if (sourceConfig.max_lag_seconds > max_delay_seconds) {
         throw new Error(`Publication '${id}': source max_lag_seconds exceeds freshness.max_delay_seconds.`);

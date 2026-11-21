@@ -121,7 +121,7 @@ async function* confirmedHistory(current: Plan | null) {
 
 function postgisLocation(config: FeaturesConfig, publication: Publication) {
   const source = postgisSource(config, publication.source);
-  const connection = config.providers?.[publication.provider]?.postgis;
+  const connection = config.providers?.[publication.tile_provider ?? publication.provider]?.postgis;
   return source && connection
     ? [connection.host, connection.port, connection.database, source.schema, source.relation]
     : undefined;
@@ -233,7 +233,9 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     targetVersion,
     added: [...next.keys()].filter((id) => !previous.has(id)),
     changed: [...next].filter(([id, publication]) => previous.has(id) &&
-      (platformChanged || changedProviders.has(publication.provider) || changedFiles.has(publication.source) ||
+      (platformChanged || changedProviders.has(publication.provider) ||
+       (publication.tile_provider !== undefined && changedProviders.has(publication.tile_provider)) ||
+       changedFiles.has(publication.source) ||
        JSON.stringify(current && fileSource(current, publication.source)) !== JSON.stringify(fileSource(config, publication.source)) ||
        (fileChanged && !postgisSource(config, publication.source) && !fileSource(config, publication.source)) ||
        JSON.stringify(current && postgisSource(current, publication.source)) !== JSON.stringify(postgisSource(config, publication.source)) ||

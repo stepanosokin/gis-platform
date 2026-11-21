@@ -181,11 +181,19 @@ async function runMartinTests(suite) {
   run(`build-${suite}-cli`, process.execPath, ['node_modules/typescript/bin/tsc']);
   const name = `${project}-${suite}`;
   const filter = mode === `--${suite}` && process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
+  const admin = suite === 'tiles' ? {
+    GIS_ADMIN_PORT: String(await freePort()),
+    GIS_ADMIN_CA_FILE: join(results, 'ca.pem'),
+    GIS_ADMIN_CERT_FILE: join(results, 'operator.pem'),
+    GIS_ADMIN_KEY_FILE: join(results, 'operator-key.pem'),
+  } : {};
+  if (suite === 'tiles') makeAdminCertificates();
   try {
     console.log(run(`test-${suite}`, process.execPath, ['--test', ...filter, `tests/${suite}.test.mjs`], {
       COMPOSE_PROJECT_NAME: name, GIS_STATE_DIR: join(results, `${suite}-state`),
       GIS_TEST_PUBLIC_URL: `http://localhost:${await freePort()}`, GIS_TEST_CONFIG: join(results, `${suite}.yaml`),
       GIS_TEST_MAILPIT: `http://localhost:${await freePort()}`,
+      ...admin,
     }));
   } finally {
     removeTestVolumes(name);
@@ -305,6 +313,7 @@ const providerSuites = new Map([
   ['--maps', runMapsTests],
   ['--mvt', () => runMartinTests('mvt')],
   ['--raster-tiles', () => runMartinTests('raster-tiles')],
+  ['--tiles', () => runMartinTests('tiles')],
 ]);
 
 console.log(`Results: ${results}`);

@@ -1,0 +1,50 @@
+schema_version: 1
+server: {host: localhost, port: 8080}
+sources:
+  observations:
+    type: postgis
+    schema: gis
+    relation: published_observations
+    id_field: id
+    geometry_field: geom
+    max_lag_seconds: 0
+providers:
+  ogc-tiles:
+    type: pygeoapi
+    image: geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a
+    api:
+      protocol: tiles
+      scheme: http
+      port: 80
+      base_path: /
+      public_root: /tiles
+      links: canonical
+      readiness: /openapi
+  live-martin:
+    type: martin
+    image: ghcr.io/maplibre/martin:1.16.1@sha256:59902019bf9038926ff0c71174237d6852e64c457830a6349abe7090be8818ca
+    api:
+      protocol: mvt
+      scheme: http
+      port: 3000
+      base_path: /
+      public_root: /mvt
+      links: canonical
+      readiness: /health
+    postgis:
+      host: postgis.example.org
+      database: gis
+      user: tiles_reader
+      password_file: ./secrets/observations-password
+publications:
+  observations:
+    source: observations
+    provider: ogc-tiles
+    tile_provider: live-martin
+    protocol: tiles
+    access: public
+    title: Observations
+    description: OGC vector tiles from PostGIS.
+    extent: [37, 55, 40, 58]
+    mvt_properties: [label]
+    freshness: {max_delay_seconds: 0}

@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { parse, parseDocument } from 'yaml';
-import { parseFeaturesConfig, publicationEntries } from './config.js';
+import { parseFeaturesConfig, publicationsForProvider } from './config.js';
 import { CliError } from './cli-result.js';
 import { configurationStatus, createPlan } from './plans.js';
 import { pullProviderImage } from './provider-images.js';
@@ -44,7 +44,7 @@ export async function planProviderCommand(command: string | undefined, args: str
     document.setIn([...path, 'image'], image);
     document.deleteIn([...path, 'digest']);
   } else {
-    const linked = publicationEntries(config).filter(([, publication]) => publication.provider === id).map(([key]) => key);
+    const linked = publicationsForProvider(config, id).map(([key]) => key);
     if (linked.length) throw new CliError('INVALID_CONFIG', 2, `Provider is used by: ${linked.join(', ')}.`, { publicationIds: linked });
     document.deleteIn(path);
   }

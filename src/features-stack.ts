@@ -14,7 +14,8 @@ import { promisify } from 'node:util';
 import { parse, stringify } from 'yaml';
 import { mapBboxDescription, mapRelation, mapSize } from './maps-profile.js';
 import { checkTileJson, martinConfig, martinService, runMartin, tileArchivePath } from './martin-profile.js';
-import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataService, pinnedImage, postgisSource, providerRoot, publicationEntries, publicationUrl,
+import { matrixSet, tilesRoutes, tilesRelation, tilesSource, vectorTileType } from './tiles-profile.js';
+import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataService, pinnedImage, postgisSource, providerRoot, publicationEntries, publicationsForProvider, publicationUrl,
   crs84, rasterFile, tileArchive, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
 
 const run = promisify(execFile);
@@ -22,6 +23,7 @@ const composeFile = (name: string) => fileURLToPath(new URL(`../${name}`, import
 const postgisPlugin = 'gis_postgis.PostGISProvider';
 const vectorFilePlugin = 'gis_vector_files.VectorFileProvider';
 const parquetImage = 'gis-platform-pygeoapi-parquet:0.24.0-arrow-23.0.1';
+const apiNames: Partial<Record<Publication['protocol'], string>> = { maps: 'Maps', tiles: 'Tiles' };
 let project: string | undefined;
 
 export async function resolveComposeProject() {
@@ -36,7 +38,7 @@ export async function resolveComposeProject() {
 function pygeoapiConfig(config: FeaturesConfig, instance = builtInProviderId(config)) {
   const publicUrl = instance ? new URL(providerRoot(config, instance), config.publicUrl).href : config.publicUrl;
   const provider = instance ? config.providers?.[instance] : undefined;
-  const protocol = provider?.image && provider.api.protocol === 'maps' ? 'Maps' : 'Features';
+  const protocol = provider?.image ? apiNames[provider.api.protocol] ?? 'Features' : 'Features';
   return {
     server: {
       bind: { host: '0.0.0.0', port: provider?.image ? provider.api.port : 80 },
@@ -75,7 +77,7 @@ function pygeoapiConfig(config: FeaturesConfig, instance = builtInProviderId(con
           spatial: { bbox: publication.extent, crs: crs84 },
           ...(publication.time_field && { temporal: { begin: null, end: null } }),
         },
-        providers: [pygeoapiSource(config, publication)],
+        providers: [publication.protocol === 'tiles' ? tilesSource(config, publication, id) : pygeoapiSource(config, publication)],
     }])),
   };
 }
@@ -142,10 +144,10 @@ function caddyConfig(config: FeaturesConfig) {
   const publications = publicationEntries(config);
   const protectedIds = publications.filter(([, publication]) => publication.access !== 'public').map(([id]) => id);
   const publicIds = publications.filter(([, publication]) => publication.access === 'public').map(([id]) => id);
+  const ogcRoutes = { maps: 'map', features: 'schema|queryables|items(/.+)?', tiles: tilesRoutes };
   const collectionRoute = (ids: string[], protocol?: Publication['protocol']) =>
     protocol === 'mvt' ? `(${ids.join('|')})(/[0-9]{1,2}/[0-9]{1,10}/[0-9]{1,10})?` :
-    `collections/(${ids.join('|')})${protocol === 'maps' ? '(/map)?' : protocol === 'features'
-      ? '(/(schema|queryables|items(/.+)?))?' : '(/(map|schema|queryables|items(/.+)?))?'}`;
+    `collections/(${ids.join('|')})(/(${protocol ? ogcRoutes[protocol] : Object.values(ogcRoutes).join('|')}))?`;
   const ogcIds = publications.filter(([, publication]) => publication.protocol !== 'mvt').map(([id]) => id);
   const mvtIds = publications.filter(([, publication]) => publication.protocol === 'mvt').map(([id]) => id);
   const allCollections = ogcIds.length ? collectionRoute(ogcIds) : '';
@@ -306,6 +308,33 @@ function serviceName(config: FeaturesConfig, id: string) {
   return config.providers?.[id]?.image ? `provider-${id}` : 'pygeoapi';
 }
 
+function corsRoutes(name: string, path: string, origins: string[] | undefined) {
+  if (!origins?.length) return '';
+  const allowed = `header_regexp Origin ^(?:${origins.map((value) => value.replaceAll('.', '\\.')).join('|')})$`;
+  return `
+	@${name} {
+		${path}
+		${allowed}
+	}
+	header @${name} {
+		Access-Control-Allow-Origin {http.request.header.Origin}
+		+Vary Origin
+	}
+	@${name}Preflight {
+		${path}
+		method OPTIONS
+		${allowed}
+		header_regexp Access-Control-Request-Method ^(GET|HEAD)$
+	}
+	header @${name}Preflight {
+		Access-Control-Allow-Methods "GET, HEAD"
+		Access-Control-Allow-Headers Authorization
+		Cache-Control no-store
+	}
+	respond @${name}Preflight 204
+`;
+}
+
 function managedGatewayRoutes(config: FeaturesConfig,
   collectionRoute: (ids: string[], protocol?: Publication['protocol']) => string, htmlPolicy: string) {
   const routes: string[] = [];
@@ -322,8 +351,18 @@ function managedGatewayRoutes(config: FeaturesConfig,
     const rootIndex = routes.length;
     const entries = publications.filter(([, publication]) => ids.includes(publication.provider));
     const mvt = root === '/mvt';
+    const tiles = ids.some((id) => {
+      const instance = config.providers?.[id];
+      return instance?.image && instance.api.protocol === 'tiles';
+    });
+    const rootProvider = (tiles && entries[0]?.[1].provider) || ids[0];
     const metadata = config.auth ? 'access' : 'metadata';
     const managedConformance = entries.some(([, publication]) => vectorFile(config, publication.source));
+    if (tiles && config.cors?.allowed_origins.length) {
+      const paths = ['/?', '/collections', '/openapi', '/conformance', '/[Tt]ileMatrixSets(/[^/]+)?'];
+      if (entries.length) paths.push('/' + collectionRoute(entries.map(([id]) => id), 'tiles'));
+      routes.push(corsRoutes(`cors${rootIndex}`, `path_regexp ^${root}(${paths.join('|')})$`, config.cors.allowed_origins));
+    }
     if (!mvt) routes.push(`
 	@metadata${rootIndex} {
 		method GET HEAD
@@ -355,10 +394,23 @@ function managedGatewayRoutes(config: FeaturesConfig,
 			}
 			request_header ${mapPath} Accept image/png
 			` : '';
+      const tileAccept = tiles ? `
+			@tileDefaultFormat {
+				path_regexp ^${root}/collections/[^/]+/tiles/${matrixSet}/[0-9]+/[0-9]+/[0-9]+$
+				expression \`{http.request.header.Accept} in ["", "*/*"]\`
+			}
+			request_header @tileDefaultFormat Accept ${vectorTileType}
+			@tilesDefaultFormat expression \`{http.request.header.Accept} in ["", "*/*"]\`
+			request_header @tilesDefaultFormat Accept application/json
+			` : '';
       const base = api?.base_path === '/' ? '' : api?.base_path ?? '';
-      const proxy = (postgis = false) => `${mapRequest}uri strip_prefix ${root}
+      const proxy = (postgis = false) => `${mapRequest}${tileAccept}uri strip_prefix ${root}
+			${tiles ? 'uri replace /tileMatrixSets /TileMatrixSets' : ''}
 			${base || mvt ? `rewrite * ${base}{http.request.uri.path}${mvt ? '?' : ''}` : ''}
 			reverse_proxy ${serviceName(config, id)}:${api?.port ?? 80} {
+				${tiles ? `transport http {
+					response_header_timeout 15s
+				}` : ''}
 				header_up -Cookie
 				header_up -Authorization${canonical}
 				header_down Cache-Control no-store${htmlPolicy}${postgis || mvt || maps ? `
@@ -369,48 +421,27 @@ function managedGatewayRoutes(config: FeaturesConfig,
 					respond \`{"code":"ServiceUnavailable"}\` 503
 				}` : ''}
 			}`;
-      if (!mvt && id === ids[0]) {
+      if (!mvt && id === rootProvider) {
         routes.push(`
 	@root${rootIndex} {
 		method GET HEAD
-		path ${root} ${root}/ ${root}/static/*${managedConformance ? '' : ` ${root}/conformance`}
+		path ${root} ${root}/ ${root}/static/*${managedConformance ? '' : ` ${root}/conformance`}${tiles ?
+          ` ${root}/TileMatrixSets ${root}/tileMatrixSets ${root}/TileMatrixSets/*` : ''}
 	}
 	handle @root${rootIndex} {
-		route {
+		route {${tiles ? `
+			@tilesLanding path ${root}
+			rewrite @tilesLanding ${root}/` : ''}
 			${proxy()}
 		}
 	}
 `);
       }
-      const cors = mvt ? config.cors?.allowed_origins : undefined;
-      if (cors?.length) {
+      if (mvt && config.cors?.allowed_origins.length) {
         const visible = entries.filter(([, entry]) => entry.provider === id).map(([key]) => key);
         if (visible.length) {
-          const name = `cors${routes.length}`;
           const path = `path_regexp ^${root}/${collectionRoute(visible, 'mvt')}$`;
-          const origins = `header_regexp Origin ^(?:${cors.map((value) => value.replaceAll('.', '\\.')).join('|')})$`;
-          routes.push(`
-	@${name} {
-		${path}
-		${origins}
-	}
-	header @${name} {
-		Access-Control-Allow-Origin {http.request.header.Origin}
-		+Vary Origin
-	}
-	@${name}Preflight {
-		${path}
-		method OPTIONS
-		${origins}
-		header_regexp Access-Control-Request-Method ^(GET|HEAD)$
-	}
-	header @${name}Preflight {
-		Access-Control-Allow-Methods "GET, HEAD"
-		Access-Control-Allow-Headers Authorization
-		Cache-Control no-store
-	}
-	respond @${name}Preflight 204
-`);
+          routes.push(corsRoutes(`cors${routes.length}`, path, config.cors.allowed_origins));
         }
       }
       function addPublicationRoute(anonymous: boolean, postgis: boolean, match: (name: string) => string) {
@@ -445,7 +476,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
           if (!visible.length) continue;
           addPublicationRoute(anonymous, postgis, (name) => `method GET HEAD
 		path_regexp ${name} ^${root}/${collectionRoute(visible, api?.protocol ?? 'features')}$`);
-          if (postgis && !mvt) addPublicationRoute(anonymous, true, (name) => `method POST
+          if (postgis && !mvt && !tiles) addPublicationRoute(anonymous, true, (name) => `method POST
 		header_regexp Content-Type (?i)^application/json(?:\\s*;.*)?$
 		path_regexp ${name} ^${root}/collections/(${visible.join('|')})/items$`);
         }
@@ -686,8 +717,8 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
     const service = serviceName(config, id);
     const secret = `postgis-${id}`;
     const passwordFile = provider.postgis?.password_file;
-    const connection = passwordFile && publicationEntries(config).some(([, publication]) =>
-      publication.provider === id && postgisSource(config, publication.source))
+    const connection = passwordFile && publicationsForProvider(config, id).some(([, publication]) =>
+      postgisSource(config, publication.source))
       ? [{ source: secret, target: 'postgis_password' }] : undefined;
     const native = service === 'pygeoapi' ? directory : join(directory, service);
     await mkdir(native, { recursive: true });
@@ -713,7 +744,8 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
       services[service] = { ...serviceSettings, volumes: [...serviceSettings.volumes, ...fileMounts] };
       continue;
     }
-    const pluginEnvironment = connection || vectorFiles ? {
+    const tiles = provider.image && provider.api.protocol === 'tiles';
+    const pluginEnvironment = connection || vectorFiles || tiles ? {
       PYTHONPATH: '/etc/pygeoapi/gis' + (provider.image && provider.environment?.PYTHONPATH
         ? `:${escapeCompose(provider.environment.PYTHONPATH)}` : ''),
     } : undefined;
@@ -723,6 +755,9 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
     if (connection) {
       secrets[secret] = { file: escapeCompose(passwordFile!) };
       await copyFile(fileURLToPath(new URL('../src/gis_postgis.py', import.meta.url)), join(native, 'gis_postgis.py'));
+    }
+    if (tiles) {
+      await copyFile(fileURLToPath(new URL('../src/gis_tiles.py', import.meta.url)), join(native, 'gis_tiles.py'));
     }
     if (!provider.image) {
       if (connection || files.length) services[service] = {
@@ -869,13 +904,14 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
     const native = service === 'pygeoapi' ? directory : join(directory, service);
     const mounted = await nativeProviderDirectory(directory, service);
     if (instance?.type === 'martin') {
-      if (publications.length && mounted === native) {
+      const rendered = publicationsForProvider(config, id);
+      if (rendered.length && mounted === native) {
         try {
           const output = await compose(config, directory, 'run', '--rm', '--no-deps', '-T', service,
-            '--check', ...publications.map(([key]) => key));
+            '--check', ...rendered.map(([key]) => key));
           const [catalog, ...documents] = output.trim().split('\n');
           const { tiles } = JSON.parse(catalog ?? '') as { tiles: Record<string, { content_type: string }> };
-          for (const [index, [key, publication]] of publications.entries()) {
+          for (const [index, [key, publication]] of rendered.entries()) {
             const source = postgisSource(config, publication.source);
             if (!source && !tiles[key]?.content_type?.startsWith('image/')) {
               throw new Error(`Publication '${key}' does not contain raster tiles.`);
@@ -898,8 +934,8 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
     } else {
       const geojson = hasGeoJson(config, id);
       if (geojson && !sourceHash) throw new Error('The GeoJSON source is unavailable.');
-      const checkPlugins = publications.some(([, publication]) => publication.crs ||
-        postgisSource(config, publication.source) || vectorFile(config, publication.source) || publication.protocol === 'maps');
+      const checkPlugins = publications.some(([, publication]) => publication.protocol !== 'tiles' &&
+        (publication.crs || postgisSource(config, publication.source) || vectorFile(config, publication.source) || publication.protocol === 'maps'));
       if (!config.providers?.[id]?.image && usedFileSources(config, id).some(([, file]) => file.type === 'geoparquet')) {
         await compose(config, directory, 'build', service);
       }
@@ -922,8 +958,57 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
       api = checkOpenApi(output, url, publications);
     }
     await writeFile(join(native, 'openapi.json'), JSON.stringify(api));
+    if (instance?.image && instance.api.protocol === 'tiles') {
+      api.paths!['/TileMatrixSets'] = { get: {
+        summary: 'List tile matrix set definitions.',
+        responses: { '200': { description: 'Tile matrix sets' } },
+      } };
+      api.paths!['/TileMatrixSets/{tileMatrixSetId}'] = { get: {
+        summary: 'Get a tile matrix set definition.',
+        parameters: [{ name: 'tileMatrixSetId', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: { '200': { description: 'Tile matrix set' }, '400': { description: 'Unknown tile matrix set.' } },
+      } };
+    }
     for (const [publicationId, publication] of publications) {
       const collection = `/collections/${publicationId}`;
+      if (publication.protocol === 'tiles') {
+        const list = `${collection}/tiles`;
+        const tile = `${list}/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}`;
+        const matrixParameter = { name: 'tileMatrixSetId', in: 'path', required: true,
+          schema: { type: 'string', enum: [matrixSet] } };
+        api.paths![`${list}/{tileMatrixSetId}`] = { get: {
+          summary: 'Get the WebMercatorQuad tileset metadata.',
+          operationId: `${publicationId}.collection.vector.getTileSet`,
+          tags: [publicationId],
+          parameters: [matrixParameter, { name: 'f', in: 'query', schema: {
+            type: 'string', enum: ['json', 'html', 'jsonld', 'tilejson'], default: 'json',
+          } }],
+          responses: { '200': { description: 'Tileset metadata', content: {
+            'application/json': { schema: { oneOf: [
+              { $ref: 'https://schemas.opengis.net/tms/2.0/json/tileSet.json' },
+              { type: 'object', required: ['tilejson', 'tiles', 'vector_layers'], properties: {
+                tilejson: { type: 'string' }, tiles: { type: 'array', items: { type: 'string' } },
+                vector_layers: { type: 'array', items: { type: 'object' } },
+              } },
+            ] } },
+          } }, '404': { description: 'Tile matrix set not found.' } },
+        } };
+        const operation = api.paths![tile]?.get;
+        if (!operation) throw new Error(`Publication '${publicationId}' is missing its tile operation.`);
+        operation.parameters = [matrixParameter,
+          { name: 'tileMatrix', in: 'path', required: true, schema: { type: 'string' },
+            description: 'Identifier of a tile matrix in WebMercatorQuad.' },
+          ...['tileRow', 'tileCol'].map((name) => ({
+            name, in: 'path', required: true, schema: { type: 'integer', minimum: 0 },
+            description: `Zero-based ${name === 'tileRow' ? 'row' : 'column'} of the tile in the selected matrix.`,
+          })),
+          ...(operation.parameters ?? []).filter((parameter) => parameter.in === 'query')];
+        operation.responses['200'] = { description: 'Vector tile', content: {
+          [vectorTileType]: { schema: { type: 'string', format: 'binary' } },
+        } };
+        operation.responses['204'] = { description: 'The tile has no data.' };
+        operation.responses['503'] = { description: 'The publication source is temporarily unavailable.' };
+      }
       const map = api.paths?.[`${collection}/map`]?.get;
       if (publication.protocol === 'maps' && map) {
         map.parameters = [
@@ -1008,6 +1093,8 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
           type: ({ json: 'application/json', html: 'text/html', jsonld: 'application/ld+json' })[format],
         })).concat(publication.protocol === 'maps'
           ? [{ rel: mapRelation, href: `${url}/collections/${id}/map?f=png`, type: 'image/png' }]
+          : publication.protocol === 'tiles'
+          ? [{ rel: tilesRelation, href: `${url}/collections/${id}/tiles?f=json`, type: 'application/json' }]
           : [{ rel: 'items', href: `${url}/collections/${id}/items?f=json`, type: 'application/geo+json' }]),
       })) },
   ]));
@@ -1109,17 +1196,21 @@ interface FeaturesParameter {
   description?: string;
   style?: string;
   explode?: boolean;
+  required?: boolean;
   schema?: Record<string, unknown>;
 }
 
 interface FeaturesOperation {
+  operationId?: string;
+  summary?: string;
+  tags?: string[];
   description?: string;
   parameters?: FeaturesParameter[];
   responses: Record<string, unknown>;
 }
 
 function dataPath(id: string, protocol: Publication['protocol']) {
-  return `/collections/${id}/${protocol === 'maps' ? 'map' : 'items'}`;
+  return `/collections/${id}/${protocol === 'maps' ? 'map' : protocol === 'tiles' ? 'tiles' : 'items'}`;
 }
 
 function checkOpenApi(body: string, publicUrl: string, publications: [string, Publication][]) {
@@ -1258,7 +1349,8 @@ export async function startFeaturesStack(config: FeaturesConfig, revisionDirecto
             continue;
           }
           const collection = JSON.parse(body) as { id?: string; links?: { rel: string; href: string }[] };
-          const [relation, suffix] = protocol === 'maps' ? [mapRelation, 'map?f=png'] : ['items', 'items?f=json'];
+          const [relation, suffix] = protocol === 'maps' ? [mapRelation, 'map?f=png'] :
+            protocol === 'tiles' ? [tilesRelation, 'tiles?f=json'] : ['items', 'items?f=json'];
           if (collection.id !== id || !collection.links?.some(({ rel, href }) =>
             rel === relation && href === `${url}/${suffix}`)) {
             throw new Error('Unexpected collection or canonical URL.');

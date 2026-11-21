@@ -59,7 +59,9 @@ function canRead(publications: Map<string, Publication['access']>, id: string, r
 function annotateOpenApi(api: OpenApi, publications: Map<string, Publication['access']>, reader: PublicationReader | null, cookieName: string) {
   let hasProtectedPaths = false;
   api.paths = Object.fromEntries(Object.entries(api.paths).filter(([path, entry]) => {
-    if (['/', '/openapi', '/conformance', '/collections'].includes(path)) return true;
+    if (['/', '/openapi', '/conformance', '/collections', '/TileMatrixSets', '/TileMatrixSets/{tileMatrixSetId}'].includes(path)) {
+      return true;
+    }
     const id = /^\/collections\/([^/]+)(?:\/|$)/.exec(path)?.[1];
     if (!id || !canRead(publications, id, reader)) return false;
     if (publications.get(id) === 'public') return true;
