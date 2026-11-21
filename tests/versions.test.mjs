@@ -231,14 +231,16 @@ test('a startup failure restores the previous routes and saves exit code 6', asy
 });
 
 test('an incomplete recovery reports the last confirmed version and keeps routes closed', async () => {
-  const certificatePath = join(dirname(file), 'https-cert.pem');
-  const certificateBackup = `${certificatePath}.test-backup`;
-  const certificate = await readFile(certificatePath);
+  const inputCertificate = join(dirname(file), 'https-cert.pem');
+  const certificate = await readFile(inputCertificate);
   const https = await planYaml(original.replace(`port: ${port}`, `port: ${port}
   tls:
     cert_file: https-cert.pem
-    key_file: https-key.pem`));
+    key_file: https-key.pem
+    ca_file: https-cert.pem`));
   assert.equal((await cli('config', 'apply', https.planId)).code, 'OK');
+  const certificatePath = join(process.env.GIS_STATE_DIR, 'tls', https.planId, 'cert.pem');
+  const certificateBackup = `${certificatePath}.test-backup`;
   const status = () => new Promise((resolve) => {
     const req = get(`https://localhost:${port}/features/collections/places?f=json`, {
       ca: certificate, signal: AbortSignal.timeout(2000),
@@ -247,8 +249,26 @@ test('an incomplete recovery reports the last confirmed version and keeps routes
   });
   assert.equal(await status(), 200);
 
+  const archiveMarker = join(process.env.GIS_STATE_DIR, 'plans', https.planId, 'tls-archived');
+  await rename(archiveMarker, `${archiveMarker}.test-backup`);
+  try {
+    await rename(inputCertificate, `${inputCertificate}.test-backup`);
+    try {
+      await withOccupiedPort(async (yaml) => {
+        const candidate = await planYaml(yaml);
+        assert.equal((await cli('config', 'apply', candidate.planId)).code, 'APPLY_FAILED');
+        assert.equal(await status(), 200);
+      });
+    } finally {
+      await rename(`${inputCertificate}.test-backup`, inputCertificate);
+    }
+  } finally {
+    await rename(`${archiveMarker}.test-backup`, archiveMarker);
+  }
+
   await rename(certificatePath, certificateBackup);
   try {
+    assert.deepEqual((await cli('doctor')).data.tls, { state: 'file-unavailable', expiresAt: null });
     await withOccupiedPort(async (yaml) => {
       const candidate = await planYaml(yaml);
       const failed = await cli('config', 'apply', candidate.planId);

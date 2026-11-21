@@ -64,7 +64,7 @@ type Source = { type: 'geojson'; path: string } | FileSource | PostgisSource;
 
 interface PlatformConfig {
   schema_version: 1;
-  server: { host: string; port: number; tls?: TlsConfig };
+  server: { host: string; port?: number; tls?: Partial<TlsConfig> };
   sources: Record<string, Source>;
   providers: Record<string, Provider>;
   publications: Record<string, Publication>;
@@ -86,6 +86,7 @@ interface SmtpConfig {
 interface TlsConfig {
   cert_file: string;
   key_file: string;
+  ca_file?: string;
 }
 
 export interface AdminConfig extends TlsConfig {
@@ -492,7 +493,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   const sourceId = geojson?.[0] ?? sources[0]![0];
   const providerId = providers[0]?.[0] ?? '';
 
-  const { host, port, tls } = config.server;
+  const { host, tls, port = tls?.cert_file ? 443 : 80 } = config.server;
   const auth = config.auth;
   if (auth) {
     auth.secret_file = resolve(directory, auth.secret_file);
@@ -512,7 +513,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   const fileSources = postgisSources.length || vectorFiles.length || rasterFiles.length || tileArchives.length || dggsSources.length;
   return {
     port,
-    publicUrl: new URL('/features', `${tls ? 'https' : 'http'}://${host}:${port}`).href,
+    publicUrl: new URL('/features', `${tls?.cert_file ? 'https' : 'http'}://${host}:${port}`).href,
     sourcePath: geojson ? resolve(directory, geojson[1].path) : '',
     ...(postgisSources.length && { postgisSources: Object.fromEntries(postgisSources) }),
     ...(vectorFiles.length && { vectorFiles: Object.fromEntries(vectorFiles) }),
@@ -528,6 +529,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       : { publicationId: null, sourceId, providerId }),
     ...(auth && { auth }),
     ...(cors && { cors }),
-    ...(tls && { tls: { cert_file: resolve(directory, tls.cert_file), key_file: resolve(directory, tls.key_file) } }),
+    ...(tls?.cert_file && { tls: { cert_file: resolve(directory, tls.cert_file), key_file: resolve(directory, tls.key_file!),
+      ...(tls.ca_file && { ca_file: resolve(directory, tls.ca_file) }) } }),
   };
 }

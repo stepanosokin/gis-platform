@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { createHash, X509Certificate } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { get as getHttp } from 'node:http';
@@ -8,7 +8,7 @@ import { isIP } from 'node:net';
 import { basename, extname, join } from 'node:path';
 import { text } from 'node:stream/consumers';
 import { setTimeout } from 'node:timers/promises';
-import { checkServerIdentity, createSecureContext } from 'node:tls';
+import { checkServerIdentity, createSecureContext, TLSSocket } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { parse, stringify } from 'yaml';
@@ -19,6 +19,7 @@ import { mapLibreAssetRoute } from './maplibre-style.js';
 import { dggsConfig, dggsDataRoute, dggsFiles, dggsRelation, dggsRoutes, dggsService,
   dggsSnapshotPath, dggsZoneParameters, runDggs } from './dggs-profile.js';
 import { healthUrl, providerServiceName as serviceName, publicationChecks, publicationHealth } from './publication-health.js';
+import { GatewayTlsError, gatewayTlsFiles, gatewayTlsProbe, inspectGatewayTls } from './gateway-tls.js';
 import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataService, pinnedImage, postgisSource, providerRoot, publicationEntries, publicationsForProvider, publicationUrl,
   crs84, dggsRoot, rasterFile, tileArchive, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
 
@@ -146,9 +147,16 @@ export function providerConfigurationChanged(candidate: FeaturesConfig, previous
 }
 
 function caddyConfig(config: FeaturesConfig) {
-  const site = config.tls ? `https://${new URL(config.publicUrl).hostname}:443` : ':80';
+  const { host, hostname, origin, protocol, port } = new URL(config.publicUrl);
+  const site = config.tls ? `https://${hostname}:443` : ':80';
   const tlsOptions = config.tls ? '\n\tauto_https disable_redirects' : '';
   const certificate = config.tls ? '\n\ttls /run/secrets/tls_cert /run/secrets/tls_key' : '';
+  const redirect = config.tls ? `
+http://:80 {
+	header Cache-Control no-store
+	redir ${origin}{uri} 308
+}
+` : '';
   const publications = publicationEntries(config);
   const protectedIds = publications.filter(([, publication]) => publication.access !== 'public').map(([id]) => id);
   const publicIds = publications.filter(([, publication]) => publication.access === 'public').map(([id]) => id);
@@ -190,6 +198,7 @@ function caddyConfig(config: FeaturesConfig) {
 				header_down X-Content-Type-Options nosniff` : '';
   const proxyFeatures = `uri strip_prefix /features
 			reverse_proxy pygeoapi:80 {
+				import gis_public_headers
 				header_up -Cookie
 				header_up -Authorization
 				header_down Cache-Control no-store${featuresHtmlPolicy}
@@ -202,6 +211,7 @@ function caddyConfig(config: FeaturesConfig) {
 	handle @metadata {
 		route {${protectedIds.length ? '' : '\n\t\t\tvars public_auth_pending true'}
 			reverse_proxy access:3000 {
+				import gis_public_headers
 				header_up X-GIS-Request-Id {http.request.uuid}
 			}
 		}
@@ -219,6 +229,7 @@ function caddyConfig(config: FeaturesConfig) {
 		route {${allowAnonymousFallback ? '\n\t\t\tvars public_auth_pending true' : ''}
 			forward_auth access:3000 {
 				uri /internal/authorize/{http.regexp.${matcher}.1}
+				import gis_public_headers
 				header_up X-GIS-Request-Id {http.request.uuid}
 			}${allowAnonymousFallback ? '\n\t\t\tvars public_auth_pending false' : ''}
 			${proxyFeatures}
@@ -238,6 +249,7 @@ function caddyConfig(config: FeaturesConfig) {
 	@accounts path /account /account/* /api/auth/*
 	handle @accounts {
 		reverse_proxy access:3000 {
+			import gis_public_headers
 			@accessFailure status 500 502 504
 			handle_response @accessFailure {
 				header Cache-Control no-store
@@ -292,9 +304,18 @@ ${config.auth ? publicationRoutes(protectedIds, false) + publicationRoutes(publi
 	}
 }
 
+(gis_public_headers) {
+	header_up Host ${host}
+	header_up X-Forwarded-Host ${host}
+	header_up X-Forwarded-Proto ${protocol.slice(0, -1)}
+	header_up X-Forwarded-Port ${port || (config.tls ? '443' : '80')}
+	header_up -Forwarded
+}
+
 ${site} {${certificate}
 ${journal}
 	route {
+		header -Strict-Transport-Security
 		@switching file {
 			root /etc/caddy/gis
 			try_files closed
@@ -306,6 +327,7 @@ ${routes}
 	}
 ${errors}
 }
+${redirect}
 
 http://:2080 {
 	bind 127.0.0.1
@@ -396,6 +418,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
 	handle @metadata${rootIndex} {
 		route {${metadataFallback ? '\n			vars public_metadata true' : ''}
 			reverse_proxy ${metadata}:3000 {
+				import gis_public_headers
 				header_up X-GIS-Request-Id {http.request.uuid}
 			}
 		}
@@ -406,15 +429,10 @@ function managedGatewayRoutes(config: FeaturesConfig,
       const instance = config.providers?.[id];
       const api = instance?.image ? instance.api : undefined;
       const maps = api?.protocol === 'maps';
-      const { host, protocol } = new URL(config.publicUrl);
-      const canonical = mvt || dggs ? `
-				header_up Host ${host}
-				header_up X-Forwarded-Host ${host}
-				header_up X-Forwarded-Proto ${protocol.slice(0, -1)}
-				header_up -Forwarded` : '';
       const mapPath = `${root}/collections/*/map`;
       const mapRequest = maps ? `forward_auth ${mapPath} metadata:3000 {
 				uri /internal/validate-map
+				import gis_public_headers
 				header_up -Cookie
 				header_up -Authorization
 			}
@@ -454,11 +472,12 @@ function managedGatewayRoutes(config: FeaturesConfig,
 			${tiles ? 'uri replace /tileMatrixSets /TileMatrixSets' : ''}
 			${!dggs && (base || mvt) ? `rewrite * ${base}{http.request.uri.path}${mvt ? '?' : ''}` : ''}
 			reverse_proxy ${upstream} {
+				import gis_public_headers
 				${postgis || tiles ? `transport http {
 					response_header_timeout 15s
 				}` : ''}
 				header_up -Cookie
-				header_up -Authorization${canonical}
+				header_up -Authorization
 				header_down Cache-Control no-store${swagger ? '' : htmlPolicy}${postgis || mvt || maps || dggs ? `
 				@sourceFailure status 5xx
 				handle_response @sourceFailure {
@@ -500,6 +519,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
 		route {${mvt ? '\n			header >Cache-Control no-store' : ''}${config.auth ? `${anonymous ? `\n			vars public_provider ${name}` : ''}
 			forward_auth access:3000 {
 				uri /internal/authorize/{http.regexp.${name}.1}
+				import gis_public_headers
 				header_up X-GIS-Request-Id {http.request.uuid}
 			}${anonymous ? '\n			vars public_provider false' : ''}` : ''}
 			${upstream}
@@ -535,7 +555,9 @@ function managedGatewayRoutes(config: FeaturesConfig,
   if (metadataFallback) fallback.push(`
 		@publicMetadataUnavailable vars public_metadata true
 		handle @publicMetadataUnavailable {
-			reverse_proxy metadata:3000
+			reverse_proxy metadata:3000 {
+				import gis_public_headers
+			}
 		}`);
   return { routes: routes.join('\n'), fallback: fallback.join('\n') };
 }
@@ -543,6 +565,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
 interface Revision {
   config: FeaturesConfig;
   directory: string;
+  tlsFingerprint?: string | null;
 }
 
 // The native Parquet provider builds projection and filter SQL from its broader
@@ -683,15 +706,6 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
   for (const id of offlineFiles) fileHashes[id] = previousFileHashes[id]!;
   if (Object.keys(fileHashes).length) {
     await writeFile(join(revisionDirectory, 'vector-files.json'), JSON.stringify(fileHashes));
-  }
-  if (config.tls) {
-    const cert = new X509Certificate(await readFile(config.tls.cert_file));
-    const hostname = new URL(config.publicUrl).hostname;
-    const matches = isIP(hostname) ? cert.checkIP(hostname) : cert.checkHost(hostname);
-    const now = Date.now();
-    if (!matches || now < Date.parse(cert.validFrom) || now > Date.parse(cert.validTo)) {
-      throw new Error('Invalid TLS certificate for the public hostname.');
-    }
   }
   if (config.auth) {
     const { auth } = config;
@@ -1239,7 +1253,11 @@ async function nativeProviderDirectory(directory: string, service = 'pygeoapi') 
   return service === 'pygeoapi' ? join(directory, '..', revision) : join(directory, '..', revision, service);
 }
 
-export async function compose(config: FeaturesConfig, revisionDirectory: string, ...args: string[]) {
+export function compose(config: FeaturesConfig, directory: string, ...args: string[]) {
+  return composeRevision({ config, directory }, ...args);
+}
+
+async function composeRevision({ config, directory: revisionDirectory, tlsFingerprint }: Revision, ...args: string[]) {
   const files = [composeFile('compose.yaml')];
   const builtIn = builtInProviderId(config);
   if (config.publicationId === null || (config.providers && (!builtIn || !hasGeoJson(config, builtIn)))) {
@@ -1253,14 +1271,15 @@ export async function compose(config: FeaturesConfig, revisionDirectory: string,
     if (config.auth.cli) files.push(join(revisionDirectory, 'compose.admin.json'));
   }
   if (config.providers) files.push(join(revisionDirectory, 'compose.providers.json'));
+  const tls = await gatewayTlsFiles(config, revisionDirectory, tlsFingerprint !== undefined);
   const { stdout } = await run('docker', ['compose', ...(project ? ['-p', project] : []),
     ...files.flatMap((file) => ['-f', file]), ...args], {
     env: {
       ...process.env,
       GIS_PUBLIC_PORT: String(config.port),
       GIS_CADDY_PORT: config.tls ? '443' : '80',
-      GIS_TLS_CERT_FILE: config.tls?.cert_file,
-      GIS_TLS_KEY_FILE: config.tls?.key_file,
+      GIS_TLS_CERT_FILE: tls?.files.cert_file,
+      GIS_TLS_KEY_FILE: tls?.files.key_file,
       GIS_REVISION_DIR: revisionDirectory,
       GIS_PROVIDER_REVISION_DIR: await nativeProviderDirectory(revisionDirectory),
       GIS_SOURCE_FILE: config.sourcePath,
@@ -1274,22 +1293,30 @@ export async function compose(config: FeaturesConfig, revisionDirectory: string,
   return stdout;
 }
 
-function probeCollection(origin: URL, path: string, certificate: Buffer | undefined) {
+function probeCollection(origin: URL, path: string, tls: Awaited<ReturnType<typeof gatewayTlsProbe>>,
+  rejectUnauthorized = true) {
   return new Promise<{ status?: number; cacheControl?: string; body: string }>((resolve, reject) => {
     const url = new URL(path, origin);
     url.hostname = '127.0.0.1';
-    const get = certificate ? getHttps : getHttp;
+    const get = tls ? getHttps : getHttp;
     const request = get(url, {
       agent: false,
       headers: { Host: origin.host },
       signal: AbortSignal.timeout(2000),
-      ...(certificate && {
-        ca: certificate,
-        allowPartialTrustChain: true,
+      ...(tls && {
+        ca: tls.ca,
+        allowPartialTrustChain: tls.allowPartialTrustChain,
+        rejectUnauthorized,
         ...(isIP(origin.hostname) === 0 && { servername: origin.hostname }),
         checkServerIdentity: (_hostname, peer) => checkServerIdentity(origin.hostname, peer),
       }),
     }, (response) => {
+      if (tls && (!(response.socket instanceof TLSSocket) ||
+          response.socket.getPeerCertificate().fingerprint256 !== tls.fingerprint)) {
+        response.resume();
+        reject(new Error('The gateway is serving a different TLS certificate.'));
+        return;
+      }
       text(response).then((body) => resolve({ status: response.statusCode,
         cacheControl: response.headers['cache-control'], body }), reject);
     });
@@ -1297,13 +1324,26 @@ function probeCollection(origin: URL, path: string, certificate: Buffer | undefi
   });
 }
 
-export async function diagnoseStack({ config, directory }: Revision, publicationId?: string) {
+export async function verifyLegacyGatewayTls({ config, directory, tlsFingerprint }: Revision) {
+  if (!config.tls || tlsFingerprint !== undefined) return;
+  try {
+    const tls = await gatewayTlsProbe(config, directory);
+    const running = await compose(config, directory, 'ps', '--status', 'running', '--services', 'caddy');
+    // An expired certificate can still identify the pair that must be retained for a legacy revision.
+    if (running.trim()) await probeCollection(new URL(config.publicUrl), '/', tls, false);
+  } catch {
+    throw new GatewayTlsError('previous-files-unavailable',
+      'Keep the previous TLS certificate and key at their original paths for recovery and rollback. Use new paths for the replacement.');
+  }
+}
+
+export async function diagnoseStack({ config, directory, tlsFingerprint }: Revision, publicationId?: string) {
   const entries = Object.fromEntries(publicationEntries(config)
     .map(([id, publication]) => [id, publicationHealth(config, id, publication)]));
   const gateway = async () => {
     try {
-      const certificate = config.tls ? await readFile(config.tls.cert_file) : undefined;
-      const { status, cacheControl } = await probeCollection(new URL(config.publicUrl), '/', certificate);
+      const { status, cacheControl } = await probeCollection(new URL(config.publicUrl), '/',
+        await gatewayTlsProbe(config, directory, tlsFingerprint));
       if (cacheControl === 'no-store') {
         if (status === 404) return 'ready';
         if (status === 503) return 'closed';
@@ -1313,8 +1353,9 @@ export async function diagnoseStack({ config, directory }: Revision, publication
     }
     return 'unavailable';
   };
-  const [gatewayState, publications] = await Promise.all([
+  const [gatewayState, tls, publications] = await Promise.all([
     gateway(),
+    inspectGatewayTls(config, directory, tlsFingerprint),
     publicationChecks(entries, (endpoint) => {
       const url = healthUrl(endpoint, '127.0.0.1');
       const probe = endpoint.martin
@@ -1324,7 +1365,8 @@ export async function diagnoseStack({ config, directory }: Revision, publication
       return compose(config, directory, 'exec', '-T', endpoint.service, ...probe).then(() => true, () => false);
     }, publicationId),
   ]);
-  return { gateway: gatewayState, publications };
+  return { gateway: gatewayState, tls: tls?.state === 'ready' && gatewayState === 'unavailable'
+    ? { ...tls, state: 'gateway-unavailable' } : tls, publications };
 }
 
 interface FeaturesOpenApi {
@@ -1457,9 +1499,10 @@ export async function featuresStackRunning(config: FeaturesConfig, directory: st
   return ['caddy', ...stackServices(config)].every((service) => running.includes(service));
 }
 
-export async function startFeaturesStack(config: FeaturesConfig, revisionDirectory: string, confirmed?: Revision) {
+export async function startFeaturesStack(revision: Revision, confirmed?: Revision) {
+  const { config, directory: revisionDirectory, tlsFingerprint } = revision;
   const origin = new URL(config.publicUrl);
-  const certificate = config.tls ? await readFile(config.tls.cert_file) : undefined;
+  const tls = await gatewayTlsProbe(config, revisionDirectory, tlsFingerprint);
   const reusedProviders = new Set<string>();
   if (confirmed) {
     for (const [id, provider] of Object.entries(config.providers ?? {})) {
@@ -1475,7 +1518,7 @@ export async function startFeaturesStack(config: FeaturesConfig, revisionDirecto
   const confirmedMartin = new Set([...reusedProviders].filter((id) => config.providers?.[id]?.type === 'martin'));
   const optionalServices = [...confirmedMartin].map((id) => serviceName(config, id));
   const requiredServices = stackServices(config).filter((service) => !optionalServices.includes(service));
-  await compose(config, revisionDirectory, 'up', '-d', '--no-deps',
+  await composeRevision(revision, 'up', '-d', '--no-deps',
     ...(!requiredServices.length && !optionalServices.length ? ['--remove-orphans'] : []), 'caddy');
   if (!builtInProviderId(config)) await compose(config, revisionDirectory, 'rm', '-sf', 'pygeoapi');
   if (optionalServices.length) {
@@ -1503,7 +1546,7 @@ export async function startFeaturesStack(config: FeaturesConfig, revisionDirecto
   };
   for (let attempt = 0; attempt < 15; attempt++) {
     try {
-      const gate = await probeCollection(origin, '/features/collections?f=json', certificate);
+      const gate = await probeCollection(origin, '/features/collections?f=json', tls);
       if (gate.status !== 503 || gate.cacheControl !== 'no-store') throw new Error('The gateway is not closed.');
       for (const [id, provider] of Object.entries(config.providers ?? {})) {
         if (!provider.image || provider.type !== 'pygeoapi' || reusedProviders.has(id) ||

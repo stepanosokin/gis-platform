@@ -1,1 +1,2 @@
 tests/cli-local-accounts.sh text eol=lf
+tests/gateway-certificates.sh text eol=lf

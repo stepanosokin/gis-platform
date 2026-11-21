@@ -8,10 +8,11 @@ import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataServic
 import { pinProviderImages } from './provider-images.js';
 import { archiveLegacyOpenApi, closeGateway, compose, diagnoseStack, featuresStackRunning, openGateway, prepareFeaturesStack, providerConfigurationChanged,
   publicationGrantRemoval, resolveComposeProject, savedSourceFingerprint, savedFileFingerprints, sourceFingerprint,
-  startFeaturesStack, fileFingerprints, FeaturesPreflightError } from './features-stack.js';
+  startFeaturesStack, fileFingerprints, FeaturesPreflightError, verifyLegacyGatewayTls } from './features-stack.js';
 import { CliError } from './cli-result.js';
 import { mapLibreFiles, mapLibreHashes, writeMapLibreFiles } from './maplibre-style.js';
 import { statusSnapshot, type ActiveState, type ApplyResult } from './configuration-state.js';
+import { archiveGatewayTls, gatewayTlsFiles, gatewayTlsFingerprint, GatewayTlsError } from './gateway-tls.js';
 
 interface Plan {
   planId: string;
@@ -24,6 +25,7 @@ interface Plan {
   // Keep the persisted field name for plans created before raster file support.
   vectorHashes?: Record<string, string | null>;
   maplibreHashes?: Record<string, string>;
+  tlsFingerprint?: string | null;
   edit?: { filename: string; before: string };
 }
 
@@ -181,8 +183,16 @@ function digest(value: string) {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function fingerprint({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, vectorHashes, edit, maplibreHashes }: Omit<Plan, 'planId'>) {
-  return `plan-${digest(JSON.stringify({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, vectorHashes, edit, maplibreHashes }))}`;
+function fingerprint({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, vectorHashes, edit, maplibreHashes,
+  tlsFingerprint }: Omit<Plan, 'planId'>) {
+  return `plan-${digest(JSON.stringify({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, vectorHashes, edit,
+    maplibreHashes, tlsFingerprint }))}`;
+}
+
+async function tlsSource(config: FeaturesConfig, target: Plan | null) {
+  return target
+    ? (await gatewayTlsFiles(config, planDirectory(target.planId), target.tlsFingerprint !== undefined))?.files
+    : config.tls;
 }
 
 export async function createPlan(config: FeaturesConfig, yaml?: string,
@@ -215,7 +225,11 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     throw new CliError('INVALID_CONFIG', 2, error.message);
   });
   const maplibreHashes = mapLibreHashes(mapFiles);
-  const target = targetVersion && await readPlan(targetVersion);
+  const target = targetVersion ? await readPlan(targetVersion) : null;
+  const tlsFingerprint = await gatewayTlsFingerprint(await tlsSource(config, target));
+  if (target && target.tlsFingerprint !== undefined && tlsFingerprint !== target.tlsFingerprint) {
+    throw new CliError('INVALID_CONFIG', 2, 'The archived TLS files do not match the selected version.');
+  }
   if (target && JSON.stringify(maplibreHashes) !== JSON.stringify(target.maplibreHashes)) {
     throw new CliError('INVALID_CONFIG', 2, 'The archived MapLibre style or resources no longer match the selected version.');
   }
@@ -224,7 +238,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     throw new CliError('INVALID_CONFIG', 2, 'The archived DGGS snapshot no longer matches the selected version.');
   }
   const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash, vectorHashes: fileHashes, edit,
-    maplibreHashes };
+    maplibreHashes, tlsFingerprint };
   const planId = fingerprint(snapshot);
   await writeMapLibreFiles(planDirectory(planId), mapFiles);
   await writeJson(join(planDirectory(planId), 'plan.json'), { ...snapshot, planId });
@@ -232,12 +246,13 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   const previousUrl = current ? firstPublicationUrl(current) : null;
   const newUrl = firstPublicationUrl(config);
   const changed = changedSource || changedFiles.size > 0 || JSON.stringify(current) !== JSON.stringify(config) ||
-    JSON.stringify(currentPlan?.maplibreHashes) !== JSON.stringify(maplibreHashes);
+    JSON.stringify(currentPlan?.maplibreHashes) !== JSON.stringify(maplibreHashes) || currentPlan?.tlsFingerprint !== tlsFingerprint;
   const previous = new Map(current ? publicationEntries(current) : []);
   const next = new Map(publicationEntries(config));
   const fileChanged = changedSource || current?.sourcePath !== config.sourcePath;
   const platformChanged = current?.publicUrl !== config.publicUrl ||
     JSON.stringify(current?.auth) !== JSON.stringify(config.auth) || JSON.stringify(current?.tls) !== JSON.stringify(config.tls) ||
+    currentPlan?.tlsFingerprint !== tlsFingerprint ||
     JSON.stringify(current?.cors) !== JSON.stringify(config.cors);
   const outcomes = [...new Set([...previous.keys(), ...next.keys()])].map((id) => {
     const before = previous.get(id);
@@ -282,6 +297,8 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     removed: [...previous.keys()].filter((id) => !next.has(id)),
     previousUrl,
     newUrl,
+    previousPublicUrl: current ? new URL(current.publicUrl).origin : null,
+    publicUrl: new URL(config.publicUrl).origin,
     publications: outcomes,
     routesToClose: changed ? affectedRoutes(config, current) : [],
     services: changed ? ['caddy', ...((builtIn || (current && builtInProviderId(current))) &&
@@ -314,7 +331,7 @@ function mailPort(config: FeaturesConfig | null) {
 }
 
 function revision(plan: Plan) {
-  return { config: plan.config, directory: planDirectory(plan.planId) };
+  return { config: plan.config, directory: planDirectory(plan.planId), tlsFingerprint: plan.tlsFingerprint };
 }
 
 function settled(state: ActiveState, planId: string, outcome: ApplyResult): ActiveState {
@@ -341,7 +358,7 @@ async function restoreStack(state: ActiveState, candidate: Plan, current: Plan |
       const previous = revision(current);
       if (!current.yaml) await prepareFeaturesStack(previous, { useArchivedOpenApi: true });
       await closeGateway(previous.directory);
-      await startFeaturesStack(current.config, previous.directory, revision(candidate));
+      await startFeaturesStack(previous, revision(candidate));
       await openGateway(previous.directory);
     } else {
       await compose(candidate.config, directory, 'down', '--remove-orphans');
@@ -398,11 +415,11 @@ async function keepProviderOpenPending(state: ActiveState, candidate: Plan) {
 }
 
 async function resumeProviderOpen(state: ActiveState, candidate: Plan, previous: Plan | null) {
-  const { config, directory } = revision(candidate);
+  const rev = revision(candidate);
   try {
     await checkProviderEdit(candidate);
-    await closeGateway(directory);
-    await startFeaturesStack(config, directory, previous ? revision(previous) : undefined);
+    await closeGateway(rev.directory);
+    await startFeaturesStack(rev, previous ? revision(previous) : undefined);
     await finishOpen(state, candidate);
   } catch {
     const saved = await readFile(candidate.edit!.filename, 'utf8').catch(() => null);
@@ -478,7 +495,7 @@ async function finalizeRemoval(state: ActiveState, plan: Plan, current: Plan | n
     }
     if (resume) {
       await closeGateway(candidate.directory);
-      await startFeaturesStack(plan.config, candidate.directory, current ? revision(current) : undefined);
+      await startFeaturesStack(candidate, current ? revision(current) : undefined);
     }
     await openGateway(candidate.directory);
     await writeActive(settled({ ...state, planId: plan.planId, previousVersion: state.planId }, plan.planId, { code: 'OK' }));
@@ -502,6 +519,18 @@ async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null
   const cleanup = await grantCleanup(plan, current);
   await writeActive({ ...state, pendingPlanId: plan.planId, phase: 'preflight' });
   try {
+    if (plan.config.tls) {
+      const text = process.env.GIS_HTTP_REDIRECT_PORT || '80';
+      const port = Number(text);
+      if (!/^\d+$/.test(text) || port < 1 || port > 65535) {
+        throw new GatewayTlsError('invalid-port', 'GIS_HTTP_REDIRECT_PORT must be a TCP port from 1 to 65535.');
+      }
+      if (port === plan.config.port) {
+        throw new GatewayTlsError('invalid-port', 'The HTTP redirect port must differ from the HTTPS port.');
+      }
+    }
+    const target = plan.targetVersion ? await readPlan(plan.targetVersion) : null;
+    await archiveGatewayTls(plan.config, candidate.directory, plan.tlsFingerprint, await tlsSource(plan.config, target));
     if (plan.maplibreHashes) {
       const files = await mapLibreFiles(plan.config, candidate.directory).catch(() => null);
       if (!files || JSON.stringify(mapLibreHashes(files)) !== JSON.stringify(plan.maplibreHashes)) {
@@ -515,11 +544,12 @@ async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null
     }
     await prepareFeaturesStack(candidate, { previous: current ? revision(current) : undefined,
       sourceHash: plan.sourceHash, fileHashes: plan.vectorHashes });
+    if (current) await verifyLegacyGatewayTls(revision(current));
     if (plan.yaml !== undefined) await writeFile(join(candidate.directory, 'platform.yaml'),
       plan.config.providers ? serializeFeaturesConfig(plan.config) : plan.yaml, { mode: 0o600 });
   } catch (error) {
     await writeActive(settled(state, plan.planId, {
-      code: 'APPLY_FAILED', message: error instanceof FeaturesPreflightError ? error.message
+      code: 'APPLY_FAILED', message: error instanceof FeaturesPreflightError || error instanceof GatewayTlsError ? error.message
         : 'Preflight failed while checking the source, TLS, native configuration or OpenAPI.',
     }));
     return;
@@ -531,7 +561,7 @@ async function activatePlan(state: ActiveState, plan: Plan, current: Plan | null
   try {
     await closeGateway(candidate.directory);
     if (current) await secureGateway(revision(current), !current.yaml);
-    await startFeaturesStack(plan.config, candidate.directory, current ? revision(current) : undefined);
+    await startFeaturesStack(candidate, current ? revision(current) : undefined);
     if (!cleanup) await openConfirmedVersion(pending, plan);
     else await writeActive({ ...pending, phase: 'finalize' });
   } catch {
@@ -620,6 +650,7 @@ export async function applyPlan(planId: string) {
     await checkProviderEdit(plan);
     await checkPublicationIdentities(plan.config, current);
     if (current && JSON.stringify(current.config) === JSON.stringify(plan.config) &&
+        current.tlsFingerprint === plan.tlsFingerprint &&
         JSON.stringify(current.maplibreHashes) === JSON.stringify(plan.maplibreHashes) &&
         !await sourceContentChanged(plan.sourceHash, current.planId) &&
         !(await fileContentChanges(plan.vectorHashes, current.planId)).size) {
@@ -630,12 +661,17 @@ export async function applyPlan(planId: string) {
       const fileChangedAfterPlanning = plannedFileHashes && liveFileHashes &&
         (Object.entries(plannedFileHashes).some(([id, hash]) => hash !== null && liveFileHashes[id] !== hash) ||
           (await fileContentChanges(liveFileHashes, current.planId)).size > 0);
-      if (!sourceChangedAfterPlanning && !fileChangedAfterPlanning && plan.config.providers &&
+      const target = plan.targetVersion ? await readPlan(plan.targetVersion) : null;
+      const tlsChangedAfterPlanning = plan.tlsFingerprint !== undefined &&
+        await gatewayTlsFingerprint(await tlsSource(plan.config, target)) !== plan.tlsFingerprint;
+      if (!sourceChangedAfterPlanning && !fileChangedAfterPlanning && !tlsChangedAfterPlanning && plan.config.providers &&
           !await featuresStackRunning(current.config, revision(current).directory)) {
         await activatePlan(state, plan, current);
         return resultFor(await readActive(), plan);
       }
-      const outcome = sourceChangedAfterPlanning || fileChangedAfterPlanning
+      const outcome = tlsChangedAfterPlanning
+        ? { code: 'APPLY_FAILED', message: 'TLS files changed after planning. Create a new plan.' } as const
+        : sourceChangedAfterPlanning || fileChangedAfterPlanning
         ? { code: 'APPLY_FAILED', message: `The ${sourceChangedAfterPlanning ? 'GeoJSON' : 'file'} source changed after planning. Create a new plan.` } as const
         : { code: 'NO_CHANGE' } as const;
       if (outcome.code === 'NO_CHANGE') await persistProviderEdit(plan);

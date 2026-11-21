@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFile, writeFile } from 'node:fs/promises';
+import { X509Certificate } from 'node:crypto';
+import { readFile, rename, writeFile } from 'node:fs/promises';
+import { get } from 'node:https';
+import { dirname, join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { test } from 'node:test';
 import { auth, cookieFrom, emailLink, register, request, session, signIn } from './access-client.mjs';
@@ -100,12 +103,12 @@ test('password change and email recovery revoke all previous sessions', async ()
 
 const collection = '/features/collections/registered-places';
 
-function features(path, cookie) {
-  return request(path, cookie ? { headers: { Cookie: cookie } } : undefined);
+function features(path, cookie, headers) {
+  return request(path, { headers: { ...headers, ...(cookie && { Cookie: cookie }) } });
 }
 
-async function document(path, cookie) {
-  const response = await features(path, cookie);
+async function document(path, cookie, headers) {
+  const response = await features(path, cookie, headers);
   assert.equal(response.status, 200, path);
   assert.equal(response.headers.get('cache-control'), 'no-store', path);
   return response.json();
@@ -242,26 +245,104 @@ test('access and PostgreSQL outages return Features 503 and leave public data av
   }
 });
 
-function cli(...args) {
-  const result = spawnSync(process.execPath, ['dist/cli.js', 'config', ...args, '--json'], {
-    encoding: 'utf8', timeout: 100_000, windowsHide: true,
+function cliResult(args, exitCode = 0, env = process.env) {
+  const { NODE_EXTRA_CA_CERTS: _ca, ...operatorEnv } = env;
+  const result = spawnSync(process.execPath, ['dist/cli.js', ...args, '--json'], {
+    encoding: 'utf8', timeout: 100_000, windowsHide: true, env: operatorEnv,
   });
   assert.ifError(result.error);
-  assert.equal(result.status, 0, result.stderr || result.stdout);
-  return JSON.parse(result.stdout).data;
+  assert.equal(result.status, exitCode, result.stderr || result.stdout);
+  return JSON.parse(result.stdout);
+}
+
+function cli(...args) {
+  return cliResult(['config', ...args]).data;
+}
+
+function httpsYaml(yaml, certificate = 'https-cert.pem', key = 'https-key.pem') {
+  return yaml.replace('  host: localhost\n', `  host: localhost\n  tls:
+    cert_file: ${certificate}
+    key_file: ${key}
+    ca_file: gateway-root.pem
+`);
+}
+
+test('TLS rejects invalid certificate material before opening or closing routes', async () => {
+  const filename = process.env.GIS_TEST_CONFIG;
+  const current = await readFile(filename, 'utf8');
+  const activeVersion = cliResult(['status']).data.currentVersion;
+  const closedPort = process.env.GIS_TEST_EMPTY_TLS_PORT;
+  const closedRedirect = process.env.GIS_TEST_EMPTY_REDIRECT_PORT;
+  const empty = { ...process.env, GIS_STATE_DIR: join(dirname(filename), 'empty-tls-state'),
+    COMPOSE_PROJECT_NAME: `${process.env.COMPOSE_PROJECT_NAME}-empty-tls`, GIS_HTTP_REDIRECT_PORT: closedRedirect };
+  const ready = '/features/collections/places?f=json';
+  for (const [name, yaml, reason] of [
+    ['missing', httpsYaml(current, 'missing-cert.pem'), /TLS.*file/i],
+    ['malformed', httpsYaml(current, 'places.geojson'), /TLS certificate.*PEM/i],
+    ['incomplete-chain', httpsYaml(current, 'https-leaf.pem'), /TLS certificate chain/i],
+    ['untrusted-chain', httpsYaml(current).replace('ca_file: gateway-root.pem', 'ca_file: https-next-leaf.pem'), /TLS certificate chain/i],
+    ['wrong-key', httpsYaml(current, 'https-cert.pem', 'https-next-key.pem'), /TLS private key/i],
+    ['wrong-host', httpsYaml(current).replace('host: localhost', 'host: other.test'), /TLS certificate.*hostname/i],
+    ['cn-without-san', httpsYaml(current, 'https-cn-only-cert.pem', 'https-cn-only-key.pem'), /TLS certificate.*hostname/i],
+    ['redirect-port', httpsYaml(current).replace(/  port: \d+\n/,
+      `  port: ${new URL(process.env.GIS_TEST_HTTP_REDIRECT_URL).port}\n`), /redirect port.*HTTPS port/i],
+    ['expired', httpsYaml(current, 'https-expired-cert.pem', 'https-expired-key.pem'), /TLS certificate.*expired/i],
+    ['future', httpsYaml(current, 'https-future-cert.pem', 'https-future-key.pem'), /TLS certificate.*not yet valid/i],
+  ]) {
+    const candidate = join(dirname(filename), `tls-${name}.yaml`);
+    await writeFile(candidate, yaml);
+    const { planId } = cli('plan', candidate);
+    const failure = cliResult(['config', 'apply', planId], 6);
+    assert.match(failure.data.message, reason);
+    assert.equal(failure.code, 'APPLY_FAILED');
+    assert.equal(cliResult(['status']).data.currentVersion, activeVersion);
+    assert.equal((await request(ready)).status, 200);
+
+    if (name === 'incomplete-chain') {
+      const first = join(dirname(filename), 'first-start-invalid-tls.yaml');
+      await writeFile(first, yaml.replace(/  port: \d+\n/, `  port: ${closedPort}\n`));
+      const separate = cliResult(['config', 'plan', first], 0, empty).data;
+      assert.equal(cliResult(['config', 'apply', separate.planId], 6, empty).code, 'APPLY_FAILED');
+      assert.equal(cliResult(['status'], 0, empty).data.currentVersion, null);
+      await assert.rejects(request(`https://localhost:${closedPort}${ready}`));
+      await assert.rejects(request(`http://localhost:${closedRedirect}${ready}`));
+    }
+  }
+});
+
+function peerFingerprint(url) {
+  return new Promise((resolve, reject) => {
+    const req = get(url, { agent: false, signal: AbortSignal.timeout(5_000) }, (response) => {
+      resolve(response.socket.getPeerX509Certificate().fingerprint256);
+      response.resume();
+    });
+    req.on('error', reject);
+  });
 }
 
 test('HTTPS serves the account flow with a Secure session cookie', async () => {
   const filename = process.env.GIS_TEST_CONFIG;
   const current = await readFile(filename, 'utf8');
-  await writeFile(filename, current.replace('  host: localhost\n',
-    '  host: localhost\n  tls:\n    cert_file: https-cert.pem\n    key_file: https-key.pem\n'));
+  await writeFile(filename, httpsYaml(current));
   const plan = cli('plan', filename);
   cli('apply', plan.planId);
-  const origin = gateway.replace('http:', 'https:');
+  const origin = process.env.GIS_TEST_HTTPS_URL;
+  const redirectOrigin = process.env.GIS_TEST_HTTP_REDIRECT_URL;
+  assert.equal(plan.previousPublicUrl, gateway);
+  assert.equal(plan.publicUrl, origin);
+  assert.equal(plan.previousUrl, `${gateway}${collection}`);
   assert.equal(plan.newUrl, `${origin}${collection}`);
-  assert.equal((await request(`${origin}/account/login`)).status, 200);
-  const plainHttp = await request('/account/login').catch(() => null);
+  const httpsPage = await request(`${origin}/account/login`);
+  assert.equal(httpsPage.status, 200);
+  assert.equal(httpsPage.headers.get('strict-transport-security'), null);
+  const path = '/account/login?return=%2Ffeatures';
+  const redirected = await request(`${redirectOrigin}${path}`, {
+    redirect: 'manual', headers: { Host: 'other.test', 'X-Forwarded-Proto': 'https' },
+  });
+  assert.equal(redirected.status, 308);
+  assert.equal(redirected.headers.get('location'), `${origin}${path}`);
+  assert.equal(redirected.headers.get('strict-transport-security'), null);
+  const plainHttp = await request('/account/login', { redirect: 'manual' }).catch(() => null);
   assert.ok(plainHttp === null || !plainHttp.ok);
 
   const email = 'https@example.test';
@@ -277,5 +358,69 @@ test('HTTPS serves the account flow with a Secure session cookie', async () => {
   const cookie = cookieFrom(login);
   assert.equal((await document(`${origin}${collection}/items/central?f=json`, cookie)).id, 'central');
   const api = await document(`${origin}/features/openapi?f=json`, cookie);
+  assert.equal(api.servers[0].url, `${origin}/features`);
   assert.equal(api.components.securitySchemes.session.name, '__Secure-gis.session_token');
+  const metadata = await document(`${origin}${collection}?f=json`, cookie, {
+    Forwarded: 'host=other.test;proto=http', 'X-Forwarded-Host': 'other.test',
+    'X-Forwarded-Proto': 'http', 'X-Forwarded-Port': '9',
+  });
+  assert.ok(metadata.links.length);
+  for (const { href } of metadata.links) assert.equal(new URL(href).origin, origin);
+
+  const initial = new X509Certificate(await readFile(join(dirname(filename), 'https-leaf.pem')));
+  const rotated = new X509Certificate(await readFile(join(dirname(filename), 'https-next-leaf.pem')));
+  assert.equal(await peerFingerprint(origin), initial.fingerprint256);
+  assert.deepEqual(cliResult(['doctor']).data.tls,
+    { state: 'ready', expiresAt: initial.validToDate.toISOString() });
+  const beforeRotation = cli('plan', filename);
+  await writeFile(join(dirname(filename), 'https-cert.pem'), await readFile(join(dirname(filename), 'https-next-cert.pem')));
+  assert.match(cliResult(['config', 'apply', beforeRotation.planId], 6).data.message, /TLS files changed after planning/);
+  const invalidRotation = cli('plan', filename);
+  assert.match(cliResult(['config', 'apply', invalidRotation.planId], 6).data.message, /TLS private key/);
+  assert.equal(cliResult(['status']).data.currentVersion, plan.planId);
+  assert.equal(await peerFingerprint(origin), initial.fingerprint256);
+  await writeFile(join(dirname(filename), 'https-key.pem'), await readFile(join(dirname(filename), 'https-next-key.pem')));
+  const rotation = cli('plan', filename);
+  cli('apply', rotation.planId);
+  assert.equal(await peerFingerprint(origin), rotated.fingerprint256);
+  assert.equal(cliResult(['doctor']).data.tls.expiresAt, rotated.validToDate.toISOString());
+
+  const archive = join(process.env.GIS_STATE_DIR, 'tls', plan.planId);
+  const backup = `${archive}-backup`;
+  await rename(archive, backup);
+  try {
+    const missing = cliResult(['config', 'plan', '--rollback-to', plan.planId], 2);
+    assert.match(missing.data.message, /archived TLS files.*selected version/i);
+  } finally {
+    await rename(backup, archive);
+  }
+  const certFile = join(archive, 'cert.pem');
+  const originalCertificate = await readFile(certFile);
+  await writeFile(certFile, await readFile(join(dirname(filename), 'https-next-cert.pem')));
+  try {
+    const changed = cliResult(['config', 'plan', '--rollback-to', plan.planId], 2);
+    assert.match(changed.data.message, /archived TLS files.*selected version/i);
+  } finally {
+    await writeFile(certFile, originalCertificate);
+  }
+  assert.equal(await peerFingerprint(origin), rotated.fingerprint256);
+  const rollback = cli('plan', '--rollback-to', plan.planId);
+  cli('apply', rollback.planId);
+  assert.equal(await peerFingerprint(origin), initial.fingerprint256);
+
+  await writeFile(filename, httpsYaml(current).replace('    cert_file: https-cert.pem\n', ''));
+  const http = cli('plan', filename);
+  assert.equal(http.previousUrl, `${origin}${collection}`);
+  assert.equal(http.newUrl, `${gateway}${collection}`);
+  cli('apply', http.planId);
+  await assert.rejects(request(`${origin}/account/login`));
+  if (redirectOrigin !== gateway) await assert.rejects(request(`${redirectOrigin}${path}`));
+  const httpLogin = await auth('sign-in/email', { email, password });
+  assert.equal(httpLogin.status, 200);
+  const httpCookie = cookieFrom(httpLogin);
+  assert.match(httpCookie, /^gis\.session_token=/);
+  const cookieHeader = httpLogin.headers.getSetCookie().find((value) => value.startsWith('gis.session_token='));
+  assert.doesNotMatch(cookieHeader, /; Secure\b/i);
+  assert.equal((await document('/features/openapi?f=json', httpCookie)).servers[0].url, `${gateway}/features`);
+  assert.equal(cliResult(['doctor']).data.tls, undefined);
 });

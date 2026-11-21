@@ -17,11 +17,12 @@ const toolsImage = 'geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35b
 const containerUser = process.getuid === undefined ? [] : ['--user', `${process.getuid()}:${process.getgid()}`];
 const resultsMount = ['--mount', `type=bind,src=${results},dst=/results`];
 const stackEnvironment = { COMPOSE_PROJECT_NAME: project, GIS_STATE_DIR: join(results, 'state') };
+const redirectPort = await freePort();
 
 function run(name, executable, args, env = {}) {
   const result = spawnSync(executable, args, {
     cwd: root,
-    env: { ...process.env, ...env },
+    env: { ...process.env, GIS_PUBLIC_BIND: '127.0.0.1', GIS_HTTP_REDIRECT_PORT: String(redirectPort), ...env },
     encoding: 'utf8',
     maxBuffer: 16 * 1024 * 1024,
     windowsHide: true,
@@ -237,24 +238,31 @@ function makeGatewayCertificate(suite) {
     'subjectAltName=DNS:localhost', '-keyout', '/results/https-key.pem', '-out', '/results/https-cert.pem']);
 }
 
-async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = false } = {}) {
+function makeGatewayChain() {
+  run('gateway-certificates', 'docker', ['run', '--rm', ...containerUser, ...resultsMount, '-w', '/results',
+    '--entrypoint', '/bin/sh', toolsImage, '-ec', readFileSync(join(root, 'tests/gateway-certificates.sh'), 'utf8')]);
+}
+
+async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = false, standardPorts = false } = {}) {
   run(`build-${suite}-cli`, process.execPath, ['node_modules/typescript/bin/tsc']);
   const accessProject = `${project}-${suite}`;
   const accessEnvironment = { COMPOSE_PROJECT_NAME: accessProject, GIS_STATE_DIR: join(results, `${suite}-state`) };
-  const port = await freePort();
+  const port = standardPorts ? 80 : await freePort();
+  const httpRedirect = standardPorts ? 80 : redirectPort;
+  accessEnvironment.GIS_HTTP_REDIRECT_PORT = String(httpRedirect);
   const mailPort = await freePort();
   const file = join(results, `${suite}.yaml`);
   copyFileSync(join(root, 'examples/places.geojson'), join(results, 'places.geojson'));
   for (const name of ['auth-secret', 'postgres-password']) {
     writeFileSync(join(results, name), randomBytes(32).toString('hex'), { mode: 0o600 });
   }
-  makeGatewayCertificate(suite);
-  const config = readFileSync(join(root, 'examples/features.yaml'), 'utf8');
+  if (suite === 'access') makeGatewayChain();
+  const config = readFileSync(join(root, 'examples/features.yaml'), 'utf8').replace(/\r\n/g, '\n');
   const entryStart = config.indexOf('  places:');
   const publicPublication = config.slice(entryStart);
   const registered = publicPublication.replace('  places:', '  registered-places:')
     .replace('access: public', 'access: registered').replace('title: Example places', 'title: Registered example');
-  const platform = config.slice(0, entryStart).replace('port: 8080', `port: ${port}`);
+  const platform = config.slice(0, entryStart).replace('  port: 8080\n', standardPorts ? '' : `  port: ${port}\n`);
   const closed = suite === 'private' ? ['private-places', 'other-private'].map((id) => publicPublication
     .replace('  places:', `  ${id}:`).replace('access: public', 'access: private')
     .replace('title: Example places', `title: ${id === 'private-places' ? 'Closed places' : 'Other closed places'}`)).join('') : '';
@@ -279,13 +287,18 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
   assert.deepEqual(plan.added, ['registered-places', 'places', ...(closed ? ['private-places', 'other-private'] : [])]);
   try {
     assert.equal(cli(`apply-${suite}`, ['apply', plan.planId], accessEnvironment).code, 'OK');
-    const filter = process.argv[3] ? [`--test-name-pattern=${process.argv[3]}`] : [];
+    const pattern = standardPorts ? '^HTTPS serves' : process.argv[3];
+    const filter = pattern ? [`--test-name-pattern=${pattern}`] : [];
     const environment = {
       ...accessEnvironment,
-      GIS_TEST_PUBLIC_URL: `http://localhost:${port}`,
+      GIS_TEST_PUBLIC_URL: new URL(`http://localhost:${port}`).origin,
+      GIS_TEST_HTTPS_URL: new URL(`https://localhost:${standardPorts ? 443 : port}`).origin,
+      GIS_TEST_HTTP_REDIRECT_URL: new URL(`http://localhost:${httpRedirect}`).origin,
+      GIS_TEST_EMPTY_TLS_PORT: String(await freePort()),
+      GIS_TEST_EMPTY_REDIRECT_PORT: String(await freePort()),
       GIS_TEST_MAILPIT: `http://localhost:${mailPort}`,
       GIS_TEST_CONFIG: file,
-      NODE_EXTRA_CA_CERTS: join(results, 'https-cert.pem'),
+      ...(suite === 'access' && { NODE_EXTRA_CA_CERTS: join(results, 'gateway-root.pem') }),
       GIS_REVISION_DIR: join(accessEnvironment.GIS_STATE_DIR, 'plans', plan.planId),
       GIS_AUTH_SECRET_FILE: join(results, 'auth-secret'),
       GIS_POSTGRES_PASSWORD_FILE: join(results, 'postgres-password'),
@@ -308,6 +321,11 @@ async function runAccessTests(suite = 'access', { qgis = false, desktopOnly = fa
     run(`${suite}-down`, 'docker', ['compose', '-p', accessProject, '-f', 'compose.yaml', '-f', 'compose.auth.yaml',
       '-f', 'compose.mailpit.yaml', 'down', '--remove-orphans', '--volumes']);
     removeTestVolumes(accessProject);
+    if (suite === 'access' && !standardPorts) {
+      const empty = `${accessProject}-empty-tls`;
+      run('empty-tls-down', 'docker', ['compose', '-p', empty, 'down', '--remove-orphans', '--volumes']);
+      removeTestVolumes(empty);
+    }
   }
 }
 
@@ -330,6 +348,10 @@ if (selectedProviderSuite) {
 }
 if (mode === '--access') {
   await runAccessTests(mode.slice(2));
+  process.exit(0);
+}
+if (mode === '--tls-standard') {
+  await runAccessTests('access', { standardPorts: true });
   process.exit(0);
 }
 if (mode === '--qgis') {

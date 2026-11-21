@@ -7,18 +7,19 @@
     "schema_version": { "const": 1 },
     "server": {
       "type": "object",
-      "required": ["host", "port"],
+      "required": ["host"],
       "additionalProperties": false,
       "properties": {
         "host": { "type": "string", "maxLength": 253, "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$" },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "tls": {
           "type": "object",
-          "required": ["cert_file", "key_file"],
+          "dependencies": { "cert_file": ["key_file"] },
           "additionalProperties": false,
           "properties": {
             "cert_file": { "type": "string", "minLength": 1 },
-            "key_file": { "type": "string", "minLength": 1 }
+            "key_file": { "type": "string", "minLength": 1 },
+            "ca_file": { "type": "string", "minLength": 1 }
           }
         }
       }

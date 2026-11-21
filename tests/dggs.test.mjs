@@ -71,7 +71,7 @@ test('pydggsapi serves H3 snapshots through the configured gateway', async (t) =
   const platform = {
     schema_version: 1,
     server: { host: 'localhost', port: Number(new URL(gateway).port),
-      tls: { cert_file: 'https-cert.pem', key_file: 'https-key.pem' } },
+      tls: { cert_file: 'https-cert.pem', key_file: 'https-key.pem', ca_file: 'https-cert.pem' } },
     sources: Object.fromEntries(['dense', 'sparse'].map((name) => [name, {
       type: 'parquet', path: `${name}-v1.parquet`, id_field: 'h3_id', resolution: 7, properties: ['tally', 'metric'],
     }])),

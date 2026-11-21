@@ -9,6 +9,7 @@
 ```sh
 npm ci
 npm run build
+export GIS_PUBLIC_BIND=127.0.0.1
 node dist/cli.js config validate examples/features.yaml
 node dist/cli.js config plan examples/features.yaml
 ```
@@ -75,7 +76,7 @@ openssl rand -hex 32 > .gis-platform/postgres-password
     password_file: .gis-platform/smtp-password
 ```
 
-Реле должно поддерживать STARTTLS. Для TLS с момента подключения укажите `smtp.secure: true`. Для реле без SMTP-аутентификации опустите `username` и `password_file`. Для HTTPS укажите `server.tls.cert_file` и `server.tls.key_file` и задайте в `server.host` имя из сертификата. Письма, ссылки Features и cookie используют настроенный внешний адрес. [Задача #15](https://github.com/stepanosokin/gis-platform/issues/15) · [Полная приёмка транспорта #31](https://github.com/stepanosokin/gis-platform/issues/31)
+Реле должно поддерживать STARTTLS. Для TLS с момента подключения укажите `smtp.secure: true`. Для реле без SMTP-аутентификации опустите `username` и `password_file`. Письма, ссылки Features и cookie используют внешний адрес платформы. [Настройка внешнего HTTP или HTTPS](ADMIN.md#внешний-http-и-https)
 
 ### Персональный токен для QGIS
 

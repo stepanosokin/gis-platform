@@ -79,6 +79,7 @@ async function main() {
     `Added: ${plan.added.join(', ') || 'none'}`,
     `Changed: ${plan.changed.join(', ') || 'none'}`,
     `Removed: ${plan.removed.join(', ') || 'none'}`,
+    `Public URL: ${plan.previousPublicUrl ?? '(none)'} → ${plan.publicUrl}`,
     `URL: ${plan.previousUrl ?? '(none)'} → ${plan.newUrl ?? '(none)'}`,
     ...plan.publications.map(({ publicationId, previousUrl, newUrl, previousAccess, newAccess, personalGrants }) =>
       `${publicationId}: ${previousUrl ?? '(none)'} → ${newUrl ?? '(none)'} | access: ${previousAccess ?? 'none'} → ${newAccess ?? 'none'} | grants: ${personalGrants}`),
@@ -125,9 +126,11 @@ function formatAdminResult({ code, data }: Pick<Awaited<ReturnType<typeof runAdm
   }
   if (group === 'doctor' && data.publications && typeof data.gateway === 'string') {
     const publications = data.publications as Awaited<ReturnType<typeof configurationDoctor>>['publications'];
+    const tls = data.tls as Awaited<ReturnType<typeof configurationDoctor>>['tls'];
     return [
       `Current version: ${data.currentVersion}`,
       `Gateway: ${data.gateway}`,
+      ...(tls ? [`TLS: ${tls.state}${tls.expiresAt ? ` | expires: ${tls.expiresAt}` : ''}`] : []),
       ...publications.map(({ publicationId, instance, source }) => `${publicationId} | instance: ${instance} | source: ${source}`),
     ].join('\n');
   }

@@ -1,5 +1,7 @@
 services:
   caddy:
+    ports:
+      - "${GIS_PUBLIC_BIND:+${GIS_PUBLIC_BIND:-}:}${GIS_HTTP_REDIRECT_PORT:-80}:80"
     secrets:
       - tls_cert
       - tls_key
