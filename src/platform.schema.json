@@ -1,63 +1,111 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Конфигурация развёртывания GIS Platform. Относительные пути к файлам считаются от каталога этого YAML.",
   "type": "object",
   "required": ["schema_version", "server", "sources", "providers", "publications"],
   "additionalProperties": false,
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": {
+      "description": "Версия формата YAML. Для текущей схемы укажите 1.",
+      "const": 1
+    },
     "server": {
+      "description": "Внешний адрес платформы и TLS шлюза Caddy.",
       "type": "object",
       "required": ["host"],
       "additionalProperties": false,
       "properties": {
-        "host": { "type": "string", "maxLength": 253, "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$" },
-        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "host": {
+          "description": "Имя хоста, которое клиенты используют в URL и которое платформа указывает в ссылках.",
+          "type": "string", "maxLength": 253, "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"
+        },
+        "port": {
+          "description": "Внешний порт шлюза. По умолчанию 80 для HTTP и 443 для HTTPS.",
+          "type": "integer", "minimum": 1, "maximum": 65535
+        },
         "tls": {
+          "description": "Параметры HTTPS. Наличие cert_file включает HTTPS.",
           "type": "object",
           "dependencies": { "cert_file": ["key_file"] },
           "additionalProperties": false,
           "properties": {
-            "cert_file": { "type": "string", "minLength": 1 },
-            "key_file": { "type": "string", "minLength": 1 },
-            "ca_file": { "type": "string", "minLength": 1 }
+            "cert_file": {
+              "description": "Путь к PEM-файлу с сертификатом шлюза и промежуточными сертификатами цепочки.",
+              "type": "string", "minLength": 1
+            },
+            "key_file": {
+              "description": "Путь к закрытому ключу сертификата шлюза.",
+              "type": "string", "minLength": 1
+            },
+            "ca_file": {
+              "description": "Путь к PEM-файлу с доверенным центром сертификации для проверки TLS шлюза средствами CLI.",
+              "type": "string", "minLength": 1
+            }
           }
         }
       }
     },
     "cors": {
+      "description": "Настройки доступа к API из веб-страниц, открытых с других адресов.",
       "type": "object",
       "required": ["allowed_origins"],
       "additionalProperties": false,
       "properties": {
         "allowed_origins": {
+          "description": "Разрешённые адреса веб-приложений. Укажите схему, хост и при необходимости порт. Пример — https://map.example.org.",
           "type": "array", "uniqueItems": true,
           "items": { "type": "string", "maxLength": 270, "pattern": "^https?://(?:[A-Za-z0-9.-]+|\\[[0-9a-f:]+\\])(?::[0-9]{1,5})?$" }
         }
       }
     },
     "auth": {
+      "description": "Настройки регистрации, входа и доступа к защищённым публикациям.",
       "type": "object",
       "required": ["mode", "secret_file", "postgres_password_file"],
       "additionalProperties": false,
       "properties": {
-        "mode": { "enum": ["development", "production"] },
-        "secret_file": { "type": "string", "minLength": 1 },
-        "postgres_password_file": { "type": "string", "minLength": 1 },
+        "mode": {
+          "description": "Режим отправки писем. development использует локальный Mailpit, production требует внешнее SMTP-реле.",
+          "enum": ["development", "production"]
+        },
+        "secret_file": {
+          "description": "Путь к файлу с секретом компонента аутентификации.",
+          "type": "string", "minLength": 1
+        },
+        "postgres_password_file": {
+          "description": "Путь к файлу с паролем PostgreSQL, где хранятся учётные записи и права доступа.",
+          "type": "string", "minLength": 1
+        },
         "administrator_emails": {
+          "description": "Email учётных записей с правами администратора платформы.",
           "type": "array",
           "uniqueItems": true,
           "items": { "type": "string", "maxLength": 254, "pattern": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$" }
         },
         "cli": {
+          "description": "Настройки локального административного API, через который CLI выполняет диагностику и управляет доступом.",
           "type": "object",
           "required": ["port", "ca_file", "cert_file", "key_file", "operators"],
           "additionalProperties": false,
           "properties": {
-            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-            "ca_file": { "type": "string", "minLength": 1 },
-            "cert_file": { "type": "string", "minLength": 1 },
-            "key_file": { "type": "string", "minLength": 1 },
+            "port": {
+              "description": "Локальный порт административного API. Используйте отдельный порт от шлюза и Mailpit.",
+              "type": "integer", "minimum": 1, "maximum": 65535
+            },
+            "ca_file": {
+              "description": "Путь к PEM-файлу с доверенным центром сертификации для проверки клиентских сертификатов операторов.",
+              "type": "string", "minLength": 1
+            },
+            "cert_file": {
+              "description": "Путь к PEM-сертификату сервера административного API.",
+              "type": "string", "minLength": 1
+            },
+            "key_file": {
+              "description": "Путь к закрытому ключу сертификата сервера административного API.",
+              "type": "string", "minLength": 1
+            },
             "operators": {
+              "description": "Права операторов по имени из их клиентского сертификата. diagnostics — состояние и диагностика, users-read — просмотр пользователей и токенов, access-write — изменение доступа.",
               "type": "object",
               "minProperties": 1,
               "propertyNames": { "pattern": "^[A-Za-z0-9_.-]{1,64}$" },
@@ -70,18 +118,40 @@
             }
           }
         },
-        "mailpit_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "mailpit_port": {
+          "description": "Локальный порт веб-интерфейса Mailpit в режиме development. По умолчанию 8025.",
+          "type": "integer", "minimum": 1, "maximum": 65535
+        },
         "smtp": {
+          "description": "Подключение к SMTP-реле для отправки писем в режиме production.",
           "type": "object",
           "required": ["host", "port", "from"],
           "additionalProperties": false,
           "properties": {
-            "host": { "type": "string", "minLength": 1 },
-            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-            "from": { "type": "string", "minLength": 1 },
-            "secure": { "type": "boolean" },
-            "username": { "type": "string", "minLength": 1 },
-            "password_file": { "type": "string", "minLength": 1 }
+            "host": {
+              "description": "Имя хоста SMTP-реле.",
+              "type": "string", "minLength": 1
+            },
+            "port": {
+              "description": "Порт SMTP-реле.",
+              "type": "integer", "minimum": 1, "maximum": 65535
+            },
+            "from": {
+              "description": "Адрес отправителя. Можно указать отображаемое имя, например GIS Platform <accounts@example.org>.",
+              "type": "string", "minLength": 1
+            },
+            "secure": {
+              "description": "При true TLS включается сразу. При false используется STARTTLS. Если поле опущено, TLS включается сразу на порту 465.",
+              "type": "boolean"
+            },
+            "username": {
+              "description": "Имя пользователя для SMTP-аутентификации. Указывается вместе с password_file.",
+              "type": "string", "minLength": 1
+            },
+            "password_file": {
+              "description": "Путь к файлу с паролем SMTP. Указывается вместе с username.",
+              "type": "string", "minLength": 1
+            }
           },
           "dependencies": { "username": ["password_file"], "password_file": ["username"] }
         }
@@ -91,18 +161,26 @@
       "else": { "properties": { "smtp": false } }
     },
     "sources": {
+      "description": "Источники пространственных данных по ID. Поле publications.<id>.source ссылается на один из этих ID.",
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/id" },
       "minProperties": 1,
       "additionalProperties": {
+        "description": "Один источник. Выберите вариант по полю type.",
         "oneOf": [
           {
             "type": "object",
             "required": ["type", "path"],
             "additionalProperties": false,
             "properties": {
-              "type": { "const": "geojson" },
-              "path": { "type": "string", "minLength": 1 }
+              "type": {
+                "description": "Формат файла источника — GeoJSON.",
+                "const": "geojson"
+              },
+              "path": {
+                "description": "Путь к GeoJSON-файлу с коллекцией объектов.",
+                "type": "string", "minLength": 1
+              }
             }
           },
           {
@@ -110,10 +188,22 @@
             "required": ["type", "path", "layer", "id_field"],
             "additionalProperties": false,
             "properties": {
-              "type": { "enum": ["geopackage", "shapefile"] },
-              "path": { "type": "string", "minLength": 1 },
-              "layer": { "type": "string", "minLength": 1 },
-              "id_field": { "$ref": "#/$defs/sqlIdentifier" }
+              "type": {
+                "description": "Формат векторного файла — GeoPackage или Shapefile.",
+                "enum": ["geopackage", "shapefile"]
+              },
+              "path": {
+                "description": "Путь к файлу .gpkg или .shp.",
+                "type": "string", "minLength": 1
+              },
+              "layer": {
+                "description": "Имя слоя GeoPackage или имя слоя Shapefile без расширения .shp.",
+                "type": "string", "minLength": 1
+              },
+              "id_field": {
+                "description": "Имя поля со стабильным уникальным ID объекта.",
+                "$ref": "#/$defs/sqlIdentifier"
+              }
             }
           },
           {
@@ -121,9 +211,18 @@
             "required": ["type", "path", "id_field"],
             "additionalProperties": false,
             "properties": {
-              "type": { "const": "geoparquet" },
-              "path": { "type": "string", "minLength": 1 },
-              "id_field": { "$ref": "#/$defs/sqlIdentifier" }
+              "type": {
+                "description": "Формат векторного файла — GeoParquet.",
+                "const": "geoparquet"
+              },
+              "path": {
+                "description": "Путь к файлу GeoParquet.",
+                "type": "string", "minLength": 1
+              },
+              "id_field": {
+                "description": "Имя поля со стабильным уникальным ID объекта.",
+                "$ref": "#/$defs/sqlIdentifier"
+              }
             }
           },
           {
@@ -131,11 +230,24 @@
             "required": ["type", "path", "id_field", "resolution", "properties"],
             "additionalProperties": false,
             "properties": {
-              "type": { "const": "parquet" },
-              "path": { "type": "string", "minLength": 1 },
-              "id_field": { "$ref": "#/$defs/dggsColumn" },
-              "resolution": { "type": "integer", "minimum": 0, "maximum": 15 },
+              "type": {
+                "description": "Parquet со строками для ячеек H3. Используется для публикации DGGS.",
+                "const": "parquet"
+              },
+              "path": {
+                "description": "Путь к снимку Parquet с одной строкой на ячейку H3.",
+                "type": "string", "minLength": 1
+              },
+              "id_field": {
+                "description": "Имя строкового столбца с уникальным ID ячейки H3.",
+                "$ref": "#/$defs/dggsColumn"
+              },
+              "resolution": {
+                "description": "Разрешение H3 всех ячеек в снимке.",
+                "type": "integer", "minimum": 0, "maximum": 15
+              },
               "properties": {
+                "description": "Имена числовых столбцов, значения которых возвращает DGGS API.",
                 "type": "array", "minItems": 1, "uniqueItems": true,
                 "items": { "$ref": "#/$defs/dggsColumn" }
               }
@@ -146,9 +258,18 @@
             "required": ["type", "path"],
             "additionalProperties": false,
             "properties": {
-              "type": { "enum": ["geotiff", "cog"] },
-              "path": { "type": "string", "minLength": 1 },
-              "epsg": { "type": "integer", "minimum": 1, "maximum": 99999999 }
+              "type": {
+                "description": "Формат растра — GeoTIFF или Cloud Optimized GeoTIFF (COG).",
+                "enum": ["geotiff", "cog"]
+              },
+              "path": {
+                "description": "Путь к растровому файлу .tif или .tiff.",
+                "type": "string", "minLength": 1
+              },
+              "epsg": {
+                "description": "Код EPSG исходной системы координат растра. По умолчанию 4326.",
+                "type": "integer", "minimum": 1, "maximum": 99999999
+              }
             }
           },
           {
@@ -156,12 +277,30 @@
             "required": ["type", "schema", "relation", "id_field", "geometry_field", "max_lag_seconds"],
             "additionalProperties": false,
             "properties": {
-              "type": { "const": "postgis" },
-              "schema": { "$ref": "#/$defs/sqlIdentifier" },
-              "relation": { "$ref": "#/$defs/sqlIdentifier" },
-              "id_field": { "$ref": "#/$defs/sqlIdentifier" },
-              "geometry_field": { "$ref": "#/$defs/sqlIdentifier" },
-              "max_lag_seconds": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+              "type": {
+                "description": "Источник в базе данных PostGIS.",
+                "const": "postgis"
+              },
+              "schema": {
+                "description": "Имя схемы PostgreSQL, в которой находится источник.",
+                "$ref": "#/$defs/sqlIdentifier"
+              },
+              "relation": {
+                "description": "Имя таблицы или представления с данными публикации.",
+                "$ref": "#/$defs/sqlIdentifier"
+              },
+              "id_field": {
+                "description": "Имя столбца с уникальным стабильным ID объекта.",
+                "$ref": "#/$defs/sqlIdentifier"
+              },
+              "geometry_field": {
+                "description": "Имя столбца с геометрией.",
+                "$ref": "#/$defs/sqlIdentifier"
+              },
+              "max_lag_seconds": {
+                "description": "Гарантированная задержка подготовки источника в секундах. 0 означает доступность изменений сразу после их подтверждения.",
+                "type": "integer", "minimum": 0, "maximum": 9007199254740991
+              }
             }
           },
           {
@@ -169,56 +308,113 @@
             "required": ["type", "path"],
             "additionalProperties": false,
             "properties": {
-              "type": { "enum": ["mbtiles", "pmtiles"] },
-              "path": { "type": "string", "minLength": 1 }
+              "type": {
+                "description": "Формат архива тайлов — MBTiles или PMTiles.",
+                "enum": ["mbtiles", "pmtiles"]
+              },
+              "path": {
+                "description": "Путь к файлу архива с готовыми тайлами.",
+                "type": "string", "minLength": 1
+              }
             }
           }
         ]
       }
     },
     "providers": {
+      "description": "Экземпляры сервис-провайдеров по ID. Поле publications.<id>.provider ссылается на один из этих ID.",
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/id" },
       "additionalProperties": {
+        "description": "Настройки одного экземпляра сервис-провайдера.",
         "type": "object",
         "required": ["type"],
         "additionalProperties": false,
         "properties": {
-          "type": { "enum": ["pygeoapi", "martin", "pydggsapi"] },
+          "type": {
+            "description": "Адаптер, который запускает и настраивает экземпляр сервиса — pygeoapi, martin или pydggsapi.",
+            "enum": ["pygeoapi", "martin", "pydggsapi"]
+          },
           "postgis": {
+            "description": "Подключение этого экземпляра к внешнему PostGIS с источниками публикаций.",
             "type": "object",
             "required": ["host", "database", "user", "password_file"],
             "additionalProperties": false,
             "properties": {
-              "host": { "type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[a-zA-Z0-9_.:%-]+$" },
-              "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-              "database": { "$ref": "#/$defs/sqlIdentifier" },
-              "user": { "$ref": "#/$defs/sqlIdentifier" },
-              "password_file": { "type": "string", "minLength": 1 }
+              "host": {
+                "description": "Имя хоста или IP-адрес PostGIS, доступный из контейнера сервис-провайдера.",
+                "type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[a-zA-Z0-9_.:%-]+$"
+              },
+              "port": {
+                "description": "Порт PostGIS. По умолчанию 5432.",
+                "type": "integer", "minimum": 1, "maximum": 65535
+              },
+              "database": {
+                "description": "Имя базы данных PostgreSQL.",
+                "$ref": "#/$defs/sqlIdentifier"
+              },
+              "user": {
+                "description": "Имя роли PostgreSQL для чтения источников.",
+                "$ref": "#/$defs/sqlIdentifier"
+              },
+              "password_file": {
+                "description": "Путь к файлу с паролем роли PostgreSQL.",
+                "type": "string", "minLength": 1
+              }
             }
           },
-          "image": { "type": "string", "maxLength": 512 },
-          "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "image": {
+            "description": "Ссылка на образ контейнера для управляемого экземпляра. При наличии image требуется api.",
+            "type": "string", "maxLength": 512
+          },
+          "digest": {
+            "description": "SHA-256 digest образа. Закрепляет версию контейнера для повторного применения и отката.",
+            "type": "string", "pattern": "^sha256:[0-9a-f]{64}$"
+          },
           "api": {
+            "description": "Параметры внутреннего HTTP API экземпляра и его маршрута через шлюз.",
             "type": "object",
             "required": ["protocol", "scheme", "port", "base_path", "public_root", "links", "readiness"],
             "additionalProperties": false,
             "properties": {
-              "protocol": { "enum": ["features", "maps", "mvt", "tiles", "dggs"] },
-              "scheme": { "const": "http" },
-              "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-              "base_path": { "type": "string", "pattern": "^/(?:[a-z][a-z0-9-]*(?:/[a-z][a-z0-9-]*)*)?$" },
-              "public_root": { "type": "string", "pattern": "^/[a-z][a-z0-9-]*(?:/[a-z][a-z0-9-]*)*$" },
-              "links": { "const": "canonical" },
-              "readiness": { "type": "string", "pattern": "^/[a-z][a-z0-9/-]*(?:\\?f=json)?$" }
+              "protocol": {
+                "description": "Протокол экземпляра. Допустимые сочетания протокола и адаптера проверяет CLI.",
+                "enum": ["features", "maps", "mvt", "tiles", "dggs"]
+              },
+              "scheme": {
+                "description": "Схема запросов к экземпляру внутри Docker Compose. Используется http.",
+                "const": "http"
+              },
+              "port": {
+                "description": "Порт, на котором сервис слушает внутри контейнера.",
+                "type": "integer", "minimum": 1, "maximum": 65535
+              },
+              "base_path": {
+                "description": "Базовый путь API внутри контейнера. Укажите /, если API доступен в корне.",
+                "type": "string", "pattern": "^/(?:[a-z][a-z0-9-]*(?:/[a-z][a-z0-9-]*)*)?$"
+              },
+              "public_root": {
+                "description": "Префикс путей этого API во внешнем адресе шлюза, например /features или /dggs.",
+                "type": "string", "pattern": "^/[a-z][a-z0-9-]*(?:/[a-z][a-z0-9-]*)*$"
+              },
+              "links": {
+                "description": "Режим формирования ссылок API. canonical задаёт ссылки через внешний адрес шлюза и public_root.",
+                "const": "canonical"
+              },
+              "readiness": {
+                "description": "Путь проверки готовности экземпляра относительно base_path. Для pydggsapi укажите /conformance.",
+                "type": "string", "pattern": "^/[a-z][a-z0-9/-]*(?:\\?f=json)?$"
+              }
             }
           },
           "environment": {
+            "description": "Строковые переменные окружения контейнера. Поддержка зависит от адаптера.",
             "type": "object",
             "propertyNames": { "pattern": "^[A-Z_][A-Z0-9_]*$" },
             "additionalProperties": { "type": "string" }
           },
           "volumes": {
+            "description": "Именованные тома экземпляра. Ключ задаёт имя тома, значение — абсолютный путь монтирования внутри контейнера.",
             "type": "object",
             "propertyNames": { "$ref": "#/$defs/id" },
             "additionalProperties": { "type": "string", "pattern": "^/(?:[a-zA-Z0-9_.-]+/)*[a-zA-Z0-9_.-]+$" }
@@ -230,32 +426,64 @@
       }
     },
     "publications": {
+      "description": "Публикации сервисов по постоянному ID. ID используется в URL и правилах доступа.",
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/id" },
       "additionalProperties": {
+        "description": "Одна публикация данных через заданный экземпляр и протокол.",
         "type": "object",
         "required": ["source", "provider", "protocol", "access", "title", "description", "extent"],
         "additionalProperties": false,
         "properties": {
-          "source": { "$ref": "#/$defs/id" },
-          "provider": { "$ref": "#/$defs/id" },
-          "protocol": { "enum": ["features", "maps", "mvt", "tiles", "dggs"] },
-          "tile_provider": { "$ref": "#/$defs/id" },
-          "access": { "enum": ["public", "registered", "private"] },
-          "title": { "type": "string", "minLength": 1 },
-          "description": { "type": "string", "minLength": 1 },
-          "time_field": { "$ref": "#/$defs/sqlIdentifier" },
+          "source": {
+            "description": "ID источника публикации из раздела sources.",
+            "$ref": "#/$defs/id"
+          },
+          "provider": {
+            "description": "ID обслуживающего экземпляра из раздела providers.",
+            "$ref": "#/$defs/id"
+          },
+          "protocol": {
+            "description": "Протокол выдачи публикации. Должен соответствовать протоколу указанного экземпляра.",
+            "enum": ["features", "maps", "mvt", "tiles", "dggs"]
+          },
+          "tile_provider": {
+            "description": "ID экземпляра Martin с подключением к PostGIS. Обязателен для OGC API — Tiles и отвечает за выдачу тайлов.",
+            "$ref": "#/$defs/id"
+          },
+          "access": {
+            "description": "Режим доступа. public — для всех. registered — для активных пользователей с подтверждённым email. private дополнительно требует персонального разрешения или роли администратора.",
+            "enum": ["public", "registered", "private"]
+          },
+          "title": {
+            "description": "Название публикации, которое видят клиенты в метаданных.",
+            "type": "string", "minLength": 1
+          },
+          "description": {
+            "description": "Описание содержимого публикации для клиентов.",
+            "type": "string", "minLength": 1
+          },
+          "time_field": {
+            "description": "Имя поля времени для фильтра datetime в публикации Features из PostGIS или GeoParquet.",
+            "$ref": "#/$defs/sqlIdentifier"
+          },
           "mvt_properties": {
+            "description": "Дополнительные столбцы PostGIS, которые включаются в атрибуты векторных тайлов.",
             "type": "array", "uniqueItems": true,
             "items": { "$ref": "#/$defs/sqlIdentifier" }
           },
           "maplibre": {
+            "description": "Стиль MapLibre и его ресурсы для публикации с протоколом mvt.",
             "type": "object",
             "required": ["style_file"],
             "additionalProperties": false,
             "properties": {
-              "style_file": { "type": "string", "minLength": 1 },
+              "style_file": {
+                "description": "Путь к JSON-файлу стиля MapLibre.",
+                "type": "string", "minLength": 1
+              },
               "resources": {
+                "description": "Файлы, на которые ссылается стиль. Ключ задаёт путь внутри публикации, значение — путь к локальному файлу.",
                 "type": "object",
                 "propertyNames": {
                   "pattern": "^(?:[A-Za-z0-9_-]+(?:[ ,][A-Za-z0-9_-]+)*/)*[A-Za-z0-9_-]+(?:@2x)?\\.(?:json|geojson|png|jpg|jpeg|webp|pbf|ttf|otf|woff2?)$"
@@ -265,18 +493,24 @@
             }
           },
           "crs": {
+            "description": "Коды поддерживаемых систем координат, которые разрешено запрашивать у публикации Features.",
             "type": "array", "minItems": 1, "uniqueItems": true,
             "items": { "type": "string", "minLength": 1, "maxLength": 72 }
           },
           "freshness": {
+            "description": "Требование к задержке обновления публикации из PostGIS.",
             "type": "object",
             "required": ["max_delay_seconds"],
             "additionalProperties": false,
             "properties": {
-              "max_delay_seconds": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+              "max_delay_seconds": {
+                "description": "Допустимая задержка обновления после подтверждённого изменения данных в секундах. По умолчанию 60.",
+                "type": "integer", "minimum": 0, "maximum": 9007199254740991
+              }
             }
           },
           "extent": {
+            "description": "Пространственный охват в CRS84. Укажите четыре числа в порядке запад, юг, восток, север.",
             "type": "array",
             "minItems": 4,
             "maxItems": 4,
@@ -292,8 +526,17 @@
     }
   },
   "$defs": {
-    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
-    "dggsColumn": { "type": "string", "pattern": "^[a-z_][a-z0-9_]{0,62}$" },
-    "sqlIdentifier": { "type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[^\\u0000-\\u001F\\u007F]+$" }
+    "id": {
+      "description": "Формат ID источника, экземпляра или публикации.",
+      "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    },
+    "dggsColumn": {
+      "description": "Формат имени столбца Parquet для H3.",
+      "type": "string", "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+    },
+    "sqlIdentifier": {
+      "description": "Формат имени столбца, отношения, схемы, базы данных или роли.",
+      "type": "string", "minLength": 1, "maxLength": 63, "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+    }
   }
 }
