@@ -331,7 +331,7 @@ node dist/cli.js doctor --json
 | `geoparquet` | Один векторный файл Parquet с метаданными GeoParquet и полем `id_field`. | Features через pygeoapi |
 | `postgis` | Таблица или представление, поле ID и поле геометрии. Подключение задаётся на экземпляре. | Features, MVT, OGC API — Tiles |
 | `geotiff`, `cog` | Геопривязанный растр `.tif` или `.tiff` и код его системы координат. | Maps через pygeoapi |
-| `mbtiles`, `pmtiles` | Архив готовых тайлов Web Mercator. | Прямые веб-тайлы через Martin |
+| `mbtiles`, `pmtiles` | Локальный архив растровых тайлов или MVT в Web Mercator. Тип тайлов определяется по каталогу Martin. | Прямые веб-тайлы через Martin |
 | `parquet` | Снимок H3 с одной строкой для каждой ячейки и числовыми показателями. | DGGS через pydggsapi |
 
 1. Подготовьте данные и доступ к файлу или БД. Проверьте ID объектов и систему координат.
@@ -514,6 +514,8 @@ curl -fsS "$public_url/mvt/observations"
 ```
 
 В MapLibre укажите этот URL для векторного источника, а `observations` — как `source-layer`. При использовании другого веб-сайта добавьте его origin в `cors.allowed_origins`. Для защищённых публикаций передавайте Bearer-токен запросам этой публикации, её TileJSON, тайлам и ресурсам.
+
+Для готовых векторных тайлов укажите источник `type: mbtiles` или `type: pmtiles` с путём к архиву и экземпляр Martin без подключения к PostGIS. Публикация использует `protocol: mvt`. В MapLibre укажите ID слоя из `vector_layers` в TileJSON как `source-layer`. Его задаёт архив.
 
 #### Стиль и связанные ресурсы MapLibre
 

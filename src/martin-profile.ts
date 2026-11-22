@@ -93,12 +93,22 @@ for id; do
 done
 `;
 
-export function checkTileJson(body: string, url: string, id: string, idField?: string) {
+export function checkTileJson(body: string, url: string, id: string,
+  expectedLayers: 'raster' | 'vector' | 'archive' | { idField: string }) {
   const document = JSON.parse(body) as { tiles?: string[]; scheme?: string;
-    data?: string[]; grids?: string[]; vector_layers?: { id: string; fields: Record<string, string> }[] };
-  const layer = document.vector_layers?.find((entry) => entry.id === id);
-  const validLayers = idField === undefined ? !document.vector_layers?.length :
-    layer?.fields && Object.hasOwn(layer.fields, idField);
+    data?: string[]; grids?: string[]; vector_layers?: { id: string; fields: Record<string, string> }[] | null };
+  const layers = document.vector_layers;
+  const noVectorLayers = layers == null || (Array.isArray(layers) && layers.length === 0);
+  let validLayers = noVectorLayers;
+  if (typeof expectedLayers === 'object') {
+    const layer = layers?.find((entry) => entry.id === id);
+    validLayers = Boolean(layer?.fields && Object.hasOwn(layer.fields, expectedLayers.idField));
+  } else if (expectedLayers === 'vector' || (expectedLayers === 'archive' && !noVectorLayers)) {
+    validLayers = Array.isArray(layers) && layers.length > 0 && layers.every((layer) =>
+      typeof layer?.id === 'string' && layer.id.trim() !== '' && layer.fields &&
+      typeof layer.fields === 'object' && !Array.isArray(layer.fields) &&
+      Object.values(layer.fields).every((field) => typeof field === 'string'));
+  }
   if (document.tiles?.length !== 1 || document.tiles[0] !== `${url}/{z}/{x}/{y}` ||
       document.data?.length || document.grids?.length ||
       (document.scheme && document.scheme !== 'xyz') || !validLayers) {

@@ -1026,15 +1026,18 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
           const { tiles } = JSON.parse(catalog ?? '') as { tiles: Record<string, { content_type: string }> };
           for (const [index, [key, publication]] of rendered.entries()) {
             const source = postgisSource(config, publication.source);
-            if (!source && !tiles[key]?.content_type?.startsWith('image/')) {
-              throw new Error(`Publication '${key}' does not contain raster tiles.`);
+            const contentType = tiles[key]?.content_type;
+            const vectorArchive = contentType === 'application/x-protobuf';
+            if (!source && !vectorArchive && !contentType?.startsWith('image/')) {
+              throw new Error(`Publication '${key}' has an unsupported tile format.`);
             }
+            const archiveLayers = vectorArchive ? 'vector' : 'raster';
             checkTileJson(documents[index] ?? '', `http://127.0.0.1:${instance.api.port}${root}/${key}`, key,
-              source?.id_field);
+              source ? { idField: source.id_field } : archiveLayers);
           }
         } catch {
           if (!instance.postgis) {
-            throw new FeaturesPreflightError(`Martin provider '${id}' failed to open its tile archives. Check the archive format, raster tiles and TileJSON.`);
+            throw new FeaturesPreflightError(`Martin provider '${id}' failed to open its tile archives. Check the tile format and TileJSON.`);
           }
           throw new FeaturesPreflightError(`Martin provider '${id}' failed to open its PostGIS sources. Check connectivity, access and source definitions.`);
         }
@@ -1576,7 +1579,8 @@ export async function startFeaturesStack(revision: Revision, confirmed?: Revisio
         }
         if (body) {
           if (mvt) {
-            checkTileJson(body, tileJsonUrl, id, postgisSource(config, source)?.id_field);
+            const postgis = postgisSource(config, source);
+            checkTileJson(body, tileJsonUrl, id, postgis ? { idField: postgis.id_field } : 'archive');
             continue;
           }
           const collection = JSON.parse(body) as { id?: string; links?: { rel: string; href: string }[] };

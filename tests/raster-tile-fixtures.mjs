@@ -23,23 +23,27 @@ export function solidPng(color) {
     pngChunk('IDAT', deflateSync(Buffer.concat(Array(size).fill(row)))), pngChunk('IEND', Buffer.alloc(0))]);
 }
 
-export function writeMbtiles(path, tile) {
+export function writeMbtiles(path, tile, vectorLayers) {
   using database = new DatabaseSync(path);
   database.exec(`CREATE TABLE metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB,
       PRIMARY KEY (zoom_level, tile_column, tile_row));
     INSERT INTO metadata VALUES ('name','Red control'), ('format','png'), ('type','baselayer'), ('version','1'),
       ('bounds','-180,-85,180,85'), ('minzoom','0'), ('maxzoom','0');`);
-  database.prepare('INSERT INTO tiles VALUES (0,0,0,?)').run(tile);
+  if (vectorLayers) {
+    database.exec("UPDATE metadata SET value = 'pbf' WHERE name = 'format'");
+    database.prepare("INSERT INTO metadata VALUES ('json', ?)").run(JSON.stringify({ vector_layers: vectorLayers }));
+  }
+  database.prepare('INSERT INTO tiles VALUES (0,0,0,?)').run(vectorLayers ? gzipSync(tile) : tile);
 }
 
-export async function writePmtiles(path, tile, tileType = 2) {
+export async function writePmtiles(path, tile, vectorLayers) {
   // PMTiles v3, one root entry for z/x/y 0/0/0. Test fixture sizes fit in at most two varint bytes.
   const length = tile.length < 128 ? [tile.length] : [(tile.length & 127) | 128, tile.length >> 7];
   const root = gzipSync(Buffer.from([1, 0, 1, ...length, 1]));
-  const metadata = gzipSync(Buffer.from(JSON.stringify(tileType === 2
-    ? { name: 'Blue control', attribution: 'Raster fixtures' }
-    : { vector_layers: [{ id: 'x', fields: {} }] })));
+  const metadata = gzipSync(Buffer.from(JSON.stringify(vectorLayers
+    ? { vector_layers: vectorLayers }
+    : { name: 'Blue control', attribution: 'Raster fixtures' })));
   const header = Buffer.alloc(127);
   header.write('PMTiles');
   header[7] = 3;
@@ -47,7 +51,7 @@ export async function writePmtiles(path, tile, tileType = 2) {
   const tileOffset = metadataOffset + metadata.length;
   const fields = [header.length, root.length, metadataOffset, metadata.length, tileOffset, 0, tileOffset, tile.length, 1, 1, 1];
   for (const [index, field] of fields.entries()) header.writeBigUInt64LE(BigInt(field), 8 + index * 8);
-  header.set([1, 2, 1, tileType], 96); // Clustered, gzip directories, uncompressed tiles, PNG or vector.
+  header.set([1, 2, 1, vectorLayers ? 1 : 2], 96); // Clustered, gzip directories, uncompressed tiles, MVT or PNG.
   for (const [index, degrees] of [-180, -85, 180, 85].entries()) header.writeInt32LE(degrees * 10_000_000, 102 + index * 4);
   await writeFile(path, Buffer.concat([header, root, metadata, tile]));
 }

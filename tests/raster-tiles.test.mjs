@@ -5,6 +5,8 @@ import { copyFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
+import { VectorTile } from '@mapbox/vector-tile';
+import { PbfReader } from 'pbf';
 import { stringify } from 'yaml';
 import { auth, register, signIn } from './access-client.mjs';
 import { mapLibreBrowserOptions, renderMapLibre } from './maplibre-browser.mjs';
@@ -81,11 +83,16 @@ test('Martin accepts explicit raster archives and keeps PostGIS connections sepa
   }
 });
 
-test('Martin serves both raster archives through canonical, authorized gateway routes', async (t) => {
+test('Martin serves vector and raster MBTiles and PMTiles through canonical gateway routes', async (t) => {
   const directory = dirname(filename);
   const red = solidPng([214, 57, 49]);
   const blue = solidPng([32, 108, 218]);
   writeMbtiles(join(directory, 'fixture.mbtiles'), red);
+  // One point at (0, 0), with name Central in the places layer.
+  const point = Buffer.from('1a2f78020a06706c61636573120f0801120200001801220509802080201a046e616d6522090a0743656e7472616c288020', 'hex');
+  const vectorLayers = [{ id: 'places', fields: { name: 'String' } }];
+  writeMbtiles(join(directory, 'places.mbtiles'), point, vectorLayers);
+  await writePmtiles(join(directory, 'places.pmtiles'), point, vectorLayers);
   await writePmtiles(join(directory, 'fixture.pmtiles'), blue);
   await writePmtiles(join(directory, 'unlisted.pmtiles'), blue);
 
@@ -103,8 +110,13 @@ test('Martin serves both raster archives through canonical, authorized gateway r
   }
   const config = { ...platform, server: { host: 'localhost', port: Number(new URL(gateway).port) },
     auth: authConfig, cors: { allowed_origins: [origin] },
+    sources: { ...platform.sources, places: { type: 'mbtiles', path: './places.mbtiles' },
+      'places-pmtiles': { type: 'pmtiles', path: './places.pmtiles' } },
     publications: { red: rasterPublication, blue: { ...rasterPublication, source: 'west', access: 'registered' },
-      private: { ...rasterPublication, source: 'west', access: 'private' } } };
+      private: { ...rasterPublication, source: 'west', access: 'private' },
+      vector: { ...rasterPublication, source: 'places', title: 'Places (MBTiles)', description: 'Vector web tiles' },
+      'vector-pmtiles': { ...rasterPublication, source: 'places-pmtiles',
+        title: 'Places (PMTiles)', description: 'Vector web tiles' } } };
   await writeFile(filename, stringify(config));
   try {
     const plan = cli('config', 'plan', filename);
@@ -119,12 +131,28 @@ test('Martin serves both raster archives through canonical, authorized gateway r
     const [provider] = JSON.parse(docker('inspect', container));
     assert.deepEqual(provider.HostConfig.PortBindings ?? {}, {});
     const mounts = provider.Mounts.filter(({ Destination }) => Destination.startsWith('/source/'));
-    assert.equal(mounts.length, 2);
+    assert.equal(mounts.length, 4);
     assert.deepEqual(mounts.map(({ Destination, RW }) => [Destination.split('.').at(-1), RW]).sort(),
-      [['mbtiles', false], ['pmtiles', false]]);
+      [['mbtiles', false], ['mbtiles', false], ['pmtiles', false], ['pmtiles', false]]);
     assert.equal(provider.Mounts.some(({ Destination }) => Destination.startsWith('/run/secrets/')), false);
     const { tiles } = JSON.parse(docker('exec', container, 'wget', '-qO-', 'http://127.0.0.1:3000/native/catalog'));
-    assert.deepEqual(Object.keys(tiles).sort(), ['blue', 'private', 'red']);
+    assert.deepEqual(Object.keys(tiles).sort(), ['blue', 'private', 'red', 'vector', 'vector-pmtiles']);
+
+    for (const [id, format] of [['vector', 'MBTiles'], ['vector-pmtiles', 'PMTiles']]) {
+      await t.test(`vector ${format} exposes its original source layer and a decodable MVT`, async () => {
+        const path = `/mvt/${id}`;
+        const metadata = await (await request(path)).json();
+        assert.deepEqual(metadata.tiles, [gateway + path + '/{z}/{x}/{y}']);
+        assert.deepEqual(metadata.vector_layers.map(({ id, fields }) => ({ id, fields })), vectorLayers);
+        const response = await request(path + '/0/0/0');
+        assert.match(response.headers.get('content-type'), /^application\/(?:x-protobuf|vnd\.mapbox-vector-tile)\b/);
+        const { layers } = new VectorTile(new PbfReader(new Uint8Array(await response.arrayBuffer())));
+        assert.equal(layers.places.length, 1);
+        const feature = layers.places.feature(0).toGeoJSON(0, 0, 0);
+        assert.equal(feature.properties.name, 'Central');
+        assert.deepEqual(feature.geometry, { type: 'Point', coordinates: [0, 0] });
+      });
+    }
 
     const email = 'raster-reader@example.test';
     const password = randomBytes(24).toString('hex');
@@ -198,24 +226,28 @@ test('Martin serves both raster archives through canonical, authorized gateway r
       ]);
     });
 
-    await t.test('a vector archive cannot replace an active raster archive', async () => {
-      const candidate = { ...config, sources: { ...config.sources,
-        west: { ...config.sources.west, path: './vector.pmtiles' } } };
-      const vector = Buffer.from([0x1a, 5, 0x0a, 1, 0x78, 0x78, 2]);
-      await writePmtiles(join(directory, 'vector.pmtiles'), vector, 1);
-      await writeFile(filename, stringify(candidate));
-      const invalidPlan = cli('config', 'plan', filename);
-      assert.equal(invalidPlan.status, 0, JSON.stringify(invalidPlan.response));
-      assert.ok(invalidPlan.response.data.services.includes('provider-archives'));
-      const rejected = cli('config', 'apply', invalidPlan.response.data.planId);
-      assert.equal(rejected.status, 6, JSON.stringify(rejected.response));
-      assert.equal(rejected.response.code, 'APPLY_FAILED');
-      assert.equal(rejected.response.data.currentVersion, plan.response.data.planId);
-      assert.match(rejected.response.data.message, /failed to open its tile archives/);
+    await t.test('invalid archive replacements leave the confirmed publications available', async () => {
+      await writePmtiles(join(directory, 'no-layers.pmtiles'), point, []);
+      writeMbtiles(join(directory, 'no-layers.mbtiles'), point, []);
+      for (const [source, path] of [['places-pmtiles', './no-layers.pmtiles'], ['places', './no-layers.mbtiles']]) {
+        const candidate = { ...config, sources: { ...config.sources,
+          [source]: { ...config.sources[source], path } } };
+        await writeFile(filename, stringify(candidate));
+        const invalidPlan = cli('config', 'plan', filename);
+        assert.equal(invalidPlan.status, 0, JSON.stringify(invalidPlan.response));
+        assert.ok(invalidPlan.response.data.services.includes('provider-archives'));
+        const rejected = cli('config', 'apply', invalidPlan.response.data.planId);
+        assert.equal(rejected.status, 6, JSON.stringify(rejected.response));
+        assert.equal(rejected.response.code, 'APPLY_FAILED');
+        assert.equal(rejected.response.data.currentVersion, plan.response.data.planId);
+        assert.match(rejected.response.data.message, /failed to open its tile archives/);
+      }
       const metadata = await request('/mvt/red');
       assert.deepEqual((await metadata.json()).tiles, [gateway + '/mvt/red/{z}/{x}/{y}']);
       assert.deepEqual(Buffer.from(await (await request('/mvt/red/0/0/0')).arrayBuffer()), red);
       assert.deepEqual(Buffer.from(await (await request('/mvt/blue/0/0/0', 200, { headers: bearer })).arrayBuffer()), blue);
+      assert.deepEqual(Buffer.from(await (await request('/mvt/vector/0/0/0')).arrayBuffer()), point);
+      assert.deepEqual(Buffer.from(await (await request('/mvt/vector-pmtiles/0/0/0')).arrayBuffer()), point);
     });
 
     await t.test('replacing archive content keeps its URL and can roll back to a preserved file', async () => {

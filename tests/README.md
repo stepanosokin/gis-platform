@@ -22,7 +22,7 @@ npm test
 | Файловые источники Features и CRS через CLI и Caddy | `npm test -- --features-files` |
 | Растровые публикации Maps через CLI и Caddy | `npm test -- --maps` |
 | Динамические тайлы MVT и TileJSON через Martin, CLI и Caddy | `npm test -- --mvt` |
-| Растровые архивы MBTiles и PMTiles через Martin, CLI и Caddy | `npm test -- --raster-tiles` |
+| Растровые и векторные MBTiles и PMTiles через Martin, CLI и Caddy | `npm test -- --raster-tiles` |
 | Профиль OGC API — Tiles, метаданные и доступ через CLI и Caddy | `npm test -- --tiles` |
 | Все сценарии регистрации и доступа | `npm test -- --access` |
 | Один сценарий регистрации и доступа | `npm test -- --access HTTPS` |
@@ -226,9 +226,11 @@ tar -xf test_results/maplibre-6.19.0/maplibre-gl-6.19.0.tgz -C test_results/mapl
 
 Если при остановке `access` публичный стиль приходит с телом файла и статусом `502`, проверьте резервный маршрут Caddy. В `handle_errors` обработчик `file_server` по умолчанию сохраняет статус исходной ошибки. Проверьте, что резервный маршрут выставляет `200` для файла и `Cache-Control: no-store`. [Обработчики ошибок Caddy](https://caddyserver.com/docs/caddyfile/directives/handle_errors)
 
-## Растровые веб-тайлы из MBTiles и PMTiles
+## Веб-тайлы из MBTiles и PMTiles
 
 Для #25 выбран полный уровень. Прогон `--raster-tiles` создаёт контрольные архивы в `test_results/` и проверяет CLI, публикации через Caddy и монтирование файлов только для чтения. Браузерная проверка использует `GIS_TEST_CHROME` и `GIS_TEST_MAPLIBRE_DIST` из раздела MVT. MapLibre GL JS запрашивает MBTiles анонимно и PMTiles с Bearer-токеном, затем сверяет RGBA контрольного изображения каждого архива. Результаты сохраняются в `raster-tiles-browser.json`.
+
+Для векторных MBTiles и PMTiles сценарий сверяет ID слоя и поля в TileJSON и декодирует контрольную точку из тайла через Caddy. Если архив без описания векторных слоёв отклонён, сценарий проверяет доступность действующих публикаций.
 
 ## OGC API — Tiles
 
