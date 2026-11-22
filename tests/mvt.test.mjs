@@ -142,6 +142,7 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
   const browserOrigin = `http://127.0.0.1:${browserPort}`;
   for (const [container, alias] of [[database, 'external-postgis'], [otherDatabase, 'other-postgis']]) {
     docker('run', '-d', '--name', container, '--network', network, '--network-alias', alias,
+      '-p', '127.0.0.1::5432',
       '--mount', `type=bind,src=${adminFile},dst=/run/secrets/password,readonly`,
       '-e', 'POSTGRES_PASSWORD_FILE=/run/secrets/password',
       'postgis/postgis:18-3.6@sha256:4a43e3c3e5d55b9208240fc71db543b79c638766280c625a425bd0a2390989c4');
@@ -173,13 +174,15 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
     auth: { mode: 'development', mailpit_port: Number(new URL(process.env.GIS_TEST_MAILPIT).port), ...authFiles,
       cli: { port: Number(process.env.GIS_ADMIN_PORT), ca_file: 'ca.pem', cert_file: 'server.pem',
         key_file: 'server-key.pem', operators: { operator: ['access-write', 'diagnostics'] } } },
-    sources: { observations: { type: 'postgis', schema: 'gis', relation: 'Published observations', id_field: 'id',
+    postgis_connections: {
+      live: { host: 'external-postgis', database: 'postgres', user: 'gis_reader', password_file: readerFile },
+    },
+    sources: { observations: { type: 'postgis', connection: 'live', schema: 'gis', relation: 'Published observations', id_field: 'id',
       geometry_field: 'geom', max_lag_seconds: 0 }, control: { type: 'geojson', path: join(process.cwd(), 'examples', 'places.geojson') } },
     providers: { 'control-features': { type: 'pygeoapi' }, 'martin-east': {
       type: 'martin', image: martin,
       api: { protocol: 'mvt', scheme: 'http', port: 3000, base_path: '/', public_root: '/mvt',
         links: 'canonical', readiness: '/health' },
-      postgis: { host: 'external-postgis', database: 'postgres', user: 'gis_reader', password_file: readerFile },
     } },
     publications: { observations: publication, 'observations-copy': { ...publication, access: 'registered' },
       control: { protocol: 'features', provider: 'control-features', source: 'control', access: 'public',
@@ -494,10 +497,8 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
   await t.test('a failed PostGIS preflight keeps the active gateway open', async () => {
     const invalidFile = join(dirname(filename), 'incorrect-reader-password');
     await writeFile(invalidFile, randomBytes(24).toString('hex'), { mode: 0o600 });
-    const provider = platform.providers['martin-east'];
     await writeFile(filename, stringify({
-      ...platform, providers: { ...platform.providers,
-        'martin-east': { ...provider, postgis: { ...provider.postgis, password_file: invalidFile } } },
+      ...platform, postgis_connections: { live: { ...platform.postgis_connections.live, password_file: invalidFile } },
     }));
     const invalid = cli('config', 'plan', filename);
     const child = spawn(process.execPath, ['dist/cli.js', 'config', 'apply', invalid.planId, '--json'],
@@ -577,11 +578,14 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
 
   const archiveTile = solidPng([214, 57, 49]);
   const withArchive = { ...platform,
-    sources: { ...platform.sources, 'file-tile': { type: 'mbtiles', path: './isolated.mbtiles' } },
+    postgis_connections: { ...platform.postgis_connections,
+      other: { ...platform.postgis_connections.live, host: 'other-postgis' } },
+    sources: { ...platform.sources, alternate: { ...platform.sources.observations, connection: 'other' },
+      'file-tile': { type: 'mbtiles', path: './isolated.mbtiles' } },
     providers: { ...platform.providers, archives: { type: 'martin', image: martin, api: platform.providers['martin-east'].api },
-      'martin-other': { ...platform.providers['martin-east'],
-        postgis: { ...platform.providers['martin-east'].postgis, host: 'other-postgis' } } },
-    publications: { ...platform.publications, 'other-observations': { ...publication, provider: 'martin-other' },
+      'martin-other': { ...platform.providers['martin-east'] } },
+    publications: { ...platform.publications,
+      'other-observations': { ...publication, source: 'alternate', provider: 'martin-other' },
       'file-tile': { source: 'file-tile', provider: 'archives', protocol: 'mvt',
       access: 'public', title: 'Archive tile', description: 'Independent archive source', extent: [-180, -85, 180, 85] } },
   };
@@ -598,6 +602,72 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
     assert.equal((await features('/mvt/other-observations/1/1/0', 'other-observations'))[0].properties.label,
       'Independent PostGIS');
     assert.deepEqual(Buffer.from(await (await request('/mvt/file-tile/0/0/0')).arrayBuffer()), archiveTile);
+  });
+
+  await t.test('one Martin reads both databases for MVT and Tiles alongside its MBTiles archive', async () => {
+    const { archives, 'martin-other': other, ...providers } = withArchive.providers;
+    const { control, ...otherPublications } = withArchive.publications;
+    const combined = {
+      ...withArchive,
+      providers: { ...providers, 'combined-ogc': {
+        type: 'pygeoapi',
+        image: 'geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a',
+        api: { protocols: ['features', 'tiles'], scheme: 'http', port: 80, base_path: '/',
+          links: 'canonical', readiness: '/openapi' },
+      } },
+      publications: { ...otherPublications,
+        control: { ...control, provider: 'combined-ogc' },
+        'features-other': { ...control, source: 'alternate', provider: 'combined-ogc' },
+        'other-observations': { ...otherPublications['other-observations'], provider: 'martin-east' },
+        'file-tile': { ...otherPublications['file-tile'], provider: 'martin-east' },
+        'tiles-live': { ...publication, provider: 'combined-ogc', tile_provider: 'martin-east', protocol: 'tiles' },
+        'tiles-other': { ...publication, source: 'alternate', provider: 'combined-ogc', tile_provider: 'martin-east', protocol: 'tiles' },
+      },
+    };
+    const ogc = '/combined-ogc/features/collections';
+    const tiles = '/combined-ogc/tiles/collections';
+    const tilePath = (id) => `${tiles}/${id}/tiles/WebMercatorQuad/1/0/1`;
+    const archiveUrl = '/mvt/file-tile/0/0/0';
+    await writeFile(filename, stringify(combined));
+    cli('config', 'apply', cli('config', 'plan', filename).planId);
+    try {
+      assert.equal((await (await request(ogc + '/control/items?f=json')).json()).features.length, 3);
+      assert.equal((await (await request(ogc + '/features-other/items?f=json')).json()).features[0].properties.label,
+        'Independent PostGIS');
+      const live = (await features('/mvt/observations/1/1/0', 'observations'))[0].properties.label;
+      assert.notEqual(live, 'Independent PostGIS');
+      assert.equal((await features('/mvt/other-observations/1/1/0', 'other-observations'))[0].properties.label,
+        'Independent PostGIS');
+      assert.equal((await features(tilePath('tiles-live'), 'tiles-live'))[0].properties.label, live);
+      assert.equal((await features(tilePath('tiles-other'), 'tiles-other'))[0].properties.label, 'Independent PostGIS');
+      assert.deepEqual(Buffer.from(await (await request(archiveUrl)).arrayBuffer()), archiveTile);
+      docker('stop', database);
+      try {
+        await request('/mvt/observations/1/1/0', 503);
+        await request(tilePath('tiles-live'), 503);
+        assert.equal((await features(tilePath('tiles-other'), 'tiles-other'))[0].properties.label, 'Independent PostGIS');
+        assert.deepEqual(Buffer.from(await (await request(archiveUrl)).arrayBuffer()), archiveTile);
+      } finally {
+        docker('start', database);
+        await waitForDatabase();
+      }
+      assert.equal((await features(tilePath('tiles-live'), 'tiles-live'))[0].properties.label, live);
+
+      await writeFile(join(dirname(filename), 'broken.mbtiles'), 'invalid tile archive');
+      await writeFile(filename, stringify({ ...combined, sources: { ...combined.sources,
+        'file-tile': { type: 'mbtiles', path: './broken.mbtiles' },
+      } }));
+      const invalid = cli('config', 'plan', filename);
+      const result = spawnSync(process.execPath, ['dist/cli.js', 'config', 'apply', invalid.planId, '--json'],
+        { encoding: 'utf8', windowsHide: true });
+      assert.ifError(result.error);
+      assert.equal(result.status, 6, result.stdout);
+      assert.match(JSON.parse(result.stdout).data.message, /PostGIS sources and tile archives/);
+      assert.deepEqual(Buffer.from(await (await request(archiveUrl)).arrayBuffer()), archiveTile);
+    } finally {
+      await writeFile(filename, stringify(withArchive));
+      cli('config', 'apply', cli('config', 'plan', filename).planId);
+    }
   });
 
   await t.test('confirmed Martin routes recover after a cold start with PostGIS offline', async () => {

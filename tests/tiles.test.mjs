@@ -61,14 +61,16 @@ const publication = {
 const config = {
   schema_version: 1,
   server: { host: 'localhost', port: Number(gatewayUrl.port) },
-  sources: { observations: { type: 'postgis', schema: 'gis', relation: 'observations', id_field: 'id',
+  postgis_connections: {
+    live: { host: 'external-postgis', database: 'postgres', user: 'gis_reader', password_file: 'tiles-reader-password' },
+  },
+  sources: { observations: { type: 'postgis', connection: 'live', schema: 'gis', relation: 'observations', id_field: 'id',
     geometry_field: 'geom', max_lag_seconds: 0 } },
   providers: {
     tiles: { type: 'pygeoapi', image: 'geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a',
       api: { ...api, protocol: 'tiles', port: 80, base_path: '/', public_root: '/tiles', readiness: '/openapi' } },
     martin: { type: 'martin', image: 'ghcr.io/maplibre/martin:1.16.1@sha256:59902019bf9038926ff0c71174237d6852e64c457830a6349abe7090be8818ca',
-      api: { ...api, protocol: 'mvt', port: 3000, base_path: '/native', public_root: '/mvt', readiness: '/health' },
-      postgis: { host: 'external-postgis', database: 'postgres', user: 'gis_reader', password_file: 'tiles-reader-password' } },
+      api: { ...api, protocol: 'mvt', port: 3000, base_path: '/native', public_root: '/mvt', readiness: '/health' } },
   },
   publications: { observations: publication },
 };

@@ -53,24 +53,22 @@ async function request(path, status = 200, options) {
   return response;
 }
 
-test('Martin accepts explicit raster archives and keeps PostGIS connections separate', async () => {
+test('Martin accepts explicit raster archives alongside a named PostGIS source', async () => {
   async function validate(config) {
     await writeFile(filename, stringify(config));
     return cli('config', 'validate', filename);
   }
   const valid = await validate(platform);
   assert.equal(valid.status, 0, JSON.stringify(valid.response));
-  const dbSource = { type: 'postgis', schema: 'gis', relation: 'places', id_field: 'id',
+  const dbSource = { type: 'postgis', connection: 'live', schema: 'gis', relation: 'places', id_field: 'id',
     geometry_field: 'geom', max_lag_seconds: 0 };
-  const dbProvider = { ...fileProvider, postgis: { host: 'external-postgis', database: 'gis', user: 'reader',
-    password_file: './password' } };
-  const separated = { ...platform, sources: { ...platform.sources, db: dbSource },
-    providers: { ...platform.providers, database: dbProvider },
-    publications: { ...platform.publications, db: { ...rasterPublication, source: 'db', provider: 'database' } } };
-  assert.equal((await validate(separated)).status, 0);
+  const combined = { ...platform,
+    postgis_connections: { live: { host: 'external-postgis', database: 'gis', user: 'reader', password_file: './password' } },
+    sources: { ...platform.sources, db: dbSource },
+    publications: { ...platform.publications, db: { ...rasterPublication, source: 'db' } } };
+  assert.equal((await validate(combined)).status, 0);
   for (const [config, expected] of [
-    [{ ...platform, providers: { archives: dbProvider } }, /separate|file.*PostGIS/i],
-    [{ ...separated, publications: { ...separated.publications, db: { ...rasterPublication, source: 'db' } } }, /PostGIS connection|separate/i],
+    [{ ...combined, postgis_connections: {} }, /unknown PostGIS connection/],
     [{ ...platform, sources: { ...platform.sources, east: { type: 'mbtiles', path: './fixture.pmtiles' } } }, /\.mbtiles file/],
     [{ ...platform, publications: { east: { ...rasterPublication, mvt_properties: ['id'] } } }, /mvt_properties.*PostGIS/],
     [{ ...platform, providers: { archives: { type: 'pygeoapi' } },

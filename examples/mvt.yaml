@@ -1,8 +1,15 @@
 schema_version: 1
 server: {host: localhost, port: 8080}
+postgis_connections:
+  live:
+    host: postgis.example.org
+    database: gis
+    user: tiles_reader
+    password_file: ./secrets/observations-password
 sources:
   observations:
     type: postgis
+    connection: live
     schema: gis
     relation: published_observations
     id_field: id
@@ -20,11 +27,6 @@ providers:
       public_root: /mvt
       links: canonical
       readiness: /health
-    postgis:
-      host: postgis.example.org
-      database: gis
-      user: tiles_reader
-      password_file: ./secrets/observations-password
 publications:
   observations:
     source: observations

@@ -1,9 +1,13 @@
 import { isIP } from 'node:net';
-import { pinnedImage, postgisSource, providerRoot, publicationsForProvider, tileArchive, type FeaturesConfig,
-  type ManagedProvider, type TileArchiveSource } from './config.js';
+import { pinnedImage, postgisSecretName, postgisSource, providerRoot, publicationsForProvider, tileArchive, type FeaturesConfig,
+  type ManagedProvider, type PostgisConnection, type TileArchiveSource } from './config.js';
 
 export function tileArchivePath(id: string, source: TileArchiveSource) {
   return `/source/${id}/tiles.${source.type}`;
+}
+
+function databaseVariable(connection: string) {
+  return `GIS_MARTIN_DATABASE_URL_${connection.replaceAll('-', '_')}`;
 }
 
 export function martinConfig(config: FeaturesConfig, id: string) {
@@ -12,17 +16,19 @@ export function martinConfig(config: FeaturesConfig, id: string) {
   const base = provider.api.base_path;
   const publications = publicationsForProvider(config, id);
   const archives: Partial<Record<TileArchiveSource['type'], { sources: Record<string, string> }>> = {};
-  const tables = Object.fromEntries(publications.flatMap(([key, publication]) => {
+  const tables = new Map<string, Record<string, object>>();
+  for (const [key, publication] of publications) {
     const archive = tileArchive(config, publication.source);
     if (archive) {
       (archives[archive.type] ??= { sources: {} }).sources[key] = tileArchivePath(publication.source, archive);
-      return [];
+      continue;
     }
     const source = postgisSource(config, publication.source)!;
-    return [[key, { schema: source.schema, table: source.relation, geometry_column: source.geometry_field,
-        layer_id: key, bounds: publication.extent, srid: 0,
-        properties: Object.fromEntries([source.id_field, ...publication.mvt_properties ?? []].map((field) => [field, field])) }]];
-  }));
+    if (!tables.has(source.connection)) tables.set(source.connection, {});
+    tables.get(source.connection)![key] = { schema: source.schema, table: source.relation, geometry_column: source.geometry_field,
+      layer_id: key, bounds: publication.extent, srid: 0,
+      properties: Object.fromEntries([source.id_field, ...publication.mvt_properties ?? []].map((field) => [field, field])) };
+  }
   return {
     listen_addresses: `0.0.0.0:${provider.api.port}`,
     base_path: providerRoot(config, id, 'mvt'),
@@ -30,26 +36,31 @@ export function martinConfig(config: FeaturesConfig, id: string) {
     cache: 'disable',
     cors: false,
     ...archives,
-    ...(Object.keys(tables).length && {
-      postgres: { connection_string: '${GIS_MARTIN_DATABASE_URL}', auto_publish: false, auto_bounds: 'skip',
-        reload_interval: '0s', tables },
+    ...(tables.size && {
+      postgres: [...tables].map(([connection, publishedTables]) => ({
+        connection_string: '${' + databaseVariable(connection) + '}', auto_publish: false, auto_bounds: 'skip',
+        reload_interval: '0s', tables: publishedTables,
+      })),
     }),
   };
 }
 
-export function martinService(provider: ManagedProvider, directory: string, connection: { source: string; target: string }[] | undefined) {
+export function martinService(provider: ManagedProvider, directory: string,
+  connections: (readonly [string, PostgisConnection])[], secrets: { source: string }[] | undefined) {
   const { base_path: base, port } = provider.api;
-  const settings = provider.postgis;
-  const host = settings && (isIP(settings.host) === 6 ? `[${settings.host}]` : settings.host);
-  const address = settings ? `@${host}:${settings.port}/${encodeURIComponent(settings.database)}` +
-    '?options=-c%20default_transaction_read_only%3Don' : '';
+  const argumentsForConnections = connections.flatMap(([id, settings]) => {
+    const host = isIP(settings.host) === 6 ? `[${settings.host}]` : settings.host;
+    const address = `@${host}:${settings.port}/${encodeURIComponent(settings.database)}` +
+      '?options=-c%20default_transaction_read_only%3Don';
+    return [databaseVariable(id), postgisSecretName(id), encodeURIComponent(settings.user), address];
+  });
   const localApi = `http://127.0.0.1:${port}${base === '/' ? '' : base}`;
   return {
     image: pinnedImage(provider),
     restart: 'unless-stopped',
     entrypoint: ['/bin/sh', '/etc/martin/gis/run.sh', localApi,
-      connection && settings ? encodeURIComponent(settings.user) : '', address],
-    ...(connection && { secrets: connection }),
+      ...(secrets ? [...argumentsForConnections, '--'] : ['', ''])],
+    ...(secrets && { secrets }),
     volumes: [{ type: 'bind', source: directory, target: '/etc/martin/gis', read_only: true,
       bind: { create_host_path: false } }],
     healthcheck: {
@@ -63,12 +74,19 @@ export function martinService(provider: ManagedProvider, directory: string, conn
 // The mounted secret is available only in the provider container. Martin expands the URI in YAML.
 export const runMartin = `set -eu
 api=$1
-if [ -n "$2" ]; then
-    password=$(cat /run/secrets/postgis_password)
-    password=$(printf '%s' "$password" | sed 's/\\r$//' | od -An -v -tx1 | tr -s '[:space:]' '%' | sed 's/%$//')
-    export GIS_MARTIN_DATABASE_URL="postgresql://$2:$password$3"
+shift
+# File-only services keep the two empty arguments used by previously saved revisions.
+if [ -z "$1" ]; then
+    shift 2
+else
+    while [ "$1" != '--' ]; do
+        password=$(cat "/run/secrets/$2")
+        password=$(printf '%s' "$password" | sed 's/\\r$//' | od -An -v -tx1 | tr -s '[:space:]' '%' | sed 's/%$//')
+        export "$1=postgresql://$3:$password$4"
+        shift 4
+    done
+    shift
 fi
-shift 3
 config=/etc/martin/gis/martin.yaml
 if [ "$#" -eq 0 ]; then
     exec martin --config "$config"

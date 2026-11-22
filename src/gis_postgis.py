@@ -10,7 +10,7 @@ from sqlalchemy.exc import DataError, SQLAlchemyError
 
 class PostGISProvider(PostgreSQLProvider):
     def __init__(self, definition):
-        password_file = Path("/run/secrets/postgis_password")
+        password_file = Path(definition["password_file"])
         password = password_file.read_text(encoding="utf-8").rstrip("\r\n")
         if not password:
             raise ProviderConnectionError("The PostGIS password file is empty.")

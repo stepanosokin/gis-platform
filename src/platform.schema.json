@@ -274,12 +274,16 @@
           },
           {
             "type": "object",
-            "required": ["type", "schema", "relation", "id_field", "geometry_field", "max_lag_seconds"],
+            "required": ["type", "connection", "schema", "relation", "id_field", "geometry_field", "max_lag_seconds"],
             "additionalProperties": false,
             "properties": {
               "type": {
                 "description": "Источник в базе данных PostGIS.",
                 "const": "postgis"
+              },
+              "connection": {
+                "description": "ID подключения из раздела postgis_connections.",
+                "$ref": "#/$defs/id"
               },
               "schema": {
                 "description": "Имя схемы PostgreSQL, в которой находится источник.",
@@ -321,6 +325,38 @@
         ]
       }
     },
+    "postgis_connections": {
+      "description": "Именованные подключения к внешним базам данных PostGIS.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/id" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["host", "database", "user", "password_file"],
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "description": "Имя хоста или IP-адрес PostGIS, доступный из контейнера сервис-провайдера.",
+            "type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[a-zA-Z0-9_.:%-]+$"
+          },
+          "port": {
+            "description": "Порт PostGIS. По умолчанию 5432.",
+            "type": "integer", "minimum": 1, "maximum": 65535
+          },
+          "database": {
+            "description": "Имя базы данных PostgreSQL.",
+            "$ref": "#/$defs/sqlIdentifier"
+          },
+          "user": {
+            "description": "Имя роли PostgreSQL для чтения источников.",
+            "$ref": "#/$defs/sqlIdentifier"
+          },
+          "password_file": {
+            "description": "Путь к файлу с паролем роли PostgreSQL.",
+            "type": "string", "minLength": 1
+          }
+        }
+      }
+    },
     "providers": {
       "description": "Экземпляры сервис-провайдеров по ID. Поле publications.<id>.provider ссылается на один из этих ID.",
       "type": "object",
@@ -334,34 +370,6 @@
           "type": {
             "description": "Адаптер, который запускает и настраивает экземпляр сервиса — pygeoapi, martin или pydggsapi.",
             "enum": ["pygeoapi", "martin", "pydggsapi"]
-          },
-          "postgis": {
-            "description": "Подключение этого экземпляра к внешнему PostGIS с источниками публикаций.",
-            "type": "object",
-            "required": ["host", "database", "user", "password_file"],
-            "additionalProperties": false,
-            "properties": {
-              "host": {
-                "description": "Имя хоста или IP-адрес PostGIS, доступный из контейнера сервис-провайдера.",
-                "type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[a-zA-Z0-9_.:%-]+$"
-              },
-              "port": {
-                "description": "Порт PostGIS. По умолчанию 5432.",
-                "type": "integer", "minimum": 1, "maximum": 65535
-              },
-              "database": {
-                "description": "Имя базы данных PostgreSQL.",
-                "$ref": "#/$defs/sqlIdentifier"
-              },
-              "user": {
-                "description": "Имя роли PostgreSQL для чтения источников.",
-                "$ref": "#/$defs/sqlIdentifier"
-              },
-              "password_file": {
-                "description": "Путь к файлу с паролем роли PostgreSQL.",
-                "type": "string", "minLength": 1
-              }
-            }
           },
           "image": {
             "description": "Ссылка на образ контейнера для управляемого экземпляра. При наличии image требуется api.",
@@ -461,7 +469,7 @@
             "enum": ["features", "maps", "mvt", "tiles", "dggs"]
           },
           "tile_provider": {
-            "description": "ID экземпляра Martin с подключением к PostGIS. Обязателен для OGC API — Tiles и отвечает за выдачу тайлов.",
+            "description": "ID экземпляра Martin, который формирует тайлы из PostGIS для OGC API — Tiles.",
             "$ref": "#/$defs/id"
           },
           "access": {

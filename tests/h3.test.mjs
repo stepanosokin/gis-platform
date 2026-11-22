@@ -75,6 +75,7 @@ test('prepared H3 observations use the standard Features and Martin gateway rout
   await writeFile(adminFile, randomBytes(24).toString('hex'), { mode: 0o600 });
   await writeFile(readerFile, readerPassword, { mode: 0o600 });
   docker('run', '-d', '--name', database, '--network', network, '--network-alias', 'external-postgis',
+    '-p', '127.0.0.1::5432',
     '--mount', `type=bind,src=${adminFile},dst=/run/secrets/password,readonly`,
     '-e', 'POSTGRES_PASSWORD_FILE=/run/secrets/password', postgis);
   started = true;
@@ -91,9 +92,8 @@ test('prepared H3 observations use the standard Features and Martin gateway rout
     GRANT SELECT ON h3_data.published_observations TO h3_reader;
   `);
   platform.server.port = Number(new URL(gateway).port);
-  for (const { postgis: connection } of Object.values(platform.providers)) {
-    Object.assign(connection, { host: 'external-postgis', database: 'postgres', password_file: readerFile });
-  }
+  Object.assign(platform.postgis_connections.h3,
+    { host: 'external-postgis', database: 'postgres', password_file: readerFile });
   await writeFile(filename, stringify(platform));
   assert.equal(cli('validate', filename).code, 'OK');
   assert.equal(cli('apply', cli('plan', filename).data.planId).code, 'OK');

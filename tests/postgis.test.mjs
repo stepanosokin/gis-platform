@@ -86,6 +86,7 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
   await writeFile(passwordFile, password, { mode: 0o600 });
   for (const [container, alias] of [[database, 'external-postgis'], [archiveDatabase, 'archive-postgis']]) {
     docker('run', '-d', '--name', container, '--network', network, '--network-alias', alias,
+      '-p', '127.0.0.1::5432',
       '--mount', `type=bind,src=${passwordFile},dst=/run/secrets/password,readonly`,
       '-e', 'POSTGRES_PASSWORD_FILE=/run/secrets/password', 'postgis/postgis:18-3.6');
     started.push(container);
@@ -129,7 +130,7 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
   const observation = { protocol: 'features', provider: 'observations', source: 'external-places', access: 'public',
     title: 'Observations', description: 'Read-only database observations.', extent: [37, 55, 40, 58],
     freshness: { max_delay_seconds: 0 }, time_field: 'observed_at' };
-  const source = { type: 'postgis', schema: 'gis', relation: 'Published observations',
+  const source = { type: 'postgis', connection: 'live', schema: 'gis', relation: 'Published observations',
     id_field: 'id', geometry_field: 'geom', max_lag_seconds: 0 };
   const geojsonFile = join(dirname(filename), 'places.geojson');
   const geojson = JSON.parse(await readFile('examples/places.geojson', 'utf8'));
@@ -142,21 +143,24 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
   const draft = {
     schema_version: 1, server: { host: 'localhost', port: Number(new URL(gateway).port) },
     auth: { mode: 'development', mailpit_port: Number(new URL(process.env.GIS_TEST_MAILPIT).port), ...authFiles },
+    postgis_connections: {
+      live: await connection('external-postgis', 'postgres', 'gis_reader', readerPassword),
+      archive: await connection('archive-postgis', 'alternate', 'gis_alternate', alternatePassword),
+    },
     sources: {
       'external-places': source,
+      'archive-places': { ...source, connection: 'archive' },
       'unlisted': { ...source, relation: 'unlisted' },
       'file-places': { type: 'geojson', path: geojsonFile },
     },
     providers: {
-      observations: { type: 'pygeoapi', postgis: await connection('external-postgis', 'postgres', 'gis_reader', readerPassword) },
-      archive: { ...managed, api: { ...managed.api, readiness: '/collections/archive/items?f=json' },
-        postgis: await connection('archive-postgis', 'alternate', 'gis_alternate', alternatePassword) },
+      observations: { type: 'pygeoapi' },
       files: { ...managed },
     },
     publications: {
       observations: observation,
       registered: { ...observation, access: 'registered' },
-      archive: { ...observation, provider: 'archive', title: 'Archive', time_field: undefined, freshness: undefined },
+      archive: { ...observation, source: 'archive-places', title: 'Archive', time_field: undefined, freshness: undefined },
       file: { ...observation, provider: 'files', source: 'file-places', title: 'File', time_field: undefined, freshness: undefined },
     },
   };
@@ -169,10 +173,11 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
   const archive = '/features/collections/archive/items?f=json';
   const file = '/features/collections/file/items?f=json';
   let registeredReader;
-  await t.test('separate instances use independent connections and expose only explicit sources', async () => {
+  await t.test('one pygeoapi instance reads two databases and exposes only explicit sources', async () => {
     const catalog = await request('/features/collections?f=json');
     assert.deepEqual(catalog.collections.map(({ id }) => id).sort(), ['archive', 'file', 'observations']);
     assert.deepEqual(ids(await request(archive)), ['alternate']);
+    assert.deepEqual(ids(await request(items)), []);
     assert.equal(ids(await request(file)).length, 3);
     await request('/features/collections/unlisted/items?f=json', 404);
   });
@@ -325,7 +330,7 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     docker('stop', provider);
     try {
       doctor('ready', 'unavailable', 'unknown');
-      assert.deepEqual(ids(await request(archive)), ['alternate']);
+      assert.equal(ids(await request(file)).length, 3);
     } finally {
       docker('start', provider);
     }
@@ -359,7 +364,7 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     const wrongPassword = randomBytes(24).toString('hex');
     const badFile = join(dirname(filename), 'invalid-connection.password');
     await writeFile(badFile, wrongPassword, { mode: 0o600 });
-    draft.providers.observations.postgis.password_file = badFile;
+    draft.postgis_connections.live.password_file = badFile;
     await writeFile(filename, stringify(draft));
     const plan = cli('plan', filename);
     assert.ok(plan.changed.includes('observations'));
@@ -374,7 +379,7 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
   });
   await t.test('a changed source schema needs a validated configuration before it can be applied', async () => {
     sql('ALTER VIEW gis."Published observations" RENAME COLUMN observed_at TO captured_at;');
-    draft.providers.observations.postgis.password_file = join(dirname(filename), 'postgres.password');
+    draft.postgis_connections.live.password_file = join(dirname(filename), 'postgres.password');
     // Confirm that candidate preflight checks the actual database column.
     draft.publications.observations = { ...observation, time_field: 'label' };
     draft.publications.registered = { ...draft.publications.registered, time_field: 'captured_at' };
@@ -396,24 +401,25 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     assert.equal(Date.parse(matching.features[0].properties.captured_at), Date.parse('2026-11-02T12:00:00Z'));
   });
   await t.test('active and retired PostGIS IDs stay bound to the original database and relation', async () => {
-    draft.providers.observations.postgis.password_file = join(dirname(filename), 'postgres.password');
-    const reassigned = { ...draft.publications.archive, title: 'Reassigned' };
-    draft.publications.observations = reassigned;
+    draft.postgis_connections.live.password_file = join(dirname(filename), 'postgres.password');
+    // Keep the source ID and relation while switching its connection to the other database.
+    draft.sources['external-places'] = { ...source, connection: 'archive' };
     await writeFile(filename, stringify(draft));
     const active = cliResult('plan', filename);
     assert.equal(active.status, 2);
     assert.match(JSON.parse(active.stdout).data.message, /reserved for its original source/);
+    draft.sources['external-places'] = source;
     delete draft.publications.observations;
     await writeFile(filename, stringify(draft));
     cli('apply', cli('plan', filename).planId);
-    draft.publications.observations = reassigned;
+    draft.publications.observations = { ...draft.publications.archive, title: 'Reassigned' };
     await writeFile(filename, stringify(draft));
     const result = cliResult('plan', filename);
     assert.equal(result.status, 2);
     assert.match(JSON.parse(result.stdout).data.message, /reserved for its original source/);
     const replacementFile = join(dirname(filename), 'replacement.password');
     await writeFile(replacementFile, readerPassword, { mode: 0o600 });
-    draft.providers.observations.postgis.password_file = replacementFile;
+    draft.postgis_connections.live.password_file = replacementFile;
     draft.publications.observations = observation;
     await writeFile(filename, stringify(draft));
     assert.deepEqual(cli('plan', filename).added, ['observations']);

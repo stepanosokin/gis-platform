@@ -107,7 +107,10 @@ test('an encrypted snapshot on a separate HTTPS endpoint restores confirmed vers
   const snapshots = () => JSON.parse(restic('snapshots', '--json')).map(({ id }) => id);
   const recoveryEnv = { ...env, COMPOSE_PROJECT_NAME: recoveryProject };
   const tag = `gis-platform-${project}`;
-  const sourceFiles = [config, ...['places.geojson', 'auth-secret', 'postgres-password', 'ca.pem', 'server.pem', 'server-key.pem']
+  const readerFile = join(fixture, 'external-postgis-password');
+  const readerPassword = randomBytes(32).toString('hex');
+  writeFileSync(readerFile, readerPassword);
+  const sourceFiles = [config, readerFile, ...['places.geojson', 'auth-secret', 'postgres-password', 'ca.pem', 'server.pem', 'server-key.pem']
     .map((file) => join(fixture, file))];
   const initial = cli(['status']).currentVersion;
 
@@ -135,7 +138,14 @@ test('an encrypted snapshot on a separate HTTPS endpoint restores confirmed vers
     const oldest = agedSnapshot(35);
     const middle = agedSnapshot(12);
 
-    writeFileSync(config, readFileSync(config, 'utf8').replace('Closed places', 'Version two places'));
+    writeFileSync(config, readFileSync(config, 'utf8').replace('Closed places', 'Version two places') + `
+postgis_connections:
+  external:
+    host: postgres.example.test
+    database: spatial
+    user: reader
+    password_file: external-postgis-password
+`);
     const second = cli(['config', 'plan', config]).planId;
     cli(['config', 'apply', second]);
     for (const file of ['https-cert.pem', 'https-key.pem']) rmSync(join(fixture, file));
@@ -153,7 +163,11 @@ test('an encrypted snapshot on a separate HTTPS endpoint restores confirmed vers
     assert.ok(snapshots().includes(middle) && !snapshots().includes(oldest));
     const signingSecret = readFileSync(join(fixture, 'auth-secret'));
     for (const entry of readdirSync(storage, { recursive: true, withFileTypes: true })) {
-      if (entry.isFile()) assert.equal(readFileSync(join(entry.parentPath, entry.name)).includes(signingSecret), false);
+      if (entry.isFile()) {
+        const contents = readFileSync(join(entry.parentPath, entry.name));
+        assert.equal(contents.includes(signingSecret), false);
+        assert.equal(contents.includes(readerPassword), false);
+      }
     }
     const badPassword = join(fixture, 'wrong-password');
     writeFileSync(badPassword, 'wrong');
@@ -194,6 +208,7 @@ test('an encrypted snapshot on a separate HTTPS endpoint restores confirmed vers
       const restoredFile = join(dirname(restored.directory), basename(file));
       copyFileSync(restoredFile, file);
     }
+    assert.equal(readFileSync(readerFile, 'utf8'), readerPassword);
     cpSync(restored.directory, state, { recursive: true });
     const stale = backup(['recover', restored.payload, '--verified-authority'],
       { env: recoveryEnv, code: 'RECOVERY_INCOMPLETE', exit: 7 });

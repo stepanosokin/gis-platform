@@ -1,10 +1,17 @@
 schema_version: 1
 server: {host: localhost, port: 8080}
+postgis_connections:
+  live:
+    host: postgis.example.org
+    database: gis
+    user: tiles_reader
+    password_file: ./secrets/observations-password
 sources:
   places: {type: geojson, path: places.geojson}
   terrain: {type: geotiff, path: ../data/terrain.tif, epsg: 4326}
   observations:
     type: postgis
+    connection: live
     schema: gis
     relation: published_observations
     id_field: id
@@ -31,11 +38,6 @@ providers:
     type: martin
     image: ghcr.io/maplibre/martin:1.16.1@sha256:59902019bf9038926ff0c71174237d6852e64c457830a6349abe7090be8818ca
     api: {protocols: [mvt], public_prefix: martin, scheme: http, port: 3000, base_path: /, links: canonical, readiness: /health}
-    postgis:
-      host: postgis.example.org
-      database: gis
-      user: tiles_reader
-      password_file: ./secrets/observations-password
   provider-pydggsapi:
     type: pydggsapi
     image: ghcr.io/landscapegeoinformatics/pydggsapi:0.4.0

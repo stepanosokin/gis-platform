@@ -3,7 +3,8 @@ import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService, postgisSource, publicationEntries, publicationUrl, providerRoutes, providerServiceName,
+import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService,
+  postgisConnectionsForProvider, postgisSource, publicationEntries, publicationUrl, providerRoutes, providerServiceName,
   fileSource, serializeFeaturesConfig, usedFileSources, vectorFile, type FeaturesConfig, type Publication } from './config.js';
 import { pinProviderImages } from './provider-images.js';
 import { archiveLegacyOpenApi, closeGateway, compose, diagnoseStack, featuresStackRunning, openGateway, prepareFeaturesStack, providerConfigurationChanged,
@@ -148,7 +149,7 @@ async function* confirmedHistory(current: Plan | null) {
 
 function postgisLocation(config: FeaturesConfig, publication: Publication) {
   const source = postgisSource(config, publication.source);
-  const connection = config.providers?.[publication.tile_provider ?? publication.provider]?.postgis;
+  const connection = source && config.postgisConnections?.[source.connection];
   return source && connection
     ? [connection.host, connection.port, connection.database, source.schema, source.relation]
     : undefined;
@@ -279,7 +280,8 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     .filter((id) => (current && providerServiceName(current, id) !== providerServiceName(config, id)) ||
       JSON.stringify(current?.providers?.[id]?.image ? current.providers[id] : null) !==
       JSON.stringify(config.providers?.[id]?.image ? config.providers[id] : null) ||
-      JSON.stringify(current?.providers?.[id]?.postgis) !== JSON.stringify(config.providers?.[id]?.postgis)));
+      JSON.stringify(current ? postgisConnectionsForProvider(current, id) : []) !==
+      JSON.stringify(postgisConnectionsForProvider(config, id))));
   const dataChanged = (id: string) => (changedSource && hasGeoJson(config, id)) ||
     usedFileSources(config, id).some(([source]) => changedFiles.has(source));
   const restarted = new Set([...changedProviders, ...Object.keys(config.providers ?? {}).filter((id) =>

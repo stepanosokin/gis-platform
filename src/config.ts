@@ -21,11 +21,15 @@ export interface Publication {
   freshness?: { max_delay_seconds: number };
 }
 
-interface ProviderConnection {
-  postgis?: { host: string; port?: number; database: string; user: string; password_file: string };
+export interface PostgisConnection {
+  host: string;
+  port?: number;
+  database: string;
+  user: string;
+  password_file: string;
 }
 
-export interface ManagedProvider extends ProviderConnection {
+export interface ManagedProvider {
   type: 'pygeoapi' | 'martin' | 'pydggsapi';
   image: string;
   digest?: string;
@@ -43,10 +47,11 @@ export interface ManagedProvider extends ProviderConnection {
   volumes?: Record<string, string>;
 }
 
-export type Provider = (ProviderConnection & { type: 'pygeoapi'; image?: undefined }) | ManagedProvider;
+export type Provider = { type: 'pygeoapi'; image?: undefined } | ManagedProvider;
 
 export interface PostgisSource {
   type: 'postgis';
+  connection: string;
   schema: string;
   relation: string;
   id_field: string;
@@ -66,6 +71,7 @@ type Source = { type: 'geojson'; path: string } | FileSource | PostgisSource;
 interface PlatformConfig {
   schema_version: 1;
   server: { host: string; port?: number; tls?: Partial<TlsConfig> };
+  postgis_connections?: Record<string, PostgisConnection>;
   sources: Record<string, Source>;
   providers: Record<string, Provider>;
   publications: Record<string, Publication>;
@@ -112,6 +118,7 @@ export type FeaturesConfig = {
   rasterFiles?: Record<string, RasterFileSource>;
   tileArchives?: Record<string, TileArchiveSource>;
   dggsSources?: Record<string, DggsSource>;
+  postgisConnections?: Record<string, PostgisConnection>;
   postgisSources?: Record<string, PostgisSource>;
   providers?: Record<string, Provider>;
   providerServiceNames?: Record<string, string>;
@@ -135,6 +142,20 @@ export function publicationsForProvider(config: FeaturesConfig, id: string) {
 
 export function postgisSource(config: FeaturesConfig, id: string) {
   return config.postgisSources && Object.hasOwn(config.postgisSources, id) ? config.postgisSources[id] : undefined;
+}
+
+export function postgisConnectionsForProvider(config: FeaturesConfig, provider: string) {
+  const ids = new Set<string>();
+  for (const [, publication] of publicationEntries(config)) {
+    if ((publication.tile_provider ?? publication.provider) !== provider) continue;
+    const connection = postgisSource(config, publication.source)?.connection;
+    if (connection) ids.add(connection);
+  }
+  return [...ids].sort().map((id) => [id, config.postgisConnections![id]!] as const);
+}
+
+export function postgisSecretName(connection: string) {
+  return `postgis-${connection}`;
 }
 
 export function hasGeoJson(config: FeaturesConfig, provider?: string) {
@@ -291,6 +312,7 @@ export function serializeFeaturesConfig(config: FeaturesConfig) {
   const snapshot: PlatformConfig = {
     schema_version: 1,
     server: { host: new URL(config.publicUrl).hostname, port: config.port, tls: config.tls },
+    postgis_connections: config.postgisConnections,
     sources: {
       ...(config.sourcePath && { [geojsonSourceId]: { type: 'geojson', path: config.sourcePath } }),
       ...config.postgisSources,
@@ -320,6 +342,12 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
 
   const config: unknown = document.toJS();
   if (!validate(config)) {
+    const legacy = validate.errors?.find(({ instancePath, params }) =>
+      /^\/providers\/[^/]+$/.test(instancePath) && params.additionalProperty === 'postgis');
+    if (legacy) {
+      const id = legacy.instancePath.split('/').at(-1);
+      throw new Error(`Replace providers.${id}.postgis with postgis_connections and sources.<id>.connection.`);
+    }
     const errors = (validate.errors ?? []).map(({ instancePath, message, params }) => {
       const field = params.additionalProperty ?? params.missingProperty;
       return `${instancePath || '/'} ${message}${field ? ` (${field})` : ''}`;
@@ -337,6 +365,16 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     entry[1].type === 'geojson');
   if (geojsonSources.length > 1) throw new Error('Only one GeoJSON source can be configured.');
   const postgisSources = sources.filter((entry): entry is [string, PostgisSource] => entry[1].type === 'postgis');
+  const postgisConnections = config.postgis_connections ?? {};
+  for (const connection of Object.values(postgisConnections)) {
+    connection.password_file = resolve(directory, connection.password_file);
+    connection.port ??= 5432;
+  }
+  for (const [id, source] of postgisSources) {
+    if (!Object.hasOwn(postgisConnections, source.connection)) {
+      throw new Error(`Source '${id}' references an unknown PostGIS connection '${source.connection}'.`);
+    }
+  }
   const vectorFiles = sources.filter((entry): entry is [string, VectorFileSource] =>
     entry[1].type === 'geopackage' || entry[1].type === 'shapefile' || entry[1].type === 'geoparquet');
   const fileExtensions = { geopackage: '.gpkg', shapefile: '.shp', geoparquet: '.parquet' };
@@ -372,11 +410,15 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   const roots = new Map<string, Publication['protocol']>();
   const prefixes = new Set<string>();
   const reservedRoots = ['/account', '/api', '/internal'];
+  const postgisReaders = new Map<string, Set<string>>();
+  for (const publication of Object.values(config.publications)) {
+    const source = config.sources[publication.source];
+    if (source?.type !== 'postgis') continue;
+    const reader = publication.tile_provider ?? publication.provider;
+    if (!postgisReaders.has(reader)) postgisReaders.set(reader, new Set());
+    postgisReaders.get(reader)!.add(source.connection);
+  }
   for (const [id, provider] of providers) {
-    if (provider.postgis) {
-      provider.postgis.password_file = resolve(directory, provider.postgis.password_file);
-      provider.postgis.port ??= 5432;
-    }
     if (provider.type === 'martin' && !provider.image) {
       throw new Error(`Martin provider '${id}' requires an image and API.`);
     }
@@ -410,15 +452,15 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     } else if (root === '/mvt') {
       throw new Error(`Provider '${id}': /mvt and protocol mvt require Martin.`);
     }
-    if (provider.api.protocol === 'maps' && (root !== '/maps' || provider.postgis)) {
+    if (provider.api.protocol === 'maps' && root !== '/maps') {
       throw new Error(`Maps provider '${id}' requires public_root /maps and file sources.`);
     }
-    if (provider.api.protocol === 'tiles' && (root !== '/tiles' || provider.postgis)) {
+    if (provider.api.protocol === 'tiles' && root !== '/tiles') {
       throw new Error(`Tiles provider '${id}' requires public_root /tiles and a separate Martin instance for PostGIS.`);
     }
     if (provider.type === 'pydggsapi') {
       if ((root ? root !== dggsRoot || base !== root : base !== '/') || readiness !== '/conformance' ||
-          provider.postgis || provider.environment || provider.volumes) {
+          provider.environment || provider.volumes) {
         throw new Error(`pydggsapi provider '${id}' requires readiness /conformance and base_path / for nested URLs, or base_path and public_root /dggs.`);
       }
       if (repository !== pydggsapiRepository || (digest ?? provider.digest ?? pydggsapiDigest) !== pydggsapiDigest ||
@@ -438,14 +480,17 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     }
     const targets = Object.values(provider.volumes ?? {});
     const reservedPaths = ['/source', '/etc/pygeoapi/gis', '/venv'];
-    if (provider.postgis) reservedPaths.push('/run/secrets/postgis_password');
+    const connections = postgisReaders.get(id);
+    if (connections) {
+      for (const connection of connections) reservedPaths.push(`/run/secrets/${postgisSecretName(connection)}`);
+    }
     if (targets.some((target) => target.split('/').some((segment) => segment === '.' || segment === '..') ||
         reservedPaths.some((path) =>
           target === path || target.startsWith(path + '/') || path.startsWith(target + '/'))) ||
         new Set(targets).size !== targets.length) throw new Error(`Invalid volume targets for provider '${id}'.`);
     if (Object.keys(provider.environment ?? {}).some((name) =>
       ['PYGEOAPI_CONFIG', 'PYGEOAPI_OPENAPI', 'GIS_PYGEOAPI_PROTOCOLS', 'SCRIPT_NAME'].includes(name) ||
-      (provider.postgis && ['PGPASSWORD', 'PGPASSFILE'].includes(name)))) {
+      (connections && ['PGPASSWORD', 'PGPASSFILE'].includes(name)))) {
       throw new Error(`Provider '${id}' overrides a required adapter environment variable.`);
     }
   }
@@ -471,7 +516,6 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
         .map(([path, file]) => [path, resolve(directory, file)])) }),
     } }),
   }]);
-  const sourceTypes = new Map<string, 'file' | 'postgis'>();
   for (const [id, publication] of entries) {
     const { source, provider, protocol, access, extent, time_field, freshness } = publication;
     if (publication.maplibre && protocol !== 'mvt') {
@@ -496,8 +540,8 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     const renderer: string | undefined = protocol === 'tiles' ? publication.tile_provider : provider;
     if (protocol === 'tiles') {
       const martin = renderer && Object.hasOwn(config.providers, renderer) ? config.providers[renderer] : undefined;
-      if (sourceConfig.type !== 'postgis' || martin?.type !== 'martin' || !martin.postgis) {
-        throw new Error(`Publication '${id}': Tiles requires a PostGIS source and tile_provider referencing a PostGIS Martin instance.`);
+      if (sourceConfig.type !== 'postgis' || martin?.type !== 'martin') {
+        throw new Error(`Publication '${id}': Tiles requires a PostGIS source and tile_provider referencing a Martin instance.`);
       }
     } else if (publication.tile_provider) {
       throw new Error(`Publication '${id}': tile_provider is only supported for Tiles.`);
@@ -505,9 +549,6 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     if (protocol === 'mvt' || protocol === 'tiles') {
       if ((!archive && sourceConfig.type !== 'postgis') || publication.crs || time_field) {
         throw new Error(`Publication '${id}': Martin requires PostGIS, MBTiles or PMTiles and uses Web Mercator without CRS or time overrides.`);
-      }
-      if (archive && instance?.postgis) {
-        throw new Error(`Provider '${provider}' specifies PostGIS for file sources. Use separate provider instances.`);
       }
       if (archive && publication.mvt_properties) {
         throw new Error(`Publication '${id}': mvt_properties requires a PostGIS source.`);
@@ -526,18 +567,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     }
     if (raster && publication.crs) throw new Error(`Publication '${id}': set the raster source epsg instead of crs.`);
     if (publication.crs) publication.crs = supportedCrs(id, sourceConfig, publication.crs);
-    const sourceType = sourceConfig.type === 'postgis' ? 'postgis' : 'file';
-    const sourceProvider = renderer ?? provider;
-    const suppliedType = sourceTypes.get(sourceProvider);
-    if (suppliedType && suppliedType !== sourceType) {
-      const fileFormats = vectorFiles.length ? 'file sources' : 'GeoJSON';
-      throw new Error(`Provider '${sourceProvider}' serves ${fileFormats} and PostGIS. Use separate provider instances.`);
-    }
-    sourceTypes.set(sourceProvider, sourceType);
     if (sourceConfig.type === 'postgis') {
-      if (!config.providers[sourceProvider]?.postgis) {
-        throw new Error(`Publication '${id}' requires a PostGIS connection on provider '${sourceProvider}'.`);
-      }
       const max_delay_seconds = freshness?.max_delay_seconds ?? 60;
       if (sourceConfig.max_lag_seconds > max_delay_seconds) {
         throw new Error(`Publication '${id}': source max_lag_seconds exceeds freshness.max_delay_seconds.`);
@@ -583,6 +613,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     port,
     publicUrl: new URL('/features', `${tls?.cert_file ? 'https' : 'http'}://${host}:${port}`).href,
     sourcePath: geojson ? resolve(directory, geojson[1].path) : '',
+    ...(config.postgis_connections && { postgisConnections }),
     ...(postgisSources.length && { postgisSources: Object.fromEntries(postgisSources) }),
     ...(vectorFiles.length && { vectorFiles: Object.fromEntries(vectorFiles) }),
     ...(rasterFiles.length && { rasterFiles: Object.fromEntries(rasterFiles) }),
@@ -590,7 +621,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     ...(dggsSources.length && { dggsSources: Object.fromEntries(dggsSources) }),
     ...(fileSources && geojson && { geojsonSourceId: geojson[0] }),
     ...(fileSources || entries.some(([, pub]) => pub.crs) ||
-      providers.length !== 1 || providers.some(([, provider]) => provider.image || provider.postgis)
+      providers.length !== 1 || providers.some(([, provider]) => provider.image)
       ? { providers: config.providers } : {}),
     ...(serviceNames.length && { providerServiceNames: Object.fromEntries(serviceNames.map(([id]) => [id, id])) }),
     ...(first ? { publicationId: first[0], publication: first[1],

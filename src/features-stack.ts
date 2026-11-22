@@ -21,7 +21,8 @@ import { dggsConfig, dggsDataRoute, dggsFiles, dggsRelation, dggsRoutes, dggsSer
   dggsSnapshotPath, dggsZoneParameters, runDggs } from './dggs-profile.js';
 import { healthUrl, publicationChecks, publicationHealth } from './publication-health.js';
 import { GatewayTlsError, gatewayTlsFiles, gatewayTlsProbe, inspectGatewayTls } from './gateway-tls.js';
-import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService, pinnedImage, postgisSource,
+import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService, pinnedImage,
+  postgisConnectionsForProvider, postgisSecretName, postgisSource,
   providerBasePath, providerProtocols, providerRoot, providerRoutes, providerServiceName as serviceName, publicationEntries, publicationRoot, publicationsForProvider,
   publicationUrl, crs84, rasterFile, tileArchive, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
 
@@ -113,13 +114,14 @@ function pygeoapiSource(config: FeaturesConfig, publication: Publication) {
   };
   const source = postgisSource(config, publication.source);
   if (!source) return { type: 'feature', name: 'GeoJSON', data: '/source/data.geojson', id_field: 'id', crs: publication.crs };
-  const connection = config.providers?.[publication.provider]?.postgis;
+  const connection = config.postgisConnections?.[source.connection];
   if (!connection) throw new Error('The PostGIS connection is missing.');
   const { host, port, database, user } = connection;
   return {
     type: 'feature',
     name: postgisPlugin,
     data: { host, port, dbname: database, user, search_path: [source.schema] },
+    password_file: `/run/secrets/${postgisSecretName(source.connection)}`,
     table: source.relation,
     id_field: source.id_field,
     geom_field: source.geometry_field,
@@ -136,18 +138,18 @@ export function providerConfigurationChanged(candidate: FeaturesConfig, previous
   if (id !== undefined && JSON.stringify(usedFileSources(candidate, id)) !== JSON.stringify(usedFileSources(previous, id))) {
     return true;
   }
+  if (id !== undefined && JSON.stringify(postgisConnectionsForProvider(candidate, id)) !==
+      JSON.stringify(postgisConnectionsForProvider(previous, id))) return true;
   if (id && candidate.providers?.[id]?.type === 'martin') {
-    return JSON.stringify(martinConfig(candidate, id)) !== JSON.stringify(martinConfig(previous, id)) ||
-      JSON.stringify(candidate.providers[id].postgis) !== JSON.stringify(previous.providers?.[id]?.postgis);
+    return JSON.stringify(martinConfig(candidate, id)) !== JSON.stringify(martinConfig(previous, id));
   }
   if (id && candidate.providers?.[id]?.type === 'pydggsapi') {
     return previous.providers?.[id]?.type !== 'pydggsapi' ||
       providerRoot(candidate, id, 'dggs') !== providerRoot(previous, id, 'dggs') ||
       JSON.stringify(dggsConfig(candidate, id)) !== JSON.stringify(dggsConfig(previous, id));
   }
-  return (id !== undefined && (
-    ((hasGeoJson(candidate, id) || hasGeoJson(previous, id)) && candidate.sourcePath !== previous.sourcePath) ||
-    candidate.providers?.[id]?.postgis?.password_file !== previous.providers?.[id]?.postgis?.password_file)) ||
+  return (id !== undefined && (hasGeoJson(candidate, id) || hasGeoJson(previous, id)) &&
+    candidate.sourcePath !== previous.sourcePath) ||
     JSON.stringify(pygeoapiConfig(candidate, id)) !== JSON.stringify(pygeoapiConfig(previous, id));
 }
 
@@ -823,11 +825,12 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
   const escapeCompose = (value: string) => value.replaceAll('$', () => '$$');
   for (const [id, provider] of Object.entries(config.providers ?? {})) {
     const service = serviceName(config, id);
-    const secret = `postgis-${id}`;
-    const passwordFile = provider.postgis?.password_file;
-    const connection = passwordFile && publicationsForProvider(config, id).some(([, publication]) =>
-      postgisSource(config, publication.source))
-      ? [{ source: secret, target: 'postgis_password' }] : undefined;
+    const connections = postgisConnectionsForProvider(config, id);
+    const connection = connections.length ? connections.map(([name, { password_file }]) => {
+      const secret = postgisSecretName(name);
+      secrets[secret] = { file: escapeCompose(password_file) };
+      return { source: secret };
+    }) : undefined;
     const native = service === 'pygeoapi' ? directory : join(directory, service);
     await mkdir(native, { recursive: true });
     const files = usedFileSources(config, id);
@@ -847,8 +850,7 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
       if (!managedProviderRuns(config, id)) continue;
       await writeFile(join(native, 'martin.yaml'), stringify(martinConfig(config, id)));
       await writeFile(join(native, 'run.sh'), runMartin);
-      if (connection) secrets[secret] = { file: escapeCompose(passwordFile!) };
-      const serviceSettings = martinService(provider, escapeCompose(await nativeProviderDirectory(directory, service)), connection);
+      const serviceSettings = martinService(provider, escapeCompose(await nativeProviderDirectory(directory, service)), connections, connection);
       services[service] = { ...serviceSettings, volumes: [...serviceSettings.volumes, ...fileMounts] };
       continue;
     }
@@ -872,7 +874,6 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
       await copyFile(fileURLToPath(new URL('../src/gis_vector_files.py', import.meta.url)), join(native, 'gis_vector_files.py'));
     }
     if (connection) {
-      secrets[secret] = { file: escapeCompose(passwordFile!) };
       await copyFile(fileURLToPath(new URL('../src/gis_postgis.py', import.meta.url)), join(native, 'gis_postgis.py'));
     }
     if (tiles) {
@@ -1055,8 +1056,12 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
               source ? { idField: source.id_field } : archiveLayers);
           }
         } catch {
-          if (!instance.postgis) {
+          const postgisCount = rendered.filter(([, publication]) => postgisSource(config, publication.source)).length;
+          if (postgisCount === 0) {
             throw new FeaturesPreflightError(`Martin provider '${id}' failed to open its tile archives. Check the tile format and TileJSON.`);
+          }
+          if (postgisCount < rendered.length) {
+            throw new FeaturesPreflightError(`Martin provider '${id}' failed to check its PostGIS sources and tile archives. Check connectivity, access, tile formats and TileJSON.`);
           }
           throw new FeaturesPreflightError(`Martin provider '${id}' failed to open its PostGIS sources. Check connectivity, access and source definitions.`);
         }

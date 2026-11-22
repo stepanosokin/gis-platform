@@ -167,9 +167,7 @@ async function referencedFiles(config: FeaturesConfig, revision: string, archive
     if (auth.mode === 'production' && auth.smtp.password_file) files.push(auth.smtp.password_file);
     if (auth.cli) files.push(auth.cli.cert_file, auth.cli.key_file, auth.cli.ca_file);
   }
-  for (const provider of Object.values(config.providers ?? {})) {
-    if (provider.postgis) files.push(provider.postgis.password_file);
-  }
+  for (const connection of Object.values(config.postgisConnections ?? {})) files.push(connection.password_file);
   const parts = usedFileSources(config).flatMap(([id, source]) => fileParts(id, source));
   return (await Promise.all([
     ...files.map((path) => includePath(path)),

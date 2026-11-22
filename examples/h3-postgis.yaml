@@ -1,8 +1,15 @@
 schema_version: 1
 server: {host: localhost, port: 8080}
+postgis_connections:
+  h3:
+    host: postgis.example.org
+    database: gis
+    user: h3_reader
+    password_file: ./secrets/h3-reader-password
 sources:
   h3-observations:
     type: postgis
+    connection: h3
     schema: h3_data
     relation: published_observations
     id_field: feature_id
@@ -11,11 +18,6 @@ sources:
 providers:
   h3-features:
     type: pygeoapi
-    postgis:
-      host: postgis.example.org
-      database: gis
-      user: h3_reader
-      password_file: ./secrets/h3-reader-password
   h3-martin:
     type: martin
     image: ghcr.io/maplibre/martin:1.16.1@sha256:59902019bf9038926ff0c71174237d6852e64c457830a6349abe7090be8818ca
@@ -27,11 +29,6 @@ providers:
       public_root: /mvt
       links: canonical
       readiness: /health
-    postgis:
-      host: postgis.example.org
-      database: gis
-      user: h3_reader
-      password_file: ./secrets/h3-reader-password
 publications:
   h3-observations:
     source: h3-observations
