@@ -82,7 +82,9 @@ test('explicit provider prefixes move only their own publications off a shared f
   assert.equal(moved.previousUrl, gateway + '/features/collections/places');
   assert.equal(moved.newUrl, gateway + '/pygeoapi/features/collections/places');
   assert.equal(moved.personalGrants, 'preserve');
-  assert.ok(Object.keys((await service('provider-pygeoapi')).HostConfig.PortBindings ?? {}).length === 0);
+  const [instance] = JSON.parse(await docker('inspect', `${project}-provider-pygeoapi-1`));
+  assert.ok(instance.State.Running);
+  assert.deepEqual(instance.HostConfig.PortBindings ?? {}, {});
   const data = await (await get('/pygeoapi/features/collections/places/items?f=json&limit=1')).json();
   assert.equal(data.features.length, 1);
   const next = data.links.find(({ rel }) => rel === 'next').href;

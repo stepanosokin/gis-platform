@@ -19,10 +19,10 @@ import { mapLibreAssetRoute } from './maplibre-style.js';
 import { featuresConformance, protocolConformance } from './protocol-conformance.js';
 import { dggsConfig, dggsDataRoute, dggsFiles, dggsRelation, dggsRoutes, dggsService,
   dggsSnapshotPath, dggsZoneParameters, runDggs } from './dggs-profile.js';
-import { healthUrl, providerServiceName as serviceName, publicationChecks, publicationHealth } from './publication-health.js';
+import { healthUrl, publicationChecks, publicationHealth } from './publication-health.js';
 import { GatewayTlsError, gatewayTlsFiles, gatewayTlsProbe, inspectGatewayTls } from './gateway-tls.js';
 import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService, pinnedImage, postgisSource,
-  providerBasePath, providerProtocols, providerRoot, providerRoutes, publicationEntries, publicationRoot, publicationsForProvider,
+  providerBasePath, providerProtocols, providerRoot, providerRoutes, providerServiceName as serviceName, publicationEntries, publicationRoot, publicationsForProvider,
   publicationUrl, crs84, rasterFile, tileArchive, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
 
 const run = promisify(execFile);
@@ -132,6 +132,7 @@ function pygeoapiSource(config: FeaturesConfig, publication: Publication) {
 export function providerConfigurationChanged(candidate: FeaturesConfig, previous: FeaturesConfig | null,
   id = builtInProviderId(candidate)) {
   if (!previous) return true;
+  if (id !== undefined && serviceName(candidate, id) !== serviceName(previous, id)) return true;
   if (id !== undefined && JSON.stringify(usedFileSources(candidate, id)) !== JSON.stringify(usedFileSources(previous, id))) {
     return true;
   }
@@ -899,7 +900,7 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
         publication.provider === id && publication.protocol === protocol).map(([key]) => key),
     }]));
     const namedVolumes = Object.entries(provider.volumes ?? {}).map(([name, target]) => {
-      const volume = `${service}_${name}`;
+      const volume = `provider-${id}_${name}`;
       volumes[volume] = {};
       return { type: 'volume', source: volume, target };
     });

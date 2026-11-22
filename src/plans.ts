@@ -3,7 +3,7 @@ import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService, postgisSource, publicationEntries, publicationUrl, providerRoutes,
+import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService, postgisSource, publicationEntries, publicationUrl, providerRoutes, providerServiceName,
   fileSource, serializeFeaturesConfig, usedFileSources, vectorFile, type FeaturesConfig, type Publication } from './config.js';
 import { pinProviderImages } from './provider-images.js';
 import { archiveLegacyOpenApi, closeGateway, compose, diagnoseStack, featuresStackRunning, openGateway, prepareFeaturesStack, providerConfigurationChanged,
@@ -213,12 +213,13 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   await checkPublicationIdentities(config, currentPlan);
   const current = currentPlan?.config ?? null;
   if (current && editFile) {
-    const before = editFile.originalConfig;
+    const { providerServiceNames: _parsedNames, ...before } = editFile.originalConfig;
+    const { providerServiceNames: _confirmedNames, ...confirmed } = current;
     for (const [id, provider] of Object.entries(before.providers ?? {})) {
       const active = current.providers?.[id];
       if (provider.image && !provider.digest && active?.image === provider.image) provider.digest = active.digest;
     }
-    if (JSON.stringify(before) !== JSON.stringify(current)) {
+    if (JSON.stringify(before) !== JSON.stringify(confirmed)) {
       throw new CliError('INVALID_CONFIG', 2, 'Apply the pending platform YAML changes before managing providers.');
     }
   }
@@ -275,7 +276,8 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     };
   });
   const changedProviders = new Set([...Object.keys(current?.providers ?? {}), ...Object.keys(config.providers ?? {})]
-    .filter((id) => JSON.stringify(current?.providers?.[id]?.image ? current.providers[id] : null) !==
+    .filter((id) => (current && providerServiceName(current, id) !== providerServiceName(config, id)) ||
+      JSON.stringify(current?.providers?.[id]?.image ? current.providers[id] : null) !==
       JSON.stringify(config.providers?.[id]?.image ? config.providers[id] : null) ||
       JSON.stringify(current?.providers?.[id]?.postgis) !== JSON.stringify(config.providers?.[id]?.postgis)));
   const dataChanged = (id: string) => (changedSource && hasGeoJson(config, id)) ||
@@ -313,7 +315,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
       ((builtIn && dataChanged(builtIn)) || !currentPlan?.yaml ||
         providerConfigurationChanged(config, current)) ? ['pygeoapi'] : []),
       ...[...restarted].filter((id) => managedProviderRuns(config, id) || (current && managedProviderRuns(current, id)))
-        .map((id) => `provider-${id}`),
+        .map((id) => providerServiceName(managedProviderRuns(config, id) ? config : current!, id)),
       ...(needsMetadataService(config) ? ['metadata'] : []),
       ...(config.auth || current?.auth ? ['access'] : []),
       ...(current?.auth?.postgres_password_file !== config.auth?.postgres_password_file ? ['postgres'] : []),

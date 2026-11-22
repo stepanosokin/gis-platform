@@ -1,4 +1,4 @@
-import { postgisSource, providerBasePath, type FeaturesConfig, type Publication } from './config.js';
+import { postgisSource, providerBasePath, providerServiceName, type FeaturesConfig, type Publication } from './config.js';
 
 export interface HealthEndpoint {
   service: string;
@@ -12,10 +12,6 @@ export interface PublicationHealth {
   instance: HealthEndpoint;
   renderer?: HealthEndpoint;
   source: HealthEndpoint;
-}
-
-export function providerServiceName(config: FeaturesConfig, id: string) {
-  return config.providers?.[id]?.image ? `provider-${id}` : 'pygeoapi';
 }
 
 export function publicationHealth(config: FeaturesConfig, id: string, publication: Publication): PublicationHealth {

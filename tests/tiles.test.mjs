@@ -421,7 +421,7 @@ test('one pygeoapi serves nested Features, Maps and Tiles with separate catalogs
   const services = JSON.parse(docker('inspect', ...containers));
   const providers = services.filter(({ Config }) => Config.Labels['com.docker.compose.service'].startsWith('provider-'));
   assert.deepEqual(providers.map(({ Config }) => Config.Labels['com.docker.compose.service']).sort(),
-    [combined, archive, renderer, grids].map((id) => `provider-${id}`).sort());
+    [combined, archive, renderer, grids].sort());
   for (const container of providers) assert.deepEqual(container.HostConfig.PortBindings ?? {}, {});
   const featuresRoot = '/pygeoapi/features';
   const mapsRoot = '/pygeoapi/maps';

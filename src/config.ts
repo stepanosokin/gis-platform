@@ -114,6 +114,7 @@ export type FeaturesConfig = {
   dggsSources?: Record<string, DggsSource>;
   postgisSources?: Record<string, PostgisSource>;
   providers?: Record<string, Provider>;
+  providerServiceNames?: Record<string, string>;
   auth?: AuthConfig;
   tls?: TlsConfig;
   cors?: CorsConfig;
@@ -211,6 +212,12 @@ const adapterProtocols: Record<ManagedProvider['type'], Publication['protocol'][
 export function providerProtocols(provider: Provider | undefined): Publication['protocol'][] {
   if (!provider?.image) return ['features'];
   return provider.api.protocols ?? [provider.api.protocol];
+}
+
+export function providerServiceName(config: FeaturesConfig, id: string) {
+  if (!config.providers?.[id]?.image) return 'pygeoapi';
+  const names = config.providerServiceNames;
+  return names && Object.hasOwn(names, id) ? names[id]! : `provider-${id}`;
 }
 
 export function providerRoot(config: FeaturesConfig, id: string, protocol: Publication['protocol']) {
@@ -568,6 +575,10 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     }
   }
   const fileSources = postgisSources.length || vectorFiles.length || rasterFiles.length || tileArchives.length || dggsSources.length;
+  // Confirmed plans without these names retain their previous Compose service keys.
+  const servicePrefix = 'provider-';
+  const serviceNames = providers.filter(([id, provider]) => provider.image && id.startsWith(servicePrefix) &&
+    !config.providers[id.slice(servicePrefix.length)]?.image);
   return {
     port,
     publicUrl: new URL('/features', `${tls?.cert_file ? 'https' : 'http'}://${host}:${port}`).href,
@@ -581,6 +592,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     ...(fileSources || entries.some(([, pub]) => pub.crs) ||
       providers.length !== 1 || providers.some(([, provider]) => provider.image || provider.postgis)
       ? { providers: config.providers } : {}),
+    ...(serviceNames.length && { providerServiceNames: Object.fromEntries(serviceNames.map(([id]) => [id, id])) }),
     ...(first ? { publicationId: first[0], publication: first[1],
       ...(others.length > 0 && { additionalPublications: Object.fromEntries(others) }) }
       : { publicationId: null, sourceId, providerId }),
