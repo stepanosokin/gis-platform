@@ -382,11 +382,13 @@ sources:
 
 ### Добавить экземпляр
 
-Для ID нового экземпляра в YAML рекомендуется формат `provider-<софт>`, например `provider-pygeoapi`, `provider-martin` или `provider-pydggsapi`. Для дополнительного экземпляра того же типа добавьте назначение, например `provider-pygeoapi-archive`.
+Для нового экземпляра в `providers` рекомендуется ID без префикса `provider-`, например `pygeoapi`, `martin` или `pydggsapi`. Для дополнительного экземпляра укажите назначение, например `pygeoapi-archive`. В публикации укажите ID экземпляра в поле `provider`. В публикации Tiles поле `tile_provider` указывает на экземпляр Martin, который формирует тайлы.
 
-Для управляемого экземпляра Compose обычно использует ID `provider-pygeoapi` как имя сервиса. Управляемый экземпляр с ID `pygeoapi` получает имя `provider-pygeoapi`. Если оба ID принадлежат управляемым экземплярам, платформа сохраняет разные имена сервисов, добавляя префикс обоим. Чтобы обновить имена в действующем проекте, выполните `config plan` и `config apply` с текущим YAML.
+Для управляемого экземпляра GIS Platform добавляет `provider-` к короткому ID при формировании имени сервиса Compose. Для ID `pygeoapi` имя сервиса — `provider-pygeoapi`, а имя контейнера в проекте `gis-platform` — `gis-platform-provider-pygeoapi-1`. Если ID уже начинается с `provider-`, платформа обычно использует его целиком. Если в одном проекте есть два управляемых экземпляра с ID `pygeoapi` и `provider-pygeoapi`, второй получает имя сервиса `provider-provider-pygeoapi`. Чтобы обновить имена в действующем проекте, выполните `config plan` и `config apply` с текущим YAML.
 
-В `api.protocols` перечислите протоколы экземпляра. Для каждого из них шлюз создаст корень `/<публичный-префикс>/<протокол>`. Задайте уникальный `api.public_prefix` одним сегментом без `/` или опустите поле, чтобы использовать ID экземпляра. [Пример с несколькими протоколами](examples/provider-protocols.yaml) использует один контейнер pygeoapi для `/pygeoapi/features`, `/pygeoapi/maps` и `/pygeoapi/tiles`. Martin формирует тайлы для Tiles через `tile_provider` и может отдельно публиковать `/martin/mvt`. pyDGGSAPI обслуживает `/pydggsapi/dggs`.
+В `api.protocols` перечислите протоколы экземпляра. Для каждого из них шлюз создаст корень `/<публичный-префикс>/<протокол>`. По умолчанию публичный префикс совпадает с ID в YAML. Например, ID `pygeoapi` с `api.protocols: [features]` даёт `/pygeoapi/features`. Чтобы задать другой префикс, укажите уникальное значение `api.public_prefix` одним сегментом без `/`.
+
+В примере для ID `provider-pygeoapi` задан `api.public_prefix: pygeoapi`. Один контейнер обслуживает `/pygeoapi/features`, `/pygeoapi/maps` и `/pygeoapi/tiles`. Martin формирует тайлы для Tiles через `tile_provider` и может отдельно публиковать `/martin/mvt`. pyDGGSAPI обслуживает `/pydggsapi/dggs`. [Пример с несколькими протоколами](examples/provider-protocols.yaml)
 
 Для OGC API у каждого корня свои `/collections`, `/openapi` и `/conformance`. Для прямых веб-тайлов вложенный корень Martin даёт `/catalog`, `/openapi` и `/conformance`, а TileJSON находится по адресу `/<префикс>/mvt/<ID>`. Шлюз показывает клиенту метаданные и дополнительные возможности доступных ему публикаций.
 
@@ -395,11 +397,11 @@ sources:
 Для отдельного добавления подготовьте [файл интеграции](examples/provider-features.yaml). Пример ниже использует собранный CLI и переменную `platform`, указывающую на полную конфигурацию. Сначала примените черновые изменения в полном YAML или подготовьте копию из действующей версии. Для нового экземпляра выберите свободный ID.
 
 ```sh
-node dist/cli.js provider add second-features geopython/pygeoapi:0.24.0 \
+node dist/cli.js provider add pygeoapi-archive geopython/pygeoapi:0.24.0 \
   examples/provider-features.yaml "$platform"
 ```
 
-Команда сама создаёт и применяет план, а затем записывает секцию `providers.second-features` с digest в полный YAML. Для pygeoapi в этом примере появляется контейнер `provider-second-features`. Martin запускается, когда на него ссылается публикация через `provider` либо `tile_provider`. У некоторых адаптеров доступны `environment` и `volumes`. Имена томов привязаны к ID экземпляра.
+Команда сама создаёт и применяет план, а затем записывает секцию `providers.pygeoapi-archive` с digest в полный YAML. В Compose появляется сервис `provider-pygeoapi-archive`. Martin запускается, когда на него ссылается публикация через `provider` либо `tile_provider`. У некоторых адаптеров доступны `environment` и `volumes`. Имена томов привязаны к ID экземпляра.
 
 ### Перейти с плоских URL на вложенные
 
@@ -411,9 +413,9 @@ node dist/cli.js provider add second-features geopython/pygeoapi:0.24.0 \
 ### Обновить или удалить экземпляр
 
 ```sh
-node dist/cli.js provider update second-features "$platform"
-node dist/cli.js provider update second-features "$platform" geopython/pygeoapi:0.24.0
-node dist/cli.js provider remove second-features "$platform"
+node dist/cli.js provider update pygeoapi-archive "$platform"
+node dist/cli.js provider update pygeoapi-archive "$platform" geopython/pygeoapi:0.24.0
+node dist/cli.js provider remove pygeoapi-archive "$platform"
 ```
 
 Выберите одну нужную команду. `provider update` загружает образ из указанного аргумента или заново запрашивает текущую ссылку. CLI сохраняет подтверждённый digest в YAML и версии. При сбое проверки действующая версия возвращается с прежним образом. Для встроенного экземпляра образ определяется версией платформы.
