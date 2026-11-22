@@ -1,4 +1,4 @@
-import { postgisSource, type FeaturesConfig, type Publication } from './config.js';
+import { postgisSource, providerBasePath, type FeaturesConfig, type Publication } from './config.js';
 
 export interface HealthEndpoint {
   service: string;
@@ -22,11 +22,10 @@ export function publicationHealth(config: FeaturesConfig, id: string, publicatio
   function endpoint(providerId: string, path: string): HealthEndpoint {
     const provider = config.providers?.[providerId];
     const api = provider?.image ? provider.api : undefined;
-    const base = api?.base_path;
     return {
       service: providerServiceName(config, providerId),
       port: api?.port ?? 80,
-      path: (base && base !== '/' ? base : '') + path,
+      path: providerBasePath(config, providerId) + path,
       martin: provider?.type === 'martin',
       ...(provider?.type === 'pydggsapi' && { python: 'python' }),
     };

@@ -374,12 +374,25 @@
           "api": {
             "description": "Параметры внутреннего HTTP API экземпляра и его маршрута через шлюз.",
             "type": "object",
-            "required": ["protocol", "scheme", "port", "base_path", "public_root", "links", "readiness"],
+            "required": ["scheme", "port", "base_path", "links", "readiness"],
+            "oneOf": [
+              { "required": ["protocol", "public_root"], "properties": { "protocols": false, "public_prefix": false } },
+              { "required": ["protocols"], "properties": { "protocol": false, "public_root": false } }
+            ],
             "additionalProperties": false,
             "properties": {
               "protocol": {
                 "description": "Протокол экземпляра. Допустимые сочетания протокола и адаптера проверяет CLI.",
                 "enum": ["features", "maps", "mvt", "tiles", "dggs"]
+              },
+              "protocols": {
+                "description": "Протоколы экземпляра с отдельными публичными корнями под общим префиксом.",
+                "type": "array", "minItems": 1, "uniqueItems": true,
+                "items": { "enum": ["features", "maps", "mvt", "tiles", "dggs"] }
+              },
+              "public_prefix": {
+                "description": "Сегмент публичного URL экземпляра. По умолчанию используется ID экземпляра.",
+                "$ref": "#/$defs/id"
               },
               "scheme": {
                 "description": "Схема запросов к экземпляру внутри Docker Compose. Используется http.",

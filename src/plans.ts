@@ -3,7 +3,7 @@ import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataService, postgisSource, publicationEntries, publicationUrl, providerRoot,
+import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService, postgisSource, publicationEntries, publicationUrl, providerRoutes,
   fileSource, serializeFeaturesConfig, usedFileSources, vectorFile, type FeaturesConfig, type Publication } from './config.js';
 import { pinProviderImages } from './provider-images.js';
 import { archiveLegacyOpenApi, closeGateway, compose, diagnoseStack, featuresStackRunning, openGateway, prepareFeaturesStack, providerConfigurationChanged,
@@ -389,8 +389,9 @@ function affectedRoutes(candidate: FeaturesConfig, current: FeaturesConfig | nul
     config.publicUrl,
     `${config.publicUrl}/collections`,
     `${config.publicUrl}/openapi`,
-    ...[...new Set(Object.keys(config.providers ?? {}).map((id) => providerRoot(config, id)))].filter((root) => root !== '/mvt').flatMap((root) =>
-      ['', '/collections', '/openapi'].map((suffix) => new URL(root + suffix, config.publicUrl).href)),
+    ...[...providerRoutes(config)].filter(([, route]) => hasProtocolMetadata(route))
+      .flatMap(([root, { protocol }]) => ['', protocol === 'mvt' ? '/catalog' : '/collections', '/openapi', '/conformance']
+        .map((suffix) => new URL(root + suffix, config.publicUrl).href)),
     ...publicationEntries(config).map(([id, publication]) => publicationUrl(config, id, publication)),
     ...(config.auth ? ['/account', '/api/auth'].map((path) => new URL(path, config.publicUrl).href) : []),
   ]))];

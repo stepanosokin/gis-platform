@@ -30,14 +30,15 @@ export interface ManagedProvider extends ProviderConnection {
   image: string;
   digest?: string;
   api: {
-    protocol: Publication['protocol'];
     scheme: 'http';
     port: number;
     base_path: string;
-    public_root: string;
     links: 'canonical';
     readiness: string;
-  };
+  } & (
+    { protocol: Publication['protocol']; public_root: string; protocols?: never; public_prefix?: never } |
+    { protocols: Publication['protocol'][]; public_prefix?: string; protocol?: never; public_root?: never }
+  );
   environment?: Record<string, string>;
   volumes?: Record<string, string>;
 }
@@ -192,7 +193,8 @@ export function usedFileSources(config: FeaturesConfig, provider?: string) {
 
 export function needsMetadataService(config: FeaturesConfig) {
   return config.providers !== undefined &&
-    (Object.keys(config.providers).length === 0 || Object.values(config.providers).some((provider) => provider.type !== 'martin')) &&
+    (Object.keys(config.providers).length === 0 || Object.values(config.providers).some((provider) =>
+      provider.type !== 'martin' || provider.api.protocols)) &&
     (!config.auth || publicationEntries(config).some(([, publication]) => publication.protocol === 'maps') ||
       publicationEntries(config).every(([, publication]) => publication.access === 'public'));
 }
@@ -202,8 +204,48 @@ export function builtInProviderId(config: FeaturesConfig) {
     : config.publicationId === null ? config.providerId : config.publication.provider;
 }
 
-export function providerRoot(config: FeaturesConfig, id: string) {
-  return config.providers?.[id]?.image ? config.providers[id].api.public_root : '/features';
+const adapterProtocols: Record<ManagedProvider['type'], Publication['protocol'][]> = {
+  pygeoapi: ['features', 'maps', 'tiles'], martin: ['mvt'], pydggsapi: ['dggs'],
+};
+
+export function providerProtocols(provider: Provider | undefined): Publication['protocol'][] {
+  if (!provider?.image) return ['features'];
+  return provider.api.protocols ?? [provider.api.protocol];
+}
+
+export function providerRoot(config: FeaturesConfig, id: string, protocol: Publication['protocol']) {
+  const provider = config.providers?.[id];
+  if (!provider?.image) return '/features';
+  return provider.api.public_root ?? `/${provider.api.public_prefix ?? id}/${protocol}`;
+}
+
+export function providerBasePath(config: FeaturesConfig, id: string) {
+  const provider = config.providers?.[id];
+  if (!provider?.image) return '';
+  return provider.type === 'pydggsapi' ? providerRoot(config, id, 'dggs') :
+    provider.api.base_path === '/' ? '' : provider.api.base_path;
+}
+
+export function publicationRoot(config: FeaturesConfig, publication: Publication) {
+  return providerRoot(config, publication.provider, publication.protocol);
+}
+
+export function providerRoutes(config: FeaturesConfig) {
+  const routes = new Map<string, { protocol: Publication['protocol']; ids: string[]; nested: boolean }>();
+  for (const [id, provider] of Object.entries(config.providers ?? {})) {
+    for (const protocol of providerProtocols(provider)) {
+      const root = providerRoot(config, id, protocol);
+      const route = routes.get(root);
+      if (route) route.ids.push(id);
+      else routes.set(root, { protocol, ids: [id], nested: Boolean(provider.image && provider.api.protocols) });
+    }
+  }
+  if (!routes.size) routes.set('/features', { protocol: 'features', ids: [], nested: false });
+  return routes;
+}
+
+export function hasProtocolMetadata({ protocol, nested }: { protocol: Publication['protocol']; nested: boolean }) {
+  return protocol !== 'mvt' || nested;
 }
 
 export function managedProviderRuns(config: FeaturesConfig, id: string) {
@@ -213,7 +255,7 @@ export function managedProviderRuns(config: FeaturesConfig, id: string) {
 }
 
 export function publicationUrl(config: FeaturesConfig, id: string, publication: Publication) {
-  const root = providerRoot(config, publication.provider);
+  const root = publicationRoot(config, publication);
   return new URL(`${root}${publication.protocol === 'mvt' ? '' : '/collections'}/${id}`, config.publicUrl).href;
 }
 
@@ -320,7 +362,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   if (providers.filter(([, provider]) => !provider.image).length > 1) {
     throw new Error('Only one provider can use the built-in image. Configure an image and API for each additional instance.');
   }
-  const roots = new Set<string>();
+  const roots = new Map<string, Publication['protocol']>();
+  const prefixes = new Set<string>();
+  const reservedRoots = ['/account', '/api', '/internal'];
   for (const [id, provider] of providers) {
     if (provider.postgis) {
       provider.postgis.password_file = resolve(directory, provider.postgis.password_file);
@@ -333,19 +377,30 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`pydggsapi provider '${id}' requires an image and API.`);
     }
     if (!provider.image && !Object.hasOwn(provider, 'image')) {
-      roots.add('/features');
+      roots.set('/features', 'features');
       continue;
     }
     if (!provider.image || id.length > 54) throw new Error(`Invalid managed provider '${id}'.`);
     const { repository, digest } = imageReference(provider.image);
     if (digest && provider.digest && digest !== provider.digest) throw new Error(`Provider '${id}' has conflicting digests.`);
-    const { public_root: root } = provider.api;
-    if (provider.type === 'martin') {
-      if (provider.api.protocol !== 'mvt' || root !== '/mvt' || provider.api.readiness !== '/health' ||
-          provider.environment || provider.volumes) {
-        throw new Error(`Martin provider '${id}' requires protocol mvt, public_root /mvt and readiness /health.`);
+    const { public_root: root, protocols, public_prefix: prefix = id, base_path: base, readiness } = provider.api;
+    if (providerProtocols(provider).some((protocol) => !adapterProtocols[provider.type].includes(protocol))) {
+      throw new Error(`Provider '${id}' uses a protocol unsupported by its ${provider.type} adapter.`);
+    }
+    if (protocols) {
+      const path = `/${prefix}`;
+      if (prefixes.has(path)) throw new Error(`Duplicate public prefix '${path}'.`);
+      if ([...reservedRoots, '/features', '/maps', '/tiles', '/mvt', dggsRoot].includes(path)) {
+        throw new Error(`Provider '${id}' uses a reserved public prefix '${path}'.`);
       }
-    } else if (provider.api.protocol === 'mvt' || root === '/mvt') {
+      prefixes.add(path);
+    }
+    if (provider.type === 'martin') {
+      if ((root && root !== '/mvt') || readiness !== '/health' ||
+          provider.environment || provider.volumes) {
+        throw new Error(`Martin provider '${id}' requires readiness /health and legacy public_root /mvt.`);
+      }
+    } else if (root === '/mvt') {
       throw new Error(`Provider '${id}': /mvt and protocol mvt require Martin.`);
     }
     if (provider.api.protocol === 'maps' && (root !== '/maps' || provider.postgis)) {
@@ -355,23 +410,25 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Tiles provider '${id}' requires public_root /tiles and a separate Martin instance for PostGIS.`);
     }
     if (provider.type === 'pydggsapi') {
-      const { protocol, base_path: base, readiness } = provider.api;
-      if (protocol !== 'dggs' || root !== dggsRoot || base !== root || readiness !== '/conformance' ||
+      if ((root ? root !== dggsRoot || base !== root : base !== '/') || readiness !== '/conformance' ||
           provider.postgis || provider.environment || provider.volumes) {
-        throw new Error(`pydggsapi provider '${id}' requires protocol dggs, base_path and public_root /dggs, and readiness /conformance.`);
+        throw new Error(`pydggsapi provider '${id}' requires readiness /conformance and base_path / for nested URLs, or base_path and public_root /dggs.`);
       }
       if (repository !== pydggsapiRepository || (digest ?? provider.digest ?? pydggsapiDigest) !== pydggsapiDigest ||
           (provider.image !== `${repository}:0.4.0` && provider.image !== `${repository}@${pydggsapiDigest}`)) {
         throw new Error(`Provider '${id}' requires the accepted pydggsapi 0.4.0 image.`);
       }
       provider.digest ??= pydggsapiDigest;
-    } else if (provider.api.protocol === 'dggs') {
-      throw new Error(`Provider '${id}': protocol dggs requires pydggsapi.`);
     }
-    if (['/account', '/api', '/internal'].some((reserved) => root === reserved || root.startsWith(reserved + '/'))) {
-      throw new Error(`Provider '${id}' uses a reserved public root.`);
+    if (root) {
+      if (reservedRoots.some((reserved) => root === reserved || root.startsWith(reserved + '/'))) {
+        throw new Error(`Provider '${id}' uses a reserved public root.`);
+      }
+      const protocol = provider.api.protocol!;
+      const existing = roots.get(root);
+      if (existing && existing !== protocol) throw new Error(`Providers at '${root}' must use the same protocol.`);
+      roots.set(root, protocol);
     }
-    roots.add(root);
     const targets = Object.values(provider.volumes ?? {});
     const reservedPaths = ['/source', '/etc/pygeoapi/gis', '/venv'];
     if (provider.postgis) reservedPaths.push('/run/secrets/postgis_password');
@@ -380,20 +437,19 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
           target === path || target.startsWith(path + '/') || path.startsWith(target + '/'))) ||
         new Set(targets).size !== targets.length) throw new Error(`Invalid volume targets for provider '${id}'.`);
     if (Object.keys(provider.environment ?? {}).some((name) =>
-      ['PYGEOAPI_CONFIG', 'PYGEOAPI_OPENAPI', 'SCRIPT_NAME'].includes(name) ||
+      ['PYGEOAPI_CONFIG', 'PYGEOAPI_OPENAPI', 'GIS_PYGEOAPI_PROTOCOLS', 'SCRIPT_NAME'].includes(name) ||
       (provider.postgis && ['PGPASSWORD', 'PGPASSFILE'].includes(name)))) {
       throw new Error(`Provider '${id}' overrides a required adapter environment variable.`);
     }
   }
-  for (const root of roots) {
-    if ([...roots].some((other) => other !== root && root.startsWith(other + '/'))) {
+  const paths = [...roots.keys()];
+  for (const root of paths) {
+    if (paths.some((other) => other !== root && root.startsWith(other + '/'))) {
       throw new Error(`Ambiguous public root '${root}'.`);
     }
-  }
-  for (const root of ['/maps', '/tiles', dggsRoot]) {
-    const protocols = new Set(providers.flatMap(([, provider]) =>
-      provider.image && provider.api.public_root === root ? [provider.api.protocol] : []));
-    if (protocols.size > 1) throw new Error(`Providers at '${root}' must use the same protocol.`);
+    if ([...prefixes].some((prefix) => root === prefix || root.startsWith(prefix + '/'))) {
+      throw new Error(`Public root '${root}' overlaps an instance prefix.`);
+    }
   }
 
   const entries = Object.entries(config.publications).map((
@@ -421,7 +477,7 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`Publication '${id}' references unknown provider '${provider}'.`);
     }
     const instance: Provider | undefined = config.providers[provider];
-    if ((instance?.image ? instance.api.protocol : 'features') !== protocol) {
+    if (!providerProtocols(instance).includes(protocol)) {
       throw new Error(`Publication '${id}' uses a protocol unsupported by provider '${provider}'.`);
     }
     const sourceConfig = config.sources[source]!;
@@ -450,7 +506,8 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
         throw new Error(`Publication '${id}': mvt_properties requires a PostGIS source.`);
       }
       if (['catalog', 'config', 'font', 'health', 'help', 'index', 'manifest', 'metrics', 'refresh',
-        'reload', 'sprite', 'status'].includes(id)) {
+        'reload', 'sprite', 'status'].includes(id) ||
+        (protocol === 'mvt' && instance?.image && instance.api.protocols && ['openapi', 'conformance'].includes(id))) {
         throw new Error(`Publication '${id}': this ID is reserved by Martin.`);
       }
     } else if (publication.mvt_properties) {

@@ -2,7 +2,7 @@ import type { Express, Request, Response } from 'express';
 import { readFile } from 'node:fs/promises';
 import { stringify } from 'yaml';
 import { page } from './account-pages.js';
-import { dggsRoot, type Publication } from './config.js';
+import type { Publication } from './config.js';
 import { publicationAccess, type PublicationReader } from './publication-access.js';
 import { probeHealth, type HealthEndpoint } from './publication-health.js';
 
@@ -19,6 +19,8 @@ interface ManagedMetadata {
   api: OpenApi;
   collections: Catalog['collections'];
   conformsTo?: string[];
+  conformance?: { common: string[]; publications: Record<string, string[]> };
+  tileCatalog?: Record<string, { name: string; description: string; content_type: string; tilejson: string }>;
   sourceProbes?: Record<string, HealthEndpoint>;
 }
 
@@ -59,13 +61,14 @@ function canRead(publications: Map<string, Publication['access']>, id: string, r
   return mode !== undefined && publicationAccess(mode, id, reader) === 200;
 }
 
-function annotateOpenApi(api: OpenApi, publications: Map<string, Publication['access']>, reader: PublicationReader | null, cookieName: string) {
+function annotateOpenApi(api: OpenApi, publications: Map<string, Publication['access']>, reader: PublicationReader | null,
+  cookieName: string, directTiles = false) {
   let hasProtectedPaths = false;
+  const metadataPaths = ['/', '/openapi', '/conformance', ...(directTiles ? ['/catalog'] :
+    ['/collections', '/TileMatrixSets', '/TileMatrixSets/{tileMatrixSetId}'])];
   api.paths = Object.fromEntries(Object.entries(api.paths).filter(([path, entry]) => {
-    if (['/', '/openapi', '/conformance', '/collections', '/TileMatrixSets', '/TileMatrixSets/{tileMatrixSetId}'].includes(path)) {
-      return true;
-    }
-    const id = /^\/collections\/([^/]+)(?:\/|$)/.exec(path)?.[1];
+    if (metadataPaths.includes(path)) return true;
+    const id = (directTiles ? /^\/([^/]+)(?:\/|$)/ : /^\/collections\/([^/]+)(?:\/|$)/).exec(path)?.[1];
     if (!id || !canRead(publications, id, reader)) return false;
     if (publications.get(id) === 'public') return true;
     hasProtectedPaths = true;
@@ -130,7 +133,26 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
   readReader: (req: Request, res: Response) => Promise<PublicationReader | null>, root: string, metadata?: ManagedMetadata) {
   const publications = new Map(Object.entries(modes));
   const title = metadata?.api.info?.title ?? 'Features';
-  if (root === dggsRoot && metadata?.api.openapi?.startsWith('3.1.')) app.get(root, (_req, res) => {
+  const tiles = metadata?.tileCatalog;
+  if (tiles) {
+    app.get(root, (_req, res) => res.json({ title, links: [
+      { rel: 'self', href: metadata.url, type: mediaTypes.json },
+      { rel: 'data', href: `${metadata.url}/catalog`, type: mediaTypes.json },
+      { rel: 'service-desc', href: `${metadata.url}/openapi`, type: 'application/vnd.oai.openapi+json;version=3.0' },
+      { rel: 'conformance', href: `${metadata.url}/conformance`, type: mediaTypes.json },
+    ] }));
+    app.get(`${root}/catalog`, async (req, res) => {
+      res.vary('Cookie').vary('Authorization');
+      const reader = await readReader(req, res);
+      res.json({ tiles: Object.fromEntries(Object.entries(tiles).filter(([id]) => canRead(publications, id, reader))) });
+    });
+    app.get(`${root}/conformance`, async (req, res) => {
+      res.vary('Cookie').vary('Authorization');
+      const reader = await readReader(req, res);
+      res.json({ interfaces: Object.keys(tiles).some((id) => canRead(publications, id, reader)) ? ['TileJSON', 'XYZ'] : [] });
+    });
+  }
+  if (metadata?.api.openapi?.startsWith('3.1.')) app.get(root, (_req, res) => {
     res.json({
       title,
       links: [
@@ -141,11 +163,18 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
       ],
     });
   });
-  const conformsTo = metadata?.conformsTo;
-  if (conformsTo) app.get(`${root}/conformance`, (req, res) => {
+  const conformance = metadata?.conformance;
+  if (conformance || metadata?.conformsTo) app.get(`${root}/conformance`, async (req, res) => {
     const representation = requestedFormat(req, ['json', 'html']);
     if (!representation) return res.status(400).json({ code: 'InvalidParameterValue', description: 'Invalid format.' });
     res.vary('Accept');
+    let conformsTo = metadata.conformsTo ?? [];
+    if (conformance) {
+      res.vary('Cookie').vary('Authorization');
+      const reader = await readReader(req, res);
+      conformsTo = [...new Set([...conformance.common, ...Object.entries(conformance.publications)
+        .filter(([id]) => canRead(publications, id, reader)).flatMap(([, classes]) => classes)])].sort();
+    }
     if (representation === 'html') return res.send(page(`${title} conformance`,
       `<ul>${conformsTo.map((uri) => `<li>${escapeHtml(uri)}</li>`).join('')}</ul>`));
     res.json({ conformsTo });
@@ -201,7 +230,7 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
     if (!representation) return res.status(400).json({ code: 'InvalidParameterValue', description: 'Invalid format.' });
     const reader = await readReader(req, res);
     const api = metadata ? structuredClone(metadata.api) : await upstreamDocument<OpenApi>('openapi');
-    annotateOpenApi(api, publications, reader, cookieName);
+    annotateOpenApi(api, publications, reader, cookieName, Boolean(tiles));
     if (representation === 'yaml') return res.type('application/yaml').send(stringify(api));
     if (representation === 'html') {
       return res.send(page(`${title} OpenAPI`, `<p><a href="${root}/openapi?f=json">OpenAPI JSON</a></p>` +

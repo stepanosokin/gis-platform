@@ -1,0 +1,92 @@
+schema_version: 1
+server: {host: localhost, port: 8080}
+sources:
+  places: {type: geojson, path: places.geojson}
+  terrain: {type: geotiff, path: ../data/terrain.tif, epsg: 4326}
+  observations:
+    type: postgis
+    schema: gis
+    relation: published_observations
+    id_field: id
+    geometry_field: geom
+    max_lag_seconds: 0
+  cells: {type: parquet, path: ../data/cells.parquet, id_field: h3_id, resolution: 7, properties: [count]}
+providers:
+  provider-pygeoapi:
+    type: pygeoapi
+    image: geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a
+    api:
+      protocols: [features, maps, tiles]
+      public_prefix: pygeoapi
+      scheme: http
+      port: 80
+      base_path: /
+      links: canonical
+      readiness: /openapi
+  provider-pygeoapi-archive:
+    type: pygeoapi
+    image: geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a
+    api: {protocols: [features], scheme: http, port: 80, base_path: /, links: canonical, readiness: /openapi}
+  provider-martin:
+    type: martin
+    image: ghcr.io/maplibre/martin:1.16.1@sha256:59902019bf9038926ff0c71174237d6852e64c457830a6349abe7090be8818ca
+    api: {protocols: [mvt], public_prefix: martin, scheme: http, port: 3000, base_path: /, links: canonical, readiness: /health}
+    postgis:
+      host: postgis.example.org
+      database: gis
+      user: tiles_reader
+      password_file: ./secrets/observations-password
+  provider-pydggsapi:
+    type: pydggsapi
+    image: ghcr.io/landscapegeoinformatics/pydggsapi:0.4.0
+    api: {protocols: [dggs], public_prefix: pydggsapi, scheme: http, port: 8000, base_path: /, links: canonical, readiness: /conformance}
+publications:
+  places:
+    source: places
+    provider: provider-pygeoapi
+    protocol: features
+    access: public
+    title: Places
+    description: Sample points through Features.
+    extent: [37, 55, 40, 58]
+  archive-places:
+    source: places
+    provider: provider-pygeoapi-archive
+    protocol: features
+    access: public
+    title: Archive places
+    description: Sample points through the separate archive instance.
+    extent: [37, 55, 40, 58]
+  terrain:
+    source: terrain
+    provider: provider-pygeoapi
+    protocol: maps
+    access: public
+    title: Terrain
+    description: PNG map of the terrain.
+    extent: [36, 54, 40, 58]
+  observations:
+    source: observations
+    provider: provider-pygeoapi
+    tile_provider: provider-martin
+    protocol: tiles
+    access: public
+    title: Observations
+    description: OGC vector tiles from PostGIS.
+    extent: [37, 55, 40, 58]
+  observations-mvt:
+    source: observations
+    provider: provider-martin
+    protocol: mvt
+    access: public
+    title: Observations MVT
+    description: Direct vector tiles from the same PostGIS source.
+    extent: [37, 55, 40, 58]
+  cells:
+    source: cells
+    provider: provider-pydggsapi
+    protocol: dggs
+    access: public
+    title: H3 cells
+    description: H3 resolution 7 cells from a Parquet snapshot.
+    extent: [37, 55, 40, 58]

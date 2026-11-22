@@ -16,19 +16,21 @@ import { mapBboxDescription, mapRelation, mapSize } from './maps-profile.js';
 import { checkTileJson, martinConfig, martinService, runMartin, tileArchivePath } from './martin-profile.js';
 import { matrixSet, tilesRoutes, tilesRelation, tilesSource, vectorTileType } from './tiles-profile.js';
 import { mapLibreAssetRoute } from './maplibre-style.js';
+import { featuresConformance, protocolConformance } from './protocol-conformance.js';
 import { dggsConfig, dggsDataRoute, dggsFiles, dggsRelation, dggsRoutes, dggsService,
   dggsSnapshotPath, dggsZoneParameters, runDggs } from './dggs-profile.js';
 import { healthUrl, providerServiceName as serviceName, publicationChecks, publicationHealth } from './publication-health.js';
 import { GatewayTlsError, gatewayTlsFiles, gatewayTlsProbe, inspectGatewayTls } from './gateway-tls.js';
-import { builtInProviderId, hasGeoJson, managedProviderRuns, needsMetadataService, pinnedImage, postgisSource, providerRoot, publicationEntries, publicationsForProvider, publicationUrl,
-  crs84, dggsRoot, rasterFile, tileArchive, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
+import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService, pinnedImage, postgisSource,
+  providerBasePath, providerProtocols, providerRoot, providerRoutes, publicationEntries, publicationRoot, publicationsForProvider,
+  publicationUrl, crs84, rasterFile, tileArchive, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
 
 const run = promisify(execFile);
 const composeFile = (name: string) => fileURLToPath(new URL(`../${name}`, import.meta.url));
 const postgisPlugin = 'gis_postgis.PostGISProvider';
 const vectorFilePlugin = 'gis_vector_files.VectorFileProvider';
 const parquetImage = 'gis-platform-pygeoapi-parquet:0.24.0-arrow-23.0.1';
-const apiNames: Partial<Record<Publication['protocol'], string>> = { maps: 'Maps', tiles: 'Tiles' };
+const apiNames = { features: 'Features', maps: 'Maps', tiles: 'Tiles', mvt: 'MVT', dggs: 'DGGS' };
 let project: string | undefined;
 
 export async function resolveComposeProject() {
@@ -41,9 +43,10 @@ export async function resolveComposeProject() {
 }
 
 function pygeoapiConfig(config: FeaturesConfig, instance = builtInProviderId(config)) {
-  const publicUrl = instance ? new URL(providerRoot(config, instance), config.publicUrl).href : config.publicUrl;
   const provider = instance ? config.providers?.[instance] : undefined;
-  const protocol = provider?.image ? apiNames[provider.api.protocol] ?? 'Features' : 'Features';
+  const protocols = providerProtocols(provider);
+  const publicUrl = instance ? new URL(providerRoot(config, instance, protocols[0]!), config.publicUrl).href : config.publicUrl;
+  const protocol = protocols.map((name) => apiNames[name]).join(', ');
   return {
     server: {
       bind: { host: '0.0.0.0', port: provider?.image ? provider.api.port : 80 },
@@ -138,6 +141,7 @@ export function providerConfigurationChanged(candidate: FeaturesConfig, previous
   }
   if (id && candidate.providers?.[id]?.type === 'pydggsapi') {
     return previous.providers?.[id]?.type !== 'pydggsapi' ||
+      providerRoot(candidate, id, 'dggs') !== providerRoot(previous, id, 'dggs') ||
       JSON.stringify(dggsConfig(candidate, id)) !== JSON.stringify(dggsConfig(previous, id));
   }
   return (id !== undefined && (
@@ -165,13 +169,16 @@ http://:80 {
     protocol === 'mvt' ? `(${ids.join('|')})(/[0-9]{1,2}/[0-9]{1,10}/[0-9]{1,10})?` :
     `collections/(${ids.join('|')})(/(${protocol ? ogcRoutes[protocol] : Object.values(ogcRoutes).join('|')}))?`;
   const ogcIds = publications.filter(([, publication]) => publication.protocol !== 'mvt').map(([id]) => id);
+  const byProtocol = providerRoutes(config);
+  const mvtRoots = [...byProtocol].filter(([, { protocol }]) => protocol === 'mvt').map(([root]) => root);
+  const tileRoot = mvtRoots.length ? `(?:${mvtRoots.join('|')})` : '/mvt';
   const mvtIds = publications.filter(([, publication]) => publication.protocol === 'mvt').map(([id]) => id);
   const allCollections = ogcIds.length ? collectionRoute(ogcIds) : '';
-  const allTiles = mvtIds.length ? `/mvt/${collectionRoute(mvtIds, 'mvt')}` : '';
+  const allTiles = mvtIds.length ? `${tileRoot}/${collectionRoute(mvtIds, 'mvt')}` : '';
   const styledIds = publications.filter(([, publication]) => publication.maplibre).map(([id]) => id);
-  const mapLibreAssets = styledIds.length ? `/mvt/(${styledIds.join('|')})/${mapLibreAssetRoute}` : '';
+  const mapLibreAssets = styledIds.length ? `${tileRoot}/(${styledIds.join('|')})/${mapLibreAssetRoute}` : '';
   const mapRoutes = [allTiles, mapLibreAssets].filter(Boolean).join('|');
-  const roots = config.providers ? [...new Set(Object.keys(config.providers).map((id) => providerRoot(config, id)))] : ['/features'];
+  const roots = [...byProtocol.keys()];
   const rootPattern = roots.length ? `(?:${roots.join('|')})` : '/features';
   const loggedRoutes = `${rootPattern}/(${['openapi', 'collections', ...(allCollections ? [allCollections] : [])].join('|')})`;
   const logged = [loggedRoutes, mapRoutes].filter(Boolean).join('|');
@@ -386,34 +393,28 @@ function managedGatewayRoutes(config: FeaturesConfig,
   const publications = publicationEntries(config);
   const origins = [...new Set([new URL(config.publicUrl).origin, ...config.cors?.allowed_origins ?? []])];
   const metadataFallback = config.auth && publications.every(([, publication]) => publication.access === 'public');
-  const byRoot = new Map<string, string[]>();
-  for (const id of Object.keys(config.providers ?? {})) {
-    const root = providerRoot(config, id);
-    byRoot.set(root, [...(byRoot.get(root) ?? []), id]);
-  }
-  if (!byRoot.size) byRoot.set('/features', []);
-  for (const [root, ids] of byRoot) {
+  for (const [root, route] of providerRoutes(config)) {
+    const { protocol, ids, nested } = route;
     const rootIndex = routes.length;
-    const entries = publications.filter(([, publication]) => ids.includes(publication.provider));
-    const mvt = root === '/mvt';
-    const dggs = ids.some((id) => config.providers?.[id]?.type === 'pydggsapi');
-    const tiles = ids.some((id) => {
-      const instance = config.providers?.[id];
-      return instance?.image && instance.api.protocol === 'tiles';
-    });
+    const entries = publications.filter(([, publication]) => publicationRoot(config, publication) === root);
+    const mvt = protocol === 'mvt';
+    const dggs = protocol === 'dggs';
+    const tiles = protocol === 'tiles';
     const rootProvider = (tiles && entries[0]?.[1].provider) || ids[0];
     const metadata = config.auth ? 'access' : 'metadata';
-    const managedConformance = entries.some(([, publication]) => vectorFile(config, publication.source));
-    if (tiles || dggs) {
+    const managedConformance = nested || entries.some(([, publication]) => vectorFile(config, publication.source));
+    if (mvt && nested) {
+      routes.push(corsRoutes(`cors${rootIndex}`, `path_regexp ^${root}(/?|/catalog|/openapi|/conformance)$`, origins));
+    } else if (tiles || dggs) {
       const paths = ['/?', '/collections', '/openapi',
-        ...(dggs ? ['/docs'] : ['/conformance', '/[Tt]ileMatrixSets(/[^/]+)?'])];
+        '/conformance', ...(dggs ? ['/docs'] : ['/[Tt]ileMatrixSets(/[^/]+)?'])];
       if (entries.length) paths.push('/' + collectionRoute(entries.map(([id]) => id), dggs ? 'dggs' : 'tiles'));
       routes.push(corsRoutes(`cors${rootIndex}`, `path_regexp ^${root}(${paths.join('|')})$`, origins));
     }
-    if (!mvt) routes.push(`
+    if (hasProtocolMetadata(route)) routes.push(`
 	@metadata${rootIndex} {
 		method GET HEAD
-		path ${root}/collections ${root}/openapi${dggs ? ` ${root} ${root}/` : ''}${managedConformance ? ` ${root}/conformance` : ''}
+		path ${root}/${mvt ? 'catalog' : 'collections'} ${root}/openapi${dggs || mvt ? ` ${root} ${root}/` : ''}${managedConformance || mvt ? ` ${root}/conformance` : ''}
 	}
 	handle @metadata${rootIndex} {
 		route {${metadataFallback ? '\n			vars public_metadata true' : ''}
@@ -428,7 +429,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
       const providerEntries = entries.filter(([, entry]) => entry.provider === id);
       const instance = config.providers?.[id];
       const api = instance?.image ? instance.api : undefined;
-      const maps = api?.protocol === 'maps';
+      const maps = protocol === 'maps';
       const mapPath = `${root}/collections/*/map`;
       const mapRequest = maps ? `forward_auth ${mapPath} metadata:3000 {
 				uri /internal/validate-map
@@ -447,7 +448,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
 			@tilesDefaultFormat expression \`{http.request.header.Accept} in ["", "*/*"]\`
 			request_header @tilesDefaultFormat Accept application/json
 			` : '';
-      const base = api?.base_path === '/' ? '' : api?.base_path ?? '';
+      const base = providerBasePath(config, id);
       const upstream = `${serviceName(config, id)}:${api?.port ?? 80}`;
       const tileJsonChecks = mvt ? providerEntries.filter(([, entry]) => postgisSource(config, entry.source))
         .map(([key, publication], index) => `
@@ -467,12 +468,13 @@ function managedGatewayRoutes(config: FeaturesConfig,
 				}
 			}
 			`).join('') : '';
-      const proxy = (postgis = false, swagger = false) => `${mapRequest}${tileAccept}${dggs && !swagger ? dggsRequest : ''}${postgis ? tileJsonChecks : ''}
+      const proxy = (postgis = false, swagger = false) => `${mapRequest}${tileAccept}${dggs && !swagger ? dggsRequest(root) : ''}${postgis ? tileJsonChecks : ''}
 			${dggs ? '' : `uri strip_prefix ${root}`}
 			${tiles ? 'uri replace /tileMatrixSets /TileMatrixSets' : ''}
 			${!dggs && (base || mvt) ? `rewrite * ${base}{http.request.uri.path}${mvt ? '?' : ''}` : ''}
 			reverse_proxy ${upstream} {
 				import gis_public_headers
+				${instance?.type === 'pygeoapi' && api?.protocols ? `header_up X-GIS-Protocol ${protocol}` : ''}
 				${postgis || tiles ? `transport http {
 					response_header_timeout 15s
 				}` : ''}
@@ -540,8 +542,8 @@ function managedGatewayRoutes(config: FeaturesConfig,
             Boolean(postgisSource(config, entry.source)) === postgis).map(([key]) => key);
           if (!visible.length) continue;
           addPublicationRoute(anonymous, proxy(postgis), (name) => `method GET HEAD
-		path_regexp ${name} ^${root}/${collectionRoute(visible, api?.protocol ?? 'features')}$`);
-          if (postgis && !mvt && !tiles) addPublicationRoute(anonymous, proxy(true), (name) => `method POST
+		path_regexp ${name} ^${root}/${collectionRoute(visible, protocol)}$`);
+          if (postgis && protocol === 'features') addPublicationRoute(anonymous, proxy(true), (name) => `method POST
 		header_regexp Content-Type (?i)^application/json(?:\\s*;.*)?$
 		path_regexp ${name} ^${root}/collections/(${visible.join('|')})/items$`);
         }
@@ -577,26 +579,26 @@ const invalidDggsListQuery = [
   ...dggsZoneParameters.filter(({ required }) => required).map(({ name }) => `!${rawQuery}.matches('(^|&)${name}=')`),
   ...dggsZoneParameters.map(({ name }) => `${rawQuery}.matches('(^|&)${name}=.*&${name}=')`),
 ].join(' || ');
-const dggsRequest = `
+const dggsRequest = (root: string) => `
 			header >Cache-Control no-store
 			@dggsZoneListInvalid {
-				path_regexp ^${dggsRoot}/collections/[^/]+${dggsDataRoute}$
+				path_regexp ^${root}/collections/[^/]+${dggsDataRoute}$
 				expression \`${invalidDggsListQuery}\`
 			}
 			@dggsZoneDataInvalid {
-				path_regexp ^${dggsRoot}/collections/[^/]+${dggsDataRoute}/[^/]+/data$
+				path_regexp ^${root}/collections/[^/]+${dggsDataRoute}/[^/]+/data$
 				expression \`!{http.request.uri.query}.matches('^(zone-depth=0)?$')\`
 			}
 			respond @dggsZoneListInvalid 400
 			respond @dggsZoneDataInvalid 400
 			@dggsMetadata {
-				not path_regexp ^${dggsRoot}/collections/[^/]+${dggsDataRoute}(/[^/]+/data)?$
+				not path_regexp ^${root}/collections/[^/]+${dggsDataRoute}(/[^/]+/data)?$
 			}
 			rewrite @dggsMetadata {http.request.uri.path}?
 			@dggsNoAccept expression \`{http.request.header.Accept} == ""\`
 			request_header @dggsNoAccept Accept */*
 			@dggsGeoJson {
-				path_regexp ^${dggsRoot}/collections/[^/]+${dggsDataRoute}$
+				path_regexp ^${root}/collections/[^/]+${dggsDataRoute}$
 				query f=geojson
 			}
 			request_header @dggsGeoJson Accept application/geo+json
@@ -853,12 +855,15 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
       await writeFile(join(native, 'config.json'), JSON.stringify(dggsConfig(config, id)));
       await writeFile(join(native, 'run.sh'), runDggs);
       await copyFile(fileURLToPath(new URL('../src/validate_dggs_snapshot.py', import.meta.url)), join(native, 'validate.py'));
-      const settings = dggsService(provider, escapeCompose(await nativeProviderDirectory(directory, service)));
+      const settings = dggsService(provider, providerRoot(config, id, 'dggs'),
+        escapeCompose(await nativeProviderDirectory(directory, service)));
       services[service] = { ...settings, volumes: [...settings.volumes, ...fileMounts] };
       continue;
     }
-    const tiles = provider.image && provider.api.protocol === 'tiles';
-    const pluginEnvironment = connection || vectorFiles || tiles ? {
+    const protocols = providerProtocols(provider);
+    const tiles = protocols.includes('tiles');
+    const nested = Boolean(provider.image && provider.api.protocols);
+    const pluginEnvironment = connection || vectorFiles || tiles || nested ? {
       PYTHONPATH: '/etc/pygeoapi/gis' + (provider.image && provider.environment?.PYTHONPATH
         ? `:${escapeCompose(provider.environment.PYTHONPATH)}` : ''),
     } : undefined;
@@ -872,6 +877,9 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
     if (tiles) {
       await copyFile(fileURLToPath(new URL('../src/gis_tiles.py', import.meta.url)), join(native, 'gis_tiles.py'));
     }
+    if (nested) {
+      await copyFile(fileURLToPath(new URL('../src/gis_pygeoapi.py', import.meta.url)), join(native, 'gis_pygeoapi.py'));
+    }
     if (!provider.image) {
       if (connection || files.length) services[service] = {
         environment: pluginEnvironment, volumes: fileMounts, secrets: connection,
@@ -884,6 +892,12 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
     }
     const { port, scheme, base_path: base, readiness } = provider.api;
     await writeFile(join(native, 'pygeoapi.yml'), JSON.stringify(pygeoapiConfig(config, id)));
+    const profiles = Object.fromEntries(protocols.map((protocol) => [protocol, {
+      url: new URL(providerRoot(config, id, protocol), config.publicUrl).href,
+      name: apiNames[protocol],
+      collections: publicationEntries(config).filter(([, publication]) =>
+        publication.provider === id && publication.protocol === protocol).map(([key]) => key),
+    }]));
     const namedVolumes = Object.entries(provider.volumes ?? {}).map(([name, target]) => {
       const volume = `${service}_${name}`;
       volumes[volume] = {};
@@ -896,12 +910,13 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
         ...Object.fromEntries(Object.entries(provider.environment ?? {}).map(([name, value]) => [name, escapeCompose(value)])),
         PYGEOAPI_CONFIG: '/etc/pygeoapi/gis/pygeoapi.yml',
         PYGEOAPI_OPENAPI: '/etc/pygeoapi/gis/openapi.json',
+        ...(nested && { GIS_PYGEOAPI_PROTOCOLS: JSON.stringify(profiles) }),
         ...pluginEnvironment,
         ...(base !== '/' && { SCRIPT_NAME: base }),
       },
       entrypoint: ['/venv/bin/gunicorn'],
       command: ['--workers', '1', '--worker-class', 'gevent', '--timeout', '6000',
-        '--bind', `0.0.0.0:${port}`, 'pygeoapi.flask_app:APP'],
+        '--bind', `0.0.0.0:${port}`, nested ? 'gis_pygeoapi:APP' : 'pygeoapi.flask_app:APP'],
       volumes: [
         { type: 'bind', source: escapeCompose(await nativeProviderDirectory(directory, service)), target: '/etc/pygeoapi/gis', read_only: true,
           bind: { create_host_path: false } },
@@ -1005,12 +1020,13 @@ async function reuseManagedArtifacts(config: FeaturesConfig, directory: string, 
 
 async function prepareManagedFeatures(config: FeaturesConfig, directory: string, sourceHash: string | null,
   savedHash?: string | null) {
-  const documents: Record<string, { url: string; api: FeaturesOpenApi }> = {};
+  const documents: Record<string, { url: string; api: FeaturesOpenApi; tiles?: Record<string, { content_type: string }> }> = {};
   const providers = Object.keys(config.providers ?? {});
   const entries = publicationEntries(config);
   for (const id of providers) {
     const instance = config.providers?.[id];
-    const root = providerRoot(config, id);
+    const protocols = providerProtocols(instance);
+    const root = providerRoot(config, id, protocols[0]!);
     const url = new URL(root, config.publicUrl).href;
     const service = serviceName(config, id);
     const publications = entries.filter(([, pub]) => pub.provider === id);
@@ -1018,12 +1034,14 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
     const mounted = await nativeProviderDirectory(directory, service);
     if (instance?.type === 'martin') {
       const rendered = publicationsForProvider(config, id);
+      let catalog: Record<string, { content_type: string }> = {};
       if (rendered.length && mounted === native) {
         try {
           const output = await compose(config, directory, 'run', '--rm', '--no-deps', '-T', service,
             '--check', ...rendered.map(([key]) => key));
-          const [catalog, ...documents] = output.trim().split('\n');
-          const { tiles } = JSON.parse(catalog ?? '') as { tiles: Record<string, { content_type: string }> };
+          const [catalogJson, ...documents] = output.trim().split('\n');
+          const { tiles } = JSON.parse(catalogJson ?? '') as { tiles: typeof catalog };
+          catalog = tiles;
           for (const [index, [key, publication]] of rendered.entries()) {
             const source = postgisSource(config, publication.source);
             const contentType = tiles[key]?.content_type;
@@ -1042,6 +1060,12 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
           throw new FeaturesPreflightError(`Martin provider '${id}' failed to open its PostGIS sources. Check connectivity, access and source definitions.`);
         }
       }
+      if (instance.api.protocols) {
+        const filename = 'martin-catalog.json';
+        if (rendered.length && mounted !== native) catalog = JSON.parse(await readFile(join(mounted, filename), 'utf8'));
+        else if (rendered.length) await writeFile(join(native, filename), JSON.stringify(catalog));
+        documents[root] = { url, api: martinOpenApi(url, publications, catalog), tiles: catalog };
+      }
       continue;
     }
     let api: FeaturesOpenApi;
@@ -1057,7 +1081,7 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
             ? `Invalid DGGS snapshot '${failure[1]}'. Check the H3 IDs, resolution, column names and BIGINT or DOUBLE indicators.`
             : `pydggsapi provider '${id}' failed to initialize. Check the pinned image and its DuckDB extension.`);
         });
-      api = dggsOpenApi(output, url, publications);
+      api = dggsOpenApi(output, root, url, publications);
     } else {
       const geojson = hasGeoJson(config, id);
       if (geojson && !sourceHash) throw new Error('The GeoJSON source is unavailable.');
@@ -1085,7 +1109,7 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
       api = checkOpenApi(output, url, publications);
     }
     await writeFile(join(native, 'openapi.json'), JSON.stringify(api));
-    if (instance?.image && instance.api.protocol === 'tiles') {
+    if (protocols.includes('tiles')) {
       api.paths!['/TileMatrixSets'] = { get: {
         summary: 'List tile matrix set definitions.',
         responses: { '200': { description: 'Tile matrix sets' } },
@@ -1191,13 +1215,19 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
         };
       }
     }
-    const shared = documents[root];
-    if (shared) {
-      Object.assign(shared.api.paths!, Object.fromEntries(Object.entries(api.paths ?? {}).filter(([key]) =>
-        key.startsWith('/collections/'))));
-      shared.api.tags = [...(shared.api.tags ?? []), ...(api.tags ?? []).filter(({ name }) => name !== 'server')];
-    } else {
-      documents[root] = { url, api };
+    for (const protocol of protocols) {
+      const publicRoot = providerRoot(config, id, protocol);
+      const publicUrl = new URL(publicRoot, config.publicUrl).href;
+      const scoped = instance?.image && instance.api.protocols ? protocolOpenApi(api, publicUrl, protocol,
+        new Set(publications.filter(([, publication]) => publication.protocol === protocol).map(([key]) => key))) : api;
+      const shared = documents[publicRoot];
+      if (shared) {
+        Object.assign(shared.api.paths!, Object.fromEntries(Object.entries(scoped.paths ?? {}).filter(([key]) =>
+          key.startsWith('/collections/'))));
+        shared.api.tags = [...(shared.api.tags ?? []), ...(scoped.tags ?? []).filter(({ name }) => name !== 'server')];
+      } else {
+        documents[publicRoot] = { url: publicUrl, api: scoped };
+      }
     }
   }
   if (!providers.length) {
@@ -1206,14 +1236,24 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
       components: {}, paths: {},
     } };
   }
-  const roots = Object.fromEntries(Object.entries(documents).map(([root, { url, api }]) => [
-    root, { url, api, conformsTo: fileConformance(config, root),
-      sourceProbes: Object.fromEntries(entries.filter(([, publication]) =>
-        (postgisSource(config, publication.source) || publication.protocol === 'dggs') &&
-        providerRoot(config, publication.provider) === root)
+  const routes = providerRoutes(config);
+  const roots = Object.fromEntries(Object.entries(documents).map(([root, { url, api, tiles }]) => {
+    const { protocol, nested } = routes.get(root)!;
+    const publications = entries.filter(([, publication]) => publicationRoot(config, publication) === root);
+    return [root, {
+      url, api,
+      tileCatalog: tiles && Object.fromEntries(publications.map(([id, publication]) => [id, {
+      name: publication.title, description: publication.description, content_type: tiles[id]!.content_type,
+      tilejson: `${url}/${id}`,
+      }])),
+      ...(nested ? { conformance: protocolConformance(config, protocol, publications) } : {
+        conformsTo: publications.some(([, publication]) => vectorFile(config, publication.source))
+          ? featuresConformance(publications.some(([, publication]) => postgisSource(config, publication.source))) : undefined,
+      }),
+      sourceProbes: Object.fromEntries(publications.filter(([, publication]) =>
+        postgisSource(config, publication.source) || publication.protocol === 'dggs')
         .map(([id, publication]) => [id, publicationHealth(config, id, publication).source])),
-      collections: entries.filter(([, publication]) => providerRoot(config, publication.provider) === root)
-      .map(([id, publication]) => ({
+      collections: publications.map(([id, publication]) => ({
         id, title: publication.title, description: publicationDescription(config, publication),
         ...(publication.protocol === 'features' && { crs: publication.crs ?? [crs84], storageCrs: crs84 }), extent: {
           spatial: { bbox: [publication.extent], crs: crs84 },
@@ -1230,23 +1270,55 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
           : publication.protocol === 'dggs'
           ? [{ rel: dggsRelation, href: `${url}/collections/${id}/dggs`, type: 'application/json' }]
           : [{ rel: 'items', href: `${url}/collections/${id}/items?f=json`, type: 'application/geo+json' }]),
-      })) },
-  ]));
+      })),
+    }];
+  }));
   await writeFile(join(directory, 'features.json'), JSON.stringify(roots));
   if (savedHash) await writeFile(join(directory, 'source.sha256'), savedHash);
 }
 
-function fileConformance(config: FeaturesConfig, root: string) {
-  const publications = publicationEntries(config).filter(([, publication]) => providerRoot(config, publication.provider) === root);
-  if (!publications.some(([, publication]) => vectorFile(config, publication.source))) return undefined;
-  const base = 'http://www.opengis.net/spec';
-  const features = ['core', 'oas30', 'html', 'geojson'].map((name) => `${base}/ogcapi-features-1/1.0/conf/${name}`);
-  features.push(`${base}/ogcapi-features-2/1.0/conf/crs`,
-    `${base}/ogcapi-features-3/1.0/conf/queryables`, `${base}/ogcapi-features-3/1.0/conf/queryables-query-parameters`);
-  if (publications.some(([, publication]) => postgisSource(config, publication.source))) {
-    features.push(`${base}/cql2/1.0/conf/basic-cql2`, `${base}/cql2/1.0/conf/cql2-text`, `${base}/cql2/1.0/conf/cql2-json`);
+function martinOpenApi(url: string, publications: [string, Publication][], catalog: Record<string, { content_type: string }>): FeaturesOpenApi {
+  const paths: NonNullable<FeaturesOpenApi['paths']> = {
+    '/': { get: { responses: { '200': { description: 'Tile service links' } } } },
+    '/catalog': { get: { responses: { '200': { description: 'Available tile sources' } } } },
+    '/openapi': { get: { responses: { '200': { description: 'OpenAPI definition' } } } },
+    '/conformance': { get: { responses: { '200': { description: 'Supported tile interfaces' } } } },
+  };
+  for (const [id, publication] of publications) {
+    paths[`/${id}`] = { get: { summary: publication.title, tags: [id], responses: { '200': {
+      description: 'TileJSON', content: { 'application/json': { schema: { type: 'object' } } },
+    } } } };
+    paths[`/${id}/{z}/{x}/{y}`] = { get: { tags: [id],
+      parameters: ['z', 'x', 'y'].map((name) => ({ name, in: 'path', required: true, schema: { type: 'integer', minimum: 0 } })),
+      responses: { '200': { description: 'XYZ tile', content: {
+        [catalog[id]!.content_type]: { schema: { type: 'string', format: 'binary' } },
+      } }, '204': { description: 'No tile data' } },
+    } };
+    if (publication.maplibre) {
+      paths[`/${id}/style.json`] = { get: { tags: [id], responses: { '200': { description: 'MapLibre style' } } } };
+    }
   }
-  return features;
+  return { openapi: '3.0.2', servers: [{ url }], info: { title: 'GIS Platform MVT', version: '1' },
+    paths, tags: publications.map(([name]) => ({ name })), components: {} };
+}
+
+function protocolOpenApi(api: FeaturesOpenApi, url: string, protocol: Publication['protocol'], ids: Set<string>) {
+  const paths = Object.fromEntries(Object.entries(api.paths ?? {}).filter(([path]) => {
+    if (path.startsWith('/TileMatrixSets')) return protocol === 'tiles';
+    const id = /^\/collections\/([^/]+)/.exec(path)?.[1];
+    return !id || ids.has(id);
+  }));
+  const components = structuredClone(api.components);
+  const resourceId = components?.parameters?.resourceId?.schema;
+  const id = ids.values().next().value;
+  if (resourceId && id) resourceId.default = id;
+  else if (resourceId) delete resourceId.default;
+  return { ...api, servers: [{ url }], paths, components,
+    info: { version: api.info?.version ?? '1', title: `GIS Platform ${apiNames[protocol]}`,
+      description: `OGC API ${apiNames[protocol]} collections`, termsOfService: url,
+      contact: { name: 'GIS Platform', url }, license: { name: 'Data license unspecified', url } },
+    tags: api.tags?.filter(({ name }) => name === 'server' || ids.has(name)),
+  };
 }
 
 async function nativeProviderDirectory(directory: string, service = 'pygeoapi') {
@@ -1402,11 +1474,12 @@ interface FeaturesOperation {
 }
 
 function dataPath(id: string, protocol: Publication['protocol']) {
+  if (protocol === 'mvt') return `/${id}/{z}/{x}/{y}`;
   if (protocol === 'dggs') return `/collections/${id}${dggsDataRoute}`;
   return `/collections/${id}/${protocol === 'maps' ? 'map' : protocol === 'tiles' ? 'tiles' : 'items'}`;
 }
 
-function dggsOpenApi(body: string, publicUrl: string, publications: [string, Publication][]) {
+function dggsOpenApi(body: string, root: string, publicUrl: string, publications: [string, Publication][]) {
   const native = JSON.parse(body) as FeaturesOpenApi;
   const paths: NonNullable<FeaturesOpenApi['paths']> = {};
   const queryParameters = dggsZoneParameters.map(({ name, required, description, schema }) =>
@@ -1416,7 +1489,7 @@ function dggsOpenApi(body: string, publicUrl: string, publications: [string, Pub
       `${dggsDataRoute}/{zoneId}`, `${dggsDataRoute}/{zoneId}/data`]) {
       const path = `/collections/${id}${suffix}`;
       const template = suffix.replace('/dggs/h3', '/dggs/{dggrsId}');
-      const operation = native.paths?.[`${dggsRoot}/collections/{collectionId}${template}`]?.get;
+      const operation = native.paths?.[`${root}/collections/{collectionId}${template}`]?.get;
       if (!operation) throw new FeaturesPreflightError(`pydggsapi is missing operation '${path}'.`);
       paths[path] = { get: {
         ...operation,
@@ -1571,10 +1644,11 @@ export async function startFeaturesStack(revision: Revision, confirmed?: Revisio
         if (config.providers && access !== 'public') {
           const instance = config.providers[provider];
           const api = instance?.image ? instance.api : undefined;
-          const base = api?.base_path === '/' ? '' : api?.base_path ?? '';
+          const base = providerBasePath(config, provider);
           const nativeOrigin = `http://${serviceName(config, provider)}:${api?.port ?? 80}`;
           body = await internal(`${base}${mvt ? `/${id}` : `/collections/${id}${dggs ? '' : '?f=json'}`}`, 200, nativeOrigin,
-            '3', dggs ? [`Host: ${origin.host}`, `X-Forwarded-Proto: ${origin.protocol.slice(0, -1)}`] : []);
+            '3', dggs ? [`Host: ${origin.host}`, `X-Forwarded-Proto: ${origin.protocol.slice(0, -1)}`] :
+              instance?.type === 'pygeoapi' && api?.protocols ? [`X-GIS-Protocol: ${protocol}`] : []);
           tileJsonUrl = nativeOrigin + path;
         }
         if (body) {
@@ -1593,23 +1667,23 @@ export async function startFeaturesStack(revision: Revision, confirmed?: Revisio
           }
         }
       }
-      const roots = new Set(Object.keys(config.providers ?? {}).map((id) => providerRoot(config, id)));
-      if (!roots.size) roots.add('/features');
-      for (const root of roots) {
-        if (root === '/mvt') continue;
-        const visible = publicationEntries(config).filter(([, { access, provider }]) =>
-          access === 'public' && providerRoot(config, provider) === root);
-        const dggs = root === dggsRoot && Object.values(config.providers ?? {}).some((provider) => provider.type === 'pydggsapi');
+      for (const [root, route] of providerRoutes(config)) {
+        if (!hasProtocolMetadata(route)) continue;
+        const { protocol } = route;
+        const visible = publicationEntries(config).filter(([, publication]) =>
+          publication.access === 'public' && publicationRoot(config, publication) === root);
         const api = checkOpenApi(await internal(`${root}/openapi?f=json`, 200), new URL(root, origin).href, visible,
-          dggs ? '3.1.' : '3.0.');
+          protocol === 'dggs' ? '3.1.' : '3.0.');
         if (config.providers) {
           // Catalog entries include a bounded live source check.
-          const catalog = JSON.parse(await internal(`${root}/collections?f=json`, 200, undefined, '8')) as {
-            collections: { id: string }[];
+          const catalog = JSON.parse(await internal(`${root}/${protocol === 'mvt' ? 'catalog' : 'collections'}?f=json`, 200, undefined, '8')) as {
+            collections?: { id: string }[]; tiles?: Record<string, unknown>;
           };
-          for (const { id, access, protocol, provider } of collections) {
-            if (providerRoot(config, provider) === root &&
-                (catalog.collections.some((item) => item.id === id) !== (access === 'public') ||
+          const visibleIds = new Set(catalog.collections?.map(({ id }) => id) ?? Object.keys(catalog.tiles ?? {}));
+          for (const publication of collections) {
+            const { id, access, protocol } = publication;
+            if (publicationRoot(config, publication) === root &&
+                (visibleIds.has(id) !== (access === 'public') ||
                  Boolean(api.paths?.[dataPath(id, protocol)]) !== (access === 'public'))) {
               throw new Error('The candidate metadata does not match the publication access rules.');
             }

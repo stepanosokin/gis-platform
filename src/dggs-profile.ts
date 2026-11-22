@@ -60,8 +60,8 @@ fi
 exec uvicorn pydggsapi.api:app --host 0.0.0.0 --port "$1" --forwarded-allow-ips '*'
 `;
 
-export function dggsService(provider: ManagedProvider, directory: string) {
-  const { port, public_root: root, readiness } = provider.api;
+export function dggsService(provider: ManagedProvider, root: string, directory: string) {
+  const { port, readiness } = provider.api;
   return {
     image: pinnedImage(provider),
     platform: 'linux/amd64',

@@ -25,7 +25,7 @@ export function martinConfig(config: FeaturesConfig, id: string) {
   }));
   return {
     listen_addresses: `0.0.0.0:${provider.api.port}`,
-    base_path: providerRoot(config, id),
+    base_path: providerRoot(config, id, 'mvt'),
     ...(base !== '/' && { route_prefix: base }),
     cache: 'disable',
     cors: false,

@@ -6,12 +6,12 @@ import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { auth, register, signIn } from './access-client.mjs';
 import { measureGateway } from './acceptance-probe.mjs';
+import { assertRasterPixels, rasterColors } from './maps-fixtures.mjs';
 
 const filename = process.env.GIS_TEST_CONFIG;
 const origin = process.env.GIS_TEST_PUBLIC_URL;
 const image = 'geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a';
 const mapPath = '/maps/collections/control/map';
-const rasterColors = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]];
 
 function yaml() {
   return `schema_version: 1
@@ -61,24 +61,6 @@ async function get(path, parameters, status = 200, headers = {}) {
   return response;
 }
 
-async function assertRasterPixels(response, width, height, colors) {
-  assert.equal(response.headers.get('content-type'), 'image/png');
-  const output = `map-${width}x${height}.png`;
-  writeFileSync(join(dirname(filename), output), Buffer.from(await response.arrayBuffer()));
-  const sample = spawnSync('docker', ['run', '--rm',
-    '--mount', `type=bind,src=${dirname(filename)},dst=/results,readonly`,
-    '--entrypoint', '/venv/bin/python', image, '-c', `
-import json
-from osgeo import gdal
-image = gdal.Open('/results/${output}')
-points = [(x, y) for y in (2, image.RasterYSize - 3) for x in (2, image.RasterXSize - 3)]
-print(json.dumps([image.RasterXSize, image.RasterYSize, [list(image.ReadRaster(x, y, 1, 1)) for x, y in points]]))
-`], { encoding: 'utf8' });
-  assert.ifError(sample.error);
-  assert.equal(sample.status, 0, sample.stderr);
-  assert.deepEqual(JSON.parse(sample.stdout), [width, height, colors]);
-}
-
 test('public raster is advertised and renders the requested area and pixel dimensions', async () => {
   const plan = apply(yaml());
   assert.equal(plan.newUrl, `${origin}/maps/collections/control`);
@@ -105,7 +87,7 @@ test('public raster is advertised and renders the requested area and pixel dimen
     assert.equal(response.headers.get('cache-control'), 'no-store');
     assert.deepEqual(response.headers.get('content-bbox').split(',').map(Number), bbox.split(',').map(Number));
     assert.equal(response.headers.get('content-crs'), 'http://www.opengis.net/def/crs/OGC/1.3/CRS84');
-    await assertRasterPixels(response, width, height, colors);
+    await assertRasterPixels(response, width, height, colors, dirname(filename), image);
   }
 });
 
@@ -213,7 +195,7 @@ auth:
   const cookie = await signIn(email, password);
   assert.deepEqual(await catalog({ Cookie: cookie }), ['control', 'registered-map']);
   const registeredMap = await get(registeredPath + '/map', query, 200, { Cookie: cookie });
-  await assertRasterPixels(registeredMap, 128, 64, rasterColors);
+  await assertRasterPixels(registeredMap, 128, 64, rasterColors, dirname(filename), image);
   await get(privatePath + '/map', query, 403, { Cookie: cookie });
 
   const grant = cli('access', 'grant', 'private-map', '--email', email);

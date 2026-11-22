@@ -236,6 +236,8 @@ tar -xf test_results/maplibre-6.19.0/maplibre-gl-6.19.0.tgz -C test_results/mapl
 
 `npm test -- --tiles` поднимает отдельные экземпляры pygeoapi, Martin и временный PostGIS. Тесты проходят от коллекции до тайла, проверяют границы WebMercatorQuad, актуальные права, CORS и ответ при сбое PostGIS. С теми же переменными Chrome и MapLibre GL JS браузер открывает TileJSON закрытой публикации и проверяет отрисованную точку. Результат сохраняется в `ogc-tiles-browser.json`.
 
+Для [#34](https://github.com/stepanosokin/gis-platform/issues/34) выбран полный уровень. `npm test -- --providers 'explicit provider prefixes|provider validation'` проверяет схему YAML, второй экземпляр и миграцию с общего корня. `npm test -- --tiles 'one pygeoapi'` проверяет через Caddy один контейнер pygeoapi с Features, Maps и Tiles, вложенные Martin и DGGS, метаданные и ссылки, сохранение прав при миграции и откате. Проверка MapLibre сохраняет результат в `nested-tiles-browser.json`.
+
 ## QGIS Desktop
 
 В открытом QGIS тест подключается анонимно через окно WFS / OGC API – Features, затем обновляет аутентификацию в том же окне. Два сценария проверяют cookie веб-сеанса и именованный Bearer-токен. Закрытая публикация должна появиться без перезапуска QGIS. Провайдер OGC API – Features должен прочитать три объекта.
