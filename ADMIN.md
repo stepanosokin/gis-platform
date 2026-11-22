@@ -84,7 +84,7 @@ Compose-проект объединяет контейнеры одного ра
 
 В Windows включите интеграцию Docker Desktop с пользовательским дистрибутивом WSL 2. В PowerShell команда `wsl --list --verbose` показывает дистрибутивы и версию WSL. Откройте выбранный дистрибутив и разместите рабочую копию в его файловой системе, например `~/gis-platform`. Установите Node.js и запускайте npm и команды из руководства в Bash этого же дистрибутива.
 
-Проверку выполните в каталоге репозитория. На сервере далее используется `/srv/gis/app`. Для локальной пробы подставьте каталог своей рабочей копии.
+Проверку выполните в каталоге репозитория. На сервере далее используется `/opt/gis-platform`. Для локальной пробы подставьте каталог своей рабочей копии.
 
 ```sh
 node --version
@@ -98,7 +98,7 @@ curl --version
 
 | Где | Что хранится |
 | --- | --- |
-| `/srv/gis/app` | Код выбранной версии, файлы Compose, примеры и собранный `dist/cli.js`. |
+| `/opt/gis-platform` | Код выбранной версии, файлы Compose, примеры и собранный `dist/cli.js`. |
 | `/srv/gis/platform.yaml` | Редактируемая конфигурация развёртывания. |
 | `/srv/gis/data` и `/srv/gis/secrets` | Указанные в YAML файлы данных, сертификаты, ключи и файлы паролей. |
 | `GIS_STATE_DIR`, например `/srv/gis/state` | Служебное состояние CLI, планы, подтверждённые версии, нативные конфиги, OpenAPI и архивы TLS. По умолчанию это `.gis-platform/` под корнем установки. |
@@ -193,10 +193,10 @@ curl -fsS "$public_url/features/collections/places/items?f=json&limit=1"
 
 ### Развёртывание на сервере
 
-1. Получите каталог `/srv/gis` с правом записи для владельца развёртывания. Поместите согласованную версию кода в `/srv/gis/app`. Ниже подготовка новой установки на примере GeoJSON. Для существующей установки оставьте действующий YAML и данные на месте.
+1. Получите каталог `/srv/gis` с правом записи для владельца развёртывания. Поместите согласованную версию кода в `/opt/gis-platform`. Ниже подготовка новой установки на примере GeoJSON. Для существующей установки оставьте действующий YAML и данные на месте.
 
 ```sh
-cd /srv/gis/app
+cd /opt/gis-platform
 git rev-parse HEAD
 npm ci
 npm run build
@@ -212,7 +212,7 @@ cp -n examples/places.geojson /srv/gis/data/places.geojson
 3. До применения проверьте DNS, порт и межсетевой экран. Если клиенты обращаются к Caddy напрямую, выполните `unset GIS_PUBLIC_BIND` и ограничьте внешний доступ правилами межсетевого экрана. Для проверки только с хоста или работы через прокси на том же хосте задайте `GIS_PUBLIC_BIND=127.0.0.1`. Используйте выбранную привязку уже при первом применении. CLI проверяет Caddy через `127.0.0.1`, поэтому одного внешнего интерфейса для проверки недостаточно.
 
 ```sh
-cd /srv/gis/app
+cd /opt/gis-platform
 export COMPOSE_PROJECT_NAME=gis-platform
 export GIS_STATE_DIR=/srv/gis/state
 platform=/srv/gis/platform.yaml
@@ -848,7 +848,7 @@ export RESTIC_PASSWORD_FILE=/etc/gis-operator/restic-password
 3. Инициализируйте **новый** репозиторий один раз. Затем вручную выполните первое копирование и проверьте результат.
 
 ```sh
-cd /srv/gis/app
+cd /opt/gis-platform
 . /etc/gis-operator/backup.env
 restic init
 node dist/cli.js backup create daily /srv/gis/platform.yaml --json
@@ -861,7 +861,7 @@ restic check
 4. Настройте ежедневное задание для владельца развёртывания. Например, добавьте в его `crontab -e` строку ниже. Укажите время обслуживания и добавьте пути к установленным `node` и `restic` в окружение cron, если их нет в системном `PATH`. Настройте доставку ошибок и запись полного ID снимка.
 
 ```cron
-15 2 * * * /bin/bash -c 'cd /srv/gis/app && . /etc/gis-operator/backup.env && node dist/cli.js backup create daily /srv/gis/platform.yaml --json'
+15 2 * * * /bin/bash -c 'cd /opt/gis-platform && . /etc/gis-operator/backup.env && node dist/cli.js backup create daily /srv/gis/platform.yaml --json'
 ```
 
 Перед обновлением дополнительно запускайте `backup create pre-update`. Ждите подтверждения. Дождитесь завершения `config apply`, если применение уже выполняется. Сохраняйте файлы и секреты неизменными до завершения снимка. После аварийной остановки проверьте рабочие каталоги `.gis-backup-work-*` в `GIS_STATE_DIR` и журнал задачи. Обращайтесь с рабочими дампами как с секретными файлами. [Подготовка репозитория restic](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html)
