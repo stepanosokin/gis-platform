@@ -84,13 +84,18 @@ Compose-проект объединяет контейнеры одного ра
 
 В Windows включите интеграцию Docker Desktop с пользовательским дистрибутивом WSL 2. В PowerShell команда `wsl --list --verbose` показывает дистрибутивы и версию WSL. Откройте выбранный дистрибутив и разместите рабочую копию в его файловой системе, например `~/gis-platform`. Установите Node.js и запускайте npm и команды из руководства в Bash этого же дистрибутива.
 
-Проверку выполните в каталоге репозитория. На сервере далее используется `/opt/gis-platform`. Для локальной пробы подставьте каталог своей рабочей копии.
+Серверные примеры CLI и Compose выполняйте из `/opt/gis-platform`. Для локальной пробы используйте каталог своей рабочей копии.
 
 ```sh
+# Проверьте версию Node.js.
 node --version
+# Проверьте версию npm.
 npm --version
+# Убедитесь, что движок Docker отвечает, и выведите его версию.
 docker info --format '{{.ServerVersion}}'
+# Проверьте версию Docker Compose.
 docker compose version
+# Проверьте, что curl установлен и доступен.
 curl --version
 ```
 
@@ -99,12 +104,13 @@ curl --version
 | Где | Что хранится |
 | --- | --- |
 | `/opt/gis-platform` | Код выбранной версии, файлы Compose, примеры и собранный `dist/cli.js`. |
-| `/srv/gis/platform.yaml` | Редактируемая конфигурация развёртывания. |
-| `/srv/gis/data` и `/srv/gis/secrets` | Указанные в YAML файлы данных, сертификаты, ключи и файлы паролей. |
-| `GIS_STATE_DIR`, например `/srv/gis/state` | Служебное состояние CLI, планы, подтверждённые версии, нативные конфиги, OpenAPI и архивы TLS. По умолчанию это `.gis-platform/` под корнем установки. |
+| `/opt/gis-platform/platform.yaml` | Редактируемая конфигурация развёртывания. |
+| `/opt/gis-platform/data` и `/opt/gis-platform/secrets` | Указанные в YAML файлы данных, сертификаты, ключи и файлы паролей. |
+| `/opt/gis-platform/operator` | Клиентские ключи операторов и файлы доступа к репозиторию restic. |
+| `GIS_STATE_DIR`, например `/opt/gis-platform/state` | Служебное состояние CLI, планы, подтверждённые версии, нативные конфиги, OpenAPI и архивы TLS. По умолчанию это `.gis-platform/` под корнем установки. |
 | Именованные тома Compose | `accounts` хранит PostgreSQL платформы. `caddy_data` и `caddy_config` хранят данные Caddy. Отдельные экземпляры могут использовать свои тома. |
 
-`COMPOSE_PROJECT_NAME` определяет группу контейнеров, сеть и имена томов. Сохраняйте то же имя проекта и тот же каталог состояния при обычных операциях. Для эксперимента задавайте отличающиеся имя, каталог состояния и порты. Сохраняйте конфигурацию, данные и секреты вне каталога кода, чтобы можно было заменить версию приложения по прежнему пути.
+`COMPOSE_PROJECT_NAME` определяет группу контейнеров, сеть и имена томов. Сохраняйте то же имя проекта и тот же каталог состояния при обычных операциях. Для эксперимента задавайте отличающиеся имя, каталог состояния и порты. При обновлении кода сохраняйте `platform.yaml`, данные, секреты и состояние в `/opt/gis-platform` по прежним путям.
 
 ### Как Compose читает несколько файлов
 
@@ -122,6 +128,7 @@ curl --version
 Например, команда ниже показывает имена сервисов в модели с регистрацией и тестовой почтой. Контейнеры она не запускает.
 
 ```sh
+# Покажите, какие сервисы входят в объединённую конфигурацию Compose.
 docker compose -p gis-guide-demo -f compose.yaml -f compose.auth.yaml -f compose.mailpit.yaml config --services
 ```
 
@@ -129,7 +136,7 @@ docker compose -p gis-guide-demo -f compose.yaml -f compose.auth.yaml -f compose
 
 ### Файлы конфигурации YAML
 
-В справке запись `<platform.yaml>` или `<integration.yaml>` означает путь к файлу. Например, можно передать `/srv/gis/platform.yaml` или `examples/provider-features.yaml`. Угловые скобки служат обозначением места аргумента и в команду не входят. В примерах `"$platform"` — значение переменной Bash с путём к вашему полному YAML.
+В справке запись `<platform.yaml>` или `<integration.yaml>` означает путь к файлу. Например, можно передать `/opt/gis-platform/platform.yaml` или `examples/provider-features.yaml`. Угловые скобки служат обозначением места аргумента и в команду не входят. В примерах `"$platform"` — значение переменной Bash с путём к вашему полному YAML.
 
 **`platform.yaml`** описывает полное желаемое состояние развёртывания. `config validate` и `config plan` принимают этот файл. Если убрать действующую публикацию из полного YAML, `config plan` покажет её в списке удалений.
 
@@ -159,34 +166,53 @@ docker compose -p gis-guide-demo -f compose.yaml -f compose.auth.yaml -f compose
 1. Из корня репозитория соберите CLI и скопируйте пример в отдельный каталог. В примере источник `sample-places` указывает на `places.geojson` рядом с YAML. Экземпляр `file-features` обслуживает публичную публикацию `places`.
 
 ```sh
+# Установите зависимости из package-lock.json.
 npm ci
+# Соберите CLI в dist/.
 npm run build
+# Задайте отдельную папку для локальной пробы.
 demo_root="$PWD/test_results/gis-guide-demo"
+# Создайте папку пробы.
 mkdir -p "$demo_root"
+# Скопируйте пример YAML, если рабочий файл ещё отсутствует.
 cp -n examples/features.yaml "$demo_root/platform.yaml"
+# Скопируйте GeoJSON, если файл данных ещё отсутствует.
 cp -n examples/places.geojson "$demo_root/places.geojson"
+# Выберите отдельный Compose-проект для пробы.
 export COMPOSE_PROJECT_NAME=gis-guide-demo
+# Выделите пробе свой каталог состояния.
 export GIS_STATE_DIR="$demo_root/state"
+# Откройте шлюз только на loopback.
 export GIS_PUBLIC_BIND=127.0.0.1
+# Сохраните путь к рабочему YAML для следующих команд.
 platform="$demo_root/platform.yaml"
+# Сохраните адрес локального шлюза для запросов.
 public_url=http://localhost:8080
 ```
 
 2. Убедитесь, что порт 8080 свободен. Если он занят, измените `server.port` в `$platform` и укажите тот же порт в `public_url`. Проверьте YAML и создайте план.
 
 ```sh
+# Проверьте YAML.
 node dist/cli.js config validate "$platform"
+# Подготовьте план и посмотрите, что он изменит.
 node dist/cli.js config plan "$platform"
 ```
 
 3. `validate` проверяет настройки. `plan` показывает изменения относительно действующей версии и возвращает ID плана. Для новой пробы ожидается добавление `places`, удаляемых публикаций нет. Проверьте внешний адрес и вставьте в следующую команду ID из вывода. `apply` проверяет источники и конфиги, запускает сервисы, проверяет маршруты и подтверждает новую версию.
 
 ```sh
+# Введите ID плана после проверки его изменений.
 read -r -p 'ID плана: ' plan_id
+# Примените выбранный план.
 node dist/cli.js config apply "$plan_id"
+# Узнайте активную версию.
 node dist/cli.js status
+# Проверьте готовность тестовой публикации.
 node dist/cli.js doctor --publication places
+# Получите каталог коллекций через шлюз.
 curl -fsS "$public_url/features/collections?f=json"
+# Убедитесь, что из коллекции places возвращается объект.
 curl -fsS "$public_url/features/collections/places/items?f=json&limit=1"
 ```
 
@@ -194,41 +220,71 @@ curl -fsS "$public_url/features/collections/places/items?f=json&limit=1"
 
 ### Развёртывание на сервере
 
-1. Получите каталог `/srv/gis` с правом записи для владельца развёртывания. Поместите согласованную версию кода в `/opt/gis-platform`. Ниже подготовка новой установки на примере GeoJSON. Для существующей установки оставьте действующий YAML и данные на месте.
+1. Поместите выбранную версию кода в `/opt/gis-platform` и дайте владельцу развёртывания право записи в этот каталог. Пример использует GeoJSON. При обновлении используйте действующий YAML и данные.
 
 ```sh
+# Перейдите в каталог установки.
 cd /opt/gis-platform
+# Запишите точный коммит устанавливаемой версии.
 git rev-parse HEAD
+# Установите зависимости из package-lock.json.
 npm ci
+# Соберите CLI в dist/.
 npm run build
-install -d -m 750 /srv/gis/data
-install -d -m 700 /srv/gis/secrets /srv/gis/state
-cp -n examples/features.yaml /srv/gis/platform.yaml
-cp -n examples/places.geojson /srv/gis/data/places.geojson
+# Создайте каталог файловых источников.
+install -d -m 750 /opt/gis-platform/data
+# Создайте закрытые каталоги для секретов, состояния и файлов оператора.
+install -d -m 700 /opt/gis-platform/secrets /opt/gis-platform/state /opt/gis-platform/operator
+# Скопируйте стартовый YAML, если рабочий файл ещё отсутствует.
+cp -n examples/features.yaml /opt/gis-platform/platform.yaml
+# Скопируйте тестовый источник, если файл данных ещё отсутствует.
+cp -n examples/places.geojson /opt/gis-platform/data/places.geojson
 ```
 
-В `/srv/gis/platform.yaml` замените `sources.sample-places.path` на `data/places.geojson`. Подставьте рабочий источник, когда будете готовы. Относительный путь считается от `/srv/gis`, где лежит YAML.
+В `/opt/gis-platform/platform.yaml` замените `sources.sample-places.path` на `data/places.geojson`. Подставьте рабочий источник, когда будете готовы. Относительный путь считается от `/opt/gis-platform`, где лежит YAML.
 
 2. Задайте внешний адрес и TLS. Для штатного HTTPS на 443 уберите `server.port: 8080` из скопированного примера. Если используете другой порт, добавьте его к `public_url` в командах проверки. При публикации с регистрацией подготовьте SMTP и секреты по [инструкции управления доступом](#учётные-записи-и-доступ). Проверьте доступ к реестрам образов, SMTP и внешнему PostGIS из сети Docker, если они используются.
-3. До применения проверьте DNS, порт и межсетевой экран. Если клиенты обращаются к Caddy напрямую, выполните `unset GIS_PUBLIC_BIND` и ограничьте внешний доступ правилами межсетевого экрана. Для проверки только с хоста или работы через прокси на том же хосте задайте `GIS_PUBLIC_BIND=127.0.0.1`. Используйте выбранную привязку уже при первом применении. CLI проверяет Caddy через `127.0.0.1`, поэтому одного внешнего интерфейса для проверки недостаточно.
+3. До применения проверьте DNS и порт. Если клиенты обращаются к Caddy напрямую, ограничьте входящие соединения правилами межсетевого экрана. Выберите одну настройку привязки уже для первого применения. CLI проверяет Caddy через `127.0.0.1`, поэтому одного внешнего интерфейса для проверки недостаточно.
 
 ```sh
+# Используйте привязку портов Caddy по умолчанию в Docker.
+unset GIS_PUBLIC_BIND
+```
+
+```sh
+# Ограничьте доступ к Caddy локальным хостом для пробы или прокси на том же сервере.
+export GIS_PUBLIC_BIND=127.0.0.1
+```
+
+```sh
+# Перейдите в каталог установки.
 cd /opt/gis-platform
+# Выберите постоянное имя Compose-проекта.
 export COMPOSE_PROJECT_NAME=gis-platform
-export GIS_STATE_DIR=/srv/gis/state
-platform=/srv/gis/platform.yaml
+# Укажите каталог планов и активной версии.
+export GIS_STATE_DIR=/opt/gis-platform/state
+# Сохраните путь к рабочему YAML.
+platform=/opt/gis-platform/platform.yaml
+# Замените пример адреса на внешний адрес своего шлюза.
 public_url=https://gis.example.org
+# Проверьте рабочий YAML.
 node dist/cli.js config validate "$platform"
+# Подготовьте план для сервера и проверьте изменения.
 node dist/cli.js config plan "$platform"
+# Введите ID проверенного плана.
 read -r -p 'ID плана: ' plan_id
+# Примените план и запустите сервисы.
 node dist/cli.js config apply "$plan_id"
+# Проверьте, какая версия подтверждена.
 node dist/cli.js status --json
+# Проверьте готовность шлюза, экземпляров и источников.
 node dist/cli.js doctor --json
 ```
 
 4. Проверьте внешний URL из плана через Caddy с серверной и клиентской сети. Для защищённых публикаций проверьте ответы анонимного и разрешённого клиента. Ожидайте `ready` в `doctor` и данные публикации в ответе на запрос.
 
 ```sh
+# Запросите один объект через внешний адрес шлюза.
 curl -fsS "$public_url/features/collections/places/items?f=json&limit=1"
 ```
 
@@ -252,8 +308,9 @@ server:
 Для проверки ещё не открытого наружу HTTPS замените значения в примере именем и портом из YAML. `--resolve` направляет запрос на loopback и сохраняет правильное имя хоста в TLS.
 
 ```sh
+# Проверьте TLS и каталог Features через loopback с публичным именем сервера.
 curl -fsS --resolve 'gis.example.org:443:127.0.0.1' \
-  --cacert /srv/gis/secrets/tls/it-root.pem \
+  --cacert /opt/gis-platform/secrets/tls/it-root.pem \
   'https://gis.example.org/features/collections?f=json'
 ```
 
@@ -264,9 +321,13 @@ curl -fsS --resolve 'gis.example.org:443:127.0.0.1' \
 Начните с имени проекта. Команды ниже обращаются к тому движку Docker, который выбран в текущем Docker context. Проверьте имя контекста, если работаете с несколькими хостами.
 
 ```sh
+# Проверьте, к какому движку подключён Docker CLI.
 docker context show
+# Найдите работающие и остановленные Compose-проекты.
 docker compose ls --all
+# Выберите проект для диагностики.
 export COMPOSE_PROJECT_NAME=gis-platform
+# Покажите контейнеры выбранного проекта, их состояние и порты.
 docker ps -a \
   --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" \
   --filter 'label=com.docker.compose.oneoff=False' \
@@ -276,8 +337,13 @@ docker ps -a \
 `docker compose ls --all` помогает найти проект. Колонка `CONFIG FILES` может включать файлы нескольких ревизий. Для работающего Caddy точный каталог смонтированного конфига можно посмотреть в поле `Mounts`. Подставьте имя контейнера из предыдущей команды.
 
 ```sh
+# Покажите, откуда Caddy получает файлы конфигурации.
 docker inspect --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' gis-platform-caddy-1
+# Укажите каталог состояния серверной установки.
+export GIS_STATE_DIR=/opt/gis-platform/state
+# Узнайте текущую подтверждённую версию.
 node dist/cli.js status --json
+# Проверьте готовность шлюза и публикаций.
 node dist/cli.js doctor --json
 ```
 
@@ -307,15 +373,25 @@ node dist/cli.js doctor --json
 В PowerShell с Docker Desktop выполните `docker compose ls --all` и найдите `gis-platform-alpha`. Проверьте монтирование Caddy и настройки запущенных сервисов. В этом репозитории конфигурация и состояние стенда находятся под `test_results/gis-platform-alpha/`. Путь к активному YAML определите по последней применённой версии и файлу оператора. Сохраняйте источник, секреты, каталог состояния, порты и тома.
 
 ```powershell
+# Найдите абсолютный путь каталога alpha-стенда.
 $alphaRoot = (Resolve-Path 'test_results/gis-platform-alpha').Path
+# Выберите Compose-проект alpha-стенда.
 $env:COMPOSE_PROJECT_NAME = 'gis-platform-alpha'
+# Укажите каталог состояния этого проекта.
 $env:GIS_STATE_DIR = Join-Path $alphaRoot 'state'
+# Ограничьте доступ к шлюзу локальным хостом.
 $env:GIS_PUBLIC_BIND = '127.0.0.1'
+# Введите путь к редактируемому YAML.
 $platform = Read-Host 'Путь к полному YAML alpha-стенда'
+# Проверьте YAML.
 node dist/cli.js config validate $platform
+# Постройте план для alpha-стенда.
 node dist/cli.js config plan $platform
+# Введите ID после проверки адресов и удалений в плане.
 $planId = Read-Host 'ID проверенного плана'
+# Примените проверенный план.
 node dist/cli.js config apply $planId
+# Проверьте готовность публикаций после обновления.
 node dist/cli.js doctor --json
 ```
 
@@ -330,7 +406,7 @@ node dist/cli.js doctor --json
 | `geojson` | GeoJSON `FeatureCollection` с хотя бы одним объектом и уникальными строковыми ID. | Features через pygeoapi |
 | `geopackage`, `shapefile` | Векторный файл, имя слоя `layer` и поле ID `id_field`. | Features через pygeoapi |
 | `geoparquet` | Один векторный файл Parquet с метаданными GeoParquet и полем `id_field`. | Features через pygeoapi |
-| `postgis` | Таблица или представление, поле ID и поле геометрии. Подключение задаётся на экземпляре. | Features, MVT, OGC API — Tiles |
+| `postgis` | Таблица или представление, поле ID, поле геометрии и `connection` с ID подключения из `postgis_connections`. | Features, MVT, OGC API — Tiles |
 | `geotiff`, `cog` | Геопривязанный растр `.tif` или `.tiff` и код его системы координат. | Maps через pygeoapi |
 | `mbtiles`, `pmtiles` | Локальный архив растровых тайлов или MVT в Web Mercator. Тип тайлов определяется по каталогу Martin. | Прямые веб-тайлы через Martin |
 | `parquet` | Снимок H3 с одной строкой для каждой ячейки и числовыми показателями. | DGGS через pydggsapi |
@@ -379,13 +455,13 @@ sources:
 
 ### Обновить файловый источник
 
-Подготовьте снимок или архив под новым именем и поменяйте `sources.<id>.path`. Сохраните прежний файл и связанные части набора по прежним путям, пока нужен откат. Выполните `validate → plan → apply`, затем проверьте новый ответ по прежнему URL. Сохранение ID публикации поддерживается для новой версии того же источника и протокола. Перенос на другое отношение или подключение PostGIS считается сменой источника для ID публикации.
+Подготовьте снимок или архив под новым именем и поменяйте `sources.<id>.path`. Сохраните прежний файл и связанные части набора по прежним путям, пока нужен откат. Выполните `validate → plan → apply`, затем проверьте новый ответ по прежнему URL. Сохранение ID публикации поддерживается для новой версии того же источника и протокола. При смене хоста, порта, имени базы, схемы или отношения PostGIS задайте новый ID публикации.
 
 ## Управление сервис-провайдерами
 
 | Адаптер | Когда использовать |
 | --- | --- |
-| `pygeoapi` | Features, Maps и внешнее API Tiles. Для Tiles нужен отдельный Martin для тайлов. |
+| `pygeoapi` | Features, Maps и публичное OGC API — Tiles. Тайлы для этого API формирует Martin. |
 | `martin` | Векторные тайлы из PostGIS, прямые тайлы из MBTiles/PMTiles и формирование тайлов для Tiles. |
 | `pydggsapi` | Доступ к снимку H3 Parquet через DGGS. |
 
@@ -408,6 +484,7 @@ sources:
 Для отдельного добавления подготовьте [файл интеграции](examples/provider-features.yaml). Пример ниже использует собранный CLI и переменную `platform`, указывающую на полную конфигурацию. Сначала примените черновые изменения в полном YAML или подготовьте копию из действующей версии. Для нового экземпляра выберите свободный ID.
 
 ```sh
+# Добавьте управляемый экземпляр pygeoapi из образа и файла интеграции.
 node dist/cli.js provider add pygeoapi-archive geopython/pygeoapi:0.24.0 \
   examples/provider-features.yaml "$platform"
 ```
@@ -424,8 +501,11 @@ node dist/cli.js provider add pygeoapi-archive geopython/pygeoapi:0.24.0 \
 ### Обновить или удалить экземпляр
 
 ```sh
+# Повторно проверьте текущую ссылку на образ и обновите закреплённый digest.
 node dist/cli.js provider update pygeoapi-archive "$platform"
+# Обновите экземпляр с явной ссылкой на образ.
 node dist/cli.js provider update pygeoapi-archive "$platform" geopython/pygeoapi:0.24.0
+# Удалите экземпляр, когда публикации перестанут на него ссылаться.
 node dist/cli.js provider remove pygeoapi-archive "$platform"
 ```
 
@@ -440,9 +520,13 @@ node dist/cli.js provider remove pygeoapi-archive "$platform"
 Для каждого нового рецепта сначала проверьте входные данные, затем выполните общий цикл.
 
 ```sh
+# Проверьте источники, экземпляры и публикации в YAML.
 node dist/cli.js config validate "$platform"
+# Постройте план и проверьте изменения публикаций и адресов.
 node dist/cli.js config plan "$platform"
+# Введите ID проверенного плана.
 read -r -p 'ID проверенного плана: ' plan_id
+# Примените план с изменениями публикаций.
 node dist/cli.js config apply "$plan_id"
 ```
 
@@ -455,9 +539,13 @@ node dist/cli.js config apply "$plan_id"
 3. Проверьте каталог, OpenAPI и чтение объектов. `limit` ограничивает число объектов, `bbox` задаёт окно в координатах CRS84.
 
 ```sh
+# Получите каталог коллекций Features.
 curl -fsS "$public_url/features/collections?f=json"
+# Получите описание интерфейса Features в OpenAPI.
 curl -fsS "$public_url/features/openapi?f=json"
+# Запросите один объект из коллекции places.
 curl -fsS "$public_url/features/collections/places/items?f=json&limit=1"
+# Отфильтруйте объекты по прямоугольнику bbox.
 curl -fsS "$public_url/features/collections/places/items?f=json&bbox=37,55,38,56"
 ```
 
@@ -510,7 +598,9 @@ publications:
 3. Примените полный YAML. Проверьте выдачу данных и, если нужно, временной фильтр. `datetime` принимает момент времени, интервал и открытые границы `..`.
 
 ```sh
+# Проверьте чтение одного объекта из PostGIS через шлюз.
 curl -fsS "$public_url/features/collections/observations/items?f=json&limit=1"
+# Запросите объекты начиная с указанного момента времени.
 curl -fsS --get "$public_url/features/collections/observations/items" \
   --data-urlencode 'f=json' \
   --data-urlencode 'datetime=2026-01-01T00:00:00Z/..'
@@ -525,7 +615,9 @@ curl -fsS --get "$public_url/features/collections/observations/items" \
 3. Запросите карту через Caddy. Меняйте `bbox`, `width` и `height` под свой участок.
 
 ```sh
+# Получите карту заданного охвата и размера и сохраните её в terrain.png.
 curl -fsS "$public_url/maps/collections/terrain/map?bbox=36,54,40,58&width=800&height=600&f=png" -o terrain.png
+# Получите описание интерфейса Maps в OpenAPI.
 curl -fsS "$public_url/maps/openapi?f=json"
 ```
 
@@ -538,6 +630,7 @@ curl -fsS "$public_url/maps/openapi?f=json"
 3. Примените план и запросите TileJSON. Ссылки указывают на тайлы XYZ в Web Mercator через Caddy.
 
 ```sh
+# Получите TileJSON векторной публикации через шлюз.
 curl -fsS "$public_url/mvt/observations"
 ```
 
@@ -586,7 +679,12 @@ const map = new maplibregl.Map({
 ### Готовые растровые веб-тайлы через Martin
 
 1. Подготовьте MBTiles или PMTiles с готовыми тайлами Web Mercator. В [примере YAML](examples/raster-tiles.yaml) поменяйте пути и охват. Для архивов можно использовать экземпляр Martin, который уже обслуживает публикации из PostGIS.
-2. В полном YAML `protocol: mvt` выбирает прямые маршруты Martin и для растрового архива. В клиенте тип источника и слоя будет `raster`. Примените план и проверьте `curl -fsS "$public_url/mvt/aerial"`. TileJSON должен содержать шаблон URL шлюза `/mvt/aerial/{z}/{x}/{y}`.
+2. В полном YAML `protocol: mvt` выбирает прямые маршруты Martin и для растрового архива. В клиенте тип источника и слоя будет `raster`. Примените план. В TileJSON проверьте шаблон URL шлюза `/mvt/aerial/{z}/{x}/{y}`.
+
+```sh
+# Получите TileJSON растрового архива через шлюз.
+curl -fsS "$public_url/mvt/aerial"
+```
 3. В MapLibre задайте `{type: 'raster', url: 'https://gis.example.org/mvt/aerial', tileSize: 256}` и подставьте реальный размер тайла архива. Проверьте, что клиент получил сами тайлы и отобразил слой.
 
 ### Векторные тайлы через OGC API — Tiles
@@ -595,7 +693,9 @@ const map = new maplibregl.Map({
 2. Примените конфигурацию и откройте коллекцию. Перейдите по ссылкам к списку наборов, набору WebMercatorQuad и определению матрицы. В шаблоне URL тайла подставьте номер матрицы, строки и столбца.
 
 ```sh
+# Получите метаданные коллекции Tiles и ссылки на наборы тайлов.
 curl -fsS "$public_url/tiles/collections/observations?f=json"
+# Получите описание интерфейса Tiles в OpenAPI.
 curl -fsS "$public_url/tiles/openapi?f=json"
 ```
 
@@ -608,6 +708,7 @@ curl -fsS "$public_url/tiles/openapi?f=json"
 Если в БД хранится `cell` типа `h3index` и доступны расширения H3, DBA может адаптировать следующий запрос. Он разрезает границу ячейки по 180° и приводит все геометрии к `MultiPolygon` с SRID 4326.
 
 ```sql
+-- Создайте представление наблюдений с геометрией ячеек H3.
 CREATE VIEW h3_data.published_observations AS
 SELECT observation_id::text AS feature_id,
        cell::text AS h3_id,
@@ -617,7 +718,9 @@ SELECT observation_id::text AS feature_id,
        ST_Multi(h3_cell_to_boundary_geometry(cell))::geometry(MultiPolygon, 4326) AS geom
 FROM h3_data.observations;
 
+-- Разрешите роли публикации обращаться к схеме.
 GRANT USAGE ON SCHEMA h3_data TO h3_reader;
+-- Разрешите этой роли читать представление.
 GRANT SELECT ON h3_data.published_observations TO h3_reader;
 ```
 
@@ -630,12 +733,18 @@ GRANT SELECT ON h3_data.published_observations TO h3_reader;
 3. Примените конфигурацию. Проверьте каталог, затем получите зоны и показатели. Для запросов к зонам укажите `Accept: */*`. Выберите реальный ID ячейки из свойства `zoneId` в ответе GeoJSON.
 
 ```sh
+# Получите каталог коллекций DGGS.
 curl -fsS "$public_url/dggs/collections"
+# Сохраните адрес зон H3 для выбранной коллекции.
 zones="$public_url/dggs/collections/h3-measurements/dggs/h3/zones"
+# Запросите границы ячеек уровня 7 в указанном прямоугольнике.
 curl -fsS -H 'Accept: */*' \
   "$zones?bbox=12.28,45.41,12.36,45.47&zone-level=7&compact-zones=false&f=geojson&geometry=zone-region"
+# Введите ID ячейки из ответа.
 read -r -p 'ID ячейки H3: ' h3_id
+# Получите описание выбранной ячейки.
 curl -fsS -H 'Accept: */*' "$zones/$h3_id"
+# Получите данные ячейки без дочерних зон.
 curl -fsS -H 'Accept: */*' "$zones/$h3_id/data?zone-depth=0"
 ```
 
@@ -661,15 +770,21 @@ Swagger доступен на `/dggs/docs`, OpenAPI — на `/dggs/openapi`. О
 
 ### Включить регистрацию и почту
 
-1. Создайте два независимых файла секретов для нового развёртывания. Пример ниже предполагает, что YAML расположен в `/srv/gis`. Сохраните существующие секреты при обновлениях.
+1. Создайте два независимых файла секретов для нового развёртывания. Пример ниже предполагает, что YAML расположен в `/opt/gis-platform`. Сохраните существующие секреты при обновлениях.
 
 ```sh
-install -d -m 700 /srv/gis/secrets
+# Создайте каталог с доступом только для владельца.
+install -d -m 700 /opt/gis-platform/secrets
+# Выполните генерацию секретов в отдельной оболочке с закрытыми правами.
 (
+  # Ограничьте доступ к новым файлам владельцем.
   umask 077
+  # Защитите существующие файлы от перезаписи через >.
   set -C
-  openssl rand -hex 32 > /srv/gis/secrets/auth-secret
-  openssl rand -hex 32 > /srv/gis/secrets/postgres-password
+  # Сгенерируйте секрет компонента доступа.
+  openssl rand -hex 32 > /opt/gis-platform/secrets/auth-secret
+  # Сгенерируйте отдельный пароль PostgreSQL платформы.
+  openssl rand -hex 32 > /opt/gis-platform/secrets/postgres-password
 )
 ```
 
@@ -730,11 +845,17 @@ auth:
 После применения API слушает на `127.0.0.1:8444`. Для вызова от имени оператора укажите **клиентскую** пару и УЦ. Пути ниже замените выданными оператору.
 
 ```sh
+# Укажите порт локального административного API.
 export GIS_ADMIN_PORT=8444
-export GIS_ADMIN_CA_FILE=/srv/gis/secrets/pki/cli-ca.pem
-export GIS_ADMIN_CERT_FILE=/etc/gis-operator/operator.pem
-export GIS_ADMIN_KEY_FILE=/etc/gis-operator/operator-key.pem
+# Укажите УЦ для проверки сертификата API.
+export GIS_ADMIN_CA_FILE=/opt/gis-platform/secrets/pki/cli-ca.pem
+# Укажите клиентский сертификат оператора.
+export GIS_ADMIN_CERT_FILE=/opt/gis-platform/operator/operator.pem
+# Укажите закрытый ключ клиентского сертификата.
+export GIS_ADMIN_KEY_FILE=/opt/gis-platform/operator/operator-key.pem
+# Проверьте подключение и разрешение diagnostics.
 node dist/cli.js status --json
+# Проверьте разрешение users-read и получите список учётных записей.
 node dist/cli.js users list --json
 ```
 
@@ -745,8 +866,11 @@ node dist/cli.js users list --json
 Для примера замените `places-private` ID своей закрытой публикации и укажите email зарегистрированного пользователя.
 
 ```sh
+# Найдите учётную запись и проверьте её статус перед выдачей доступа.
 node dist/cli.js users list --json
+# Выдайте персональное разрешение на публикацию places-private.
 node dist/cli.js access grant places-private --email reader@example.org
+# Убедитесь, что публикация появилась в списке доступа пользователя.
 node dist/cli.js users list --json
 ```
 
@@ -757,10 +881,15 @@ node dist/cli.js users list --json
 В следующем блоке выберите нужную операцию. `--user-id` можно использовать вместо `--email`. Указанные ID пользователя и токена получите из вывода соответствующих команд list.
 
 ```sh
+# Отзовите персональное разрешение на places-private.
 node dist/cli.js access revoke places-private --email reader@example.org
+# Заблокируйте учётную запись.
 node dist/cli.js users block --email reader@example.org
+# Разблокируйте учётную запись, чтобы снова разрешить вход.
 node dist/cli.js users unblock --email reader@example.org
+# Найдите ID персонального токена пользователя.
 node dist/cli.js tokens list --email reader@example.org --json
+# Отзовите выбранный токен по ID.
 node dist/cli.js tokens revoke token-17 --email reader@example.org
 ```
 
@@ -789,7 +918,7 @@ node dist/cli.js tokens revoke token-17 --email reader@example.org
 
 ### Обновить версию платформы
 
-1. Подготовьте отдельную копию кода выбранной версии и проверьте требования этой версии. Из её каталога выполните `npm ci`, `npm run build` и `git rev-parse HEAD`. Оставьте прежнюю копию кода и сделанную перед обновлением резервную копию. Убедитесь, что исходные пути данных, секретов и редактируемого YAML по-прежнему доступны.
+1. Подготовьте новую версию кода и проверьте её требования. Сохраните прежнюю копию кода и резервную копию. Разместите файлы новой версии в `/opt/gis-platform`. Установите зависимости командой `npm ci` и соберите CLI командой `npm run build`. Сохраняйте рабочий YAML, данные, секреты и состояние по прежним путям.
 2. Укажите прежнее имя проекта и каталог состояния. Внесите необходимые изменения формата в рабочую копию YAML в том же каталоге. Запустите в новой версии CLI `config validate` и `config plan`. Проверьте план и примените его. Если CLI переключает версию, он подготавливает конфиги и запускает нужные сервисы из выбранной версии кода.
 3. При `NO_CHANGE` CLI принял ту же конфигурацию без пересборки. Если изменился только CLI, используйте новый `dist/cli.js`. Чтобы запустить обновлённый стек через CLI, внесите уместное изменение в YAML, например уточните описание действующей публикации. Снова постройте план. Проверьте, что URL, права и списки удалений совпадают с ожидаемыми, и примените план из новой версии кода. Для совместимого обновления одного контейнера `access` можно использовать рецепт ниже. Для выпуска со специальным порядком развёртывания следуйте инструкции этого выпуска.
 4. Проверьте `status`, `doctor`, публичные запросы, вход и закрытую публикацию с контрольным пользователем. Сохраните номер релиза, коммит и ID применённой конфигурации.
@@ -797,19 +926,30 @@ node dist/cli.js tokens revoke token-17 --email reader@example.org
 Пример пересборки только `access` на хосте, где PostgreSQL уже работает. Выполните в каталоге новой версии проекта. Подставьте ID **действующей** подтверждённой версии из `status --json`, а пути к секретам возьмите из применённого YAML. Дополнения `compose.smtp.json` и `compose.admin.json` берутся из этой же версии.
 
 ```sh
+# Введите ID версии, которую показывает status.
 read -r -p 'Действующая версия config из status: ' current_version
+# Укажите каталог с подготовленными файлами действующей версии.
 export GIS_REVISION_DIR="$GIS_STATE_DIR/plans/$current_version"
-export GIS_AUTH_SECRET_FILE=/srv/gis/secrets/auth-secret
-export GIS_POSTGRES_PASSWORD_FILE=/srv/gis/secrets/postgres-password
+# Подключите действующий секрет компонента доступа.
+export GIS_AUTH_SECRET_FILE=/opt/gis-platform/secrets/auth-secret
+# Подключите действующий пароль PostgreSQL платформы.
+export GIS_POSTGRES_PASSWORD_FILE=/opt/gis-platform/secrets/postgres-password
+# Начните с базового Compose-файла и дополнения для доступа.
 access_files=(-f compose.yaml -f compose.auth.yaml)
+# Проверьте, использует ли активная версия SMTP.
 if [ -f "$GIS_REVISION_DIR/compose.smtp.json" ]; then
+  # Добавьте действующую конфигурацию SMTP.
   access_files+=(-f "$GIS_REVISION_DIR/compose.smtp.json")
 fi
+# Проверьте, включён ли административный API.
 if [ -f "$GIS_REVISION_DIR/compose.admin.json" ]; then
+  # Добавьте действующую конфигурацию административного API.
   access_files+=(-f "$GIS_REVISION_DIR/compose.admin.json")
 fi
+# Пересоберите и перезапустите только access, затем дождитесь его готовности.
 docker compose -p "$COMPOSE_PROJECT_NAME" "${access_files[@]}" \
   up -d --no-deps --build --wait --wait-timeout 65 access
+# Проверьте шлюз и публикации после пересборки.
 node dist/cli.js doctor --json
 ```
 
@@ -820,11 +960,17 @@ node dist/cli.js doctor --json
 Скопируйте подходящий ID подтверждённой конфигурации, например `previousVersion` из `status --json`. Убедитесь, что связанные источники по прежним путям существуют и пригодны для чтения. Для PostGIS проверьте прежнее подключение, а для старых версий TLS — комплект по сохранённым путям.
 
 ```sh
+# Найдите текущую и предыдущую подтверждённые версии.
 node dist/cli.js status --json
+# Введите ID версии, к которой нужно вернуться.
 read -r -p 'ID версии для отката: ' previous_version
+# Подготовьте план отката и проверьте его изменения.
 node dist/cli.js config plan --rollback-to "$previous_version"
+# Введите ID проверенного плана отката.
 read -r -p 'ID проверенного плана отката: ' rollback_plan
+# Примените план отката.
 node dist/cli.js config apply "$rollback_plan"
+# Проверьте доступность публикаций после отката.
 node dist/cli.js doctor --json
 ```
 
@@ -847,25 +993,37 @@ node dist/cli.js doctor --json
 ### Настроить репозиторий и ежедневное копирование
 
 1. Установите restic версии 0.20 или новее. Подготовьте отдельный репозиторий rest-server по HTTPS на другом хосте и доступ с учётной записью этого развёртывания. Храните пароль restic отдельно от резервируемых файлов и репозитория.
-2. Подготовьте закрытый файл окружения, например `/etc/gis-operator/backup.env`. При необходимости укажите закрытые значения `RESTIC_REST_USERNAME` и `RESTIC_REST_PASSWORD` в этом файле. Используйте URL без встроенных учётных данных. Для частного УЦ укажите `RESTIC_CACERT`.
+2. Подготовьте закрытый файл окружения, например `/opt/gis-platform/operator/backup.env`. При необходимости укажите закрытые значения `RESTIC_REST_USERNAME` и `RESTIC_REST_PASSWORD` в этом файле. Используйте URL без встроенных учётных данных. Для частного УЦ укажите `RESTIC_CACERT`.
 
 ```sh
+# Выберите Compose-проект, для которого создаются снимки.
 export COMPOSE_PROJECT_NAME=gis-platform
-export GIS_STATE_DIR=/srv/gis/state
+# Укажите каталог состояния этого проекта.
+export GIS_STATE_DIR=/opt/gis-platform/state
+# Укажите URL отдельного репозитория restic.
 export RESTIC_REPOSITORY=rest:https://backup.example.org/gis-platform/
-export RESTIC_PASSWORD_FILE=/etc/gis-operator/restic-password
-# export RESTIC_CACERT=/etc/gis-operator/backup-ca.pem
+# Укажите файл с паролем репозитория вне входов резервного копирования.
+export RESTIC_PASSWORD_FILE=/opt/gis-platform/operator/restic-password
+# Раскомментируйте строку, если сертификат репозитория подписан частным УЦ.
+# export RESTIC_CACERT=/opt/gis-platform/operator/backup-ca.pem
+# Раскомментируйте и задайте срок хранения, если нужно изменить срок по умолчанию.
 # export GIS_BACKUP_RETENTION_DAYS=30
 ```
 
 3. Инициализируйте **новый** репозиторий один раз. Затем вручную выполните первое копирование и проверьте результат.
 
 ```sh
+# Перейдите в каталог установки.
 cd /opt/gis-platform
-. /etc/gis-operator/backup.env
+# Загрузите параметры проекта и доступ к репозиторию.
+. /opt/gis-platform/operator/backup.env
+# Инициализируйте новый репозиторий restic один раз.
 restic init
-node dist/cli.js backup create daily /srv/gis/platform.yaml --json
+# Создайте ежедневный снимок и получите его ID в JSON.
+node dist/cli.js backup create daily /opt/gis-platform/platform.yaml --json
+# Найдите созданный снимок по тегу проекта.
 restic snapshots --tag "gis-platform-$COMPOSE_PROJECT_NAME"
+# Проверьте целостность репозитория.
 restic check
 ```
 
@@ -874,13 +1032,15 @@ restic check
 4. Настройте ежедневное задание для владельца развёртывания. Например, добавьте в его `crontab -e` строку ниже. Укажите время обслуживания и добавьте пути к установленным `node` и `restic` в окружение cron, если их нет в системном `PATH`. Настройте доставку ошибок и запись полного ID снимка.
 
 ```cron
-15 2 * * * /bin/bash -c 'cd /opt/gis-platform && . /etc/gis-operator/backup.env && node dist/cli.js backup create daily /srv/gis/platform.yaml --json'
+# В 02:15 ежедневно перейдите в каталог установки, загрузите окружение и создайте снимок.
+15 2 * * * /bin/bash -c 'cd /opt/gis-platform && . /opt/gis-platform/operator/backup.env && node dist/cli.js backup create daily /opt/gis-platform/platform.yaml --json'
 ```
 
 Перед обновлением дополнительно запускайте `backup create pre-update`. Ждите подтверждения. Дождитесь завершения `config apply`, если применение уже выполняется. Сохраняйте файлы и секреты неизменными до завершения снимка. После аварийной остановки проверьте рабочие каталоги `.gis-backup-work-*` в `GIS_STATE_DIR` и журнал задачи. Обращайтесь с рабочими дампами как с секретными файлами. [Подготовка репозитория restic](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html)
 
 ```sh
-node dist/cli.js backup create pre-update /srv/gis/platform.yaml --json
+# Сделайте отдельную резервную копию перед обновлением.
+node dist/cli.js backup create pre-update /opt/gis-platform/platform.yaml --json
 ```
 
 ### Сверка доступа
@@ -894,59 +1054,82 @@ node dist/cli.js backup create pre-update /srv/gis/platform.yaml --json
 Если исходный сервер ещё доступен, объявите окно на переключение, прекратите операции с учётными записями и правами и остановите компонент доступа. Оставьте PostgreSQL работающим. Подставьте имя контейнера `access`, найденное по метке проекта.
 
 ```sh
+# Остановите компонент доступа, чтобы прекратить изменения учётных записей и прав.
 docker stop gis-platform-access-1
-node dist/cli.js backup create pre-update /srv/gis/platform.yaml --json
+# Сохраните снимок с последним состоянием прав перед переключением.
+node dist/cli.js backup create pre-update /opt/gis-platform/platform.yaml --json
 ```
 
 Запишите полный ID свежего снимка. Сверьте с журналом выдачу и отзыв разрешений, блокировки и разблокировки, отзыв токенов и завершение сеансов. При пробном восстановлении выбирайте снимки и подтверждайте состояние доступа по тестовым сценариям, чтобы не останавливать исходный сервер.
 
 ### Пробное восстановление и запуск
 
-1. Подготовьте отдельную машину или изолированную виртуальную машину с соответствующей версией кода и собранным CLI. На ней должны быть свободны прежние порты и исходные абсолютные пути для восстанавливаемых файлов. В примере разместите код под `/opt/gis-platform-restore`, чтобы `/srv/gis` оставался свободен для данных из копии. Выполняйте команды из каталога кода. Подключите закрытый файл окружения restic и настройте контролируемый доступ к внешнему PostGIS и SMTP.
+1. На отдельной машине или изолированной виртуальной машине разместите ту же версию кода в `/opt/gis-platform` и соберите CLI. Освободите прежние порты и пути для восстановленных файлов. Выполняйте команды из `/opt/gis-platform`. Подключите файл окружения restic и настройте контролируемый доступ к внешнему PostGIS и SMTP.
 2. Извлеките базовый снимок и, при необходимости, снимок с актуальным дампом в разные новые каталоги. Подставьте полный ID из `restic snapshots`. Команда проверяет файлы и отмечает состояние шлюза закрытым.
 
 ```sh
+# Ограничьте доступ к новым файлам владельцем.
 umask 077
-install -d -m 700 /srv/gis-restore
+# Создайте закрытую папку для распаковки снимков.
+install -d -m 700 /opt/gis-platform/restore
+# Введите полный ID снимка с нужной конфигурацией.
 read -r -p 'Полный ID базового снимка: ' snapshot_id
-node dist/cli.js backup extract "$snapshot_id" /srv/gis-restore/baseline --json
+# Извлеките и проверьте базовый снимок в новом каталоге baseline.
+node dist/cli.js backup extract "$snapshot_id" /opt/gis-platform/restore/baseline --json
 ```
 
 Если нужен отдельный снимок с актуальным дампом, извлеките его отдельно.
 
 ```sh
+# Введите полный ID снимка с актуальными правами.
 read -r -p 'Полный ID снимка с актуальными правами: ' authority_id
-node dist/cli.js backup extract "$authority_id" /srv/gis-restore/authority --json
+# Извлеките этот снимок в отдельный новый каталог authority.
+node dist/cli.js backup extract "$authority_id" /opt/gis-platform/restore/authority --json
 ```
 
 Из первого результата выпишите `data.directory` и `data.originalStateDirectory`, из выбранного снимка с дампом — `data.payload`. `data.payload` — абсолютный путь к служебному комплекту, передаваемому в `backup recover`.
 
-3. Восстановите служебный каталог из `data.directory` по пути `data.originalStateDirectory`. Верните остальные файлы базового снимка на их исходные пути, включая данные и секреты. Сохраните режимы доступа и владельцев. Пример копирования ниже применим, если восстановленные данные под `baseline/srv/gis/` включают всё необходимое, а `/srv/gis` ещё отсутствует на выделенной машине. Код приложения можно держать в отдельном каталоге, чтобы не мешать восстановлению путей.
+3. Восстановите служебный каталог из `data.directory` по пути `data.originalStateDirectory`. Следующий пример применим, если исходный путь состояния — `/opt/gis-platform/state`.
 
 ```sh
-test ! -e /srv/gis && cp -a /srv/gis-restore/baseline/srv/gis /srv/gis
+# Введите путь data.directory, который вернула команда извлечения базового снимка.
+read -r -p 'Извлечённый каталог состояния: ' extracted_state
+# Проверьте, что на месте исходного каталога состояния нет файла, каталога или ссылки.
+if [ ! -e /opt/gis-platform/state ] && [ ! -L /opt/gis-platform/state ]; then
+  # Скопируйте состояние с сохранением владельцев и прав.
+  cp -a -- "$extracted_state" /opt/gis-platform/state
+else
+  # Сообщите, что копирование пропущено из-за занятого пути.
+  printf '%s\n' 'Каталог /opt/gis-platform/state уже занят. Проверьте его содержимое.' >&2
+fi
 ```
 
-Продолжайте после успешного копирования. Если `/srv/gis` уже существует, проверьте его содержимое и восстановите файлы на исходные пути только в выделенном окружении.
+Если исходный путь занят, проверьте его содержимое перед восстановлением. Верните `platform.yaml`, данные и секреты из `/opt/gis-platform/restore/baseline/opt/gis-platform/` по их исходным путям, сохраняя владельцев и права. Если снимок содержит файлы из других каталогов, восстановите и их по исходным путям. Продолжайте после восстановления состояния и нужных файлов.
 
 4. Выберите новое имя проекта с префиксом `gis-restore-`. Оно должно быть свободно, без прежних контейнеров и томов. Укажите исходный абсолютный путь каталога состояния и loopback.
 
 ```sh
+# Выберите свободное имя проекта для восстановления.
 export COMPOSE_PROJECT_NAME=gis-restore-pilot
-export GIS_STATE_DIR=/srv/gis/state
+# Укажите исходный абсолютный путь восстановленного состояния.
+export GIS_STATE_DIR=/opt/gis-platform/state
+# Оставьте шлюз на loopback до завершения проверки.
 export GIS_PUBLIC_BIND=127.0.0.1
+# Введите путь data.payload выбранного снимка с дампом.
 read -r -p 'Абсолютный путь data.payload: ' payload
 ```
 
 Запустите **одну** команду `recover`. Для проверенного свежего дампа выполните:
 
 ```sh
+# Восстановите доступ из снимка, который учитывает последние изменения прав.
 node dist/cli.js backup recover "$payload" --verified-authority --json
 ```
 
 Для базового дампа при подтверждённом отсутствии изменений выполните:
 
 ```sh
+# Восстановите базовый дамп, если подтверждено отсутствие изменений прав.
 node dist/cli.js backup recover "$payload" --verified-no-changes --json
 ```
 
@@ -955,7 +1138,9 @@ CLI поднимает PostgreSQL с новым томом, восстанавл
 5. Проверьте текущую и предыдущую версии, чтение публичной публикации и отказ без соответствующих прав. Проверьте разрешённые контрольные учётные записи и отказ заблокированной записи, отозванному разрешению, отозванному токену и завершённому сеансу. Для локальной проверки HTTPS используйте `curl --resolve` с публичным именем и доверенным УЦ, как в [разделе HTTPS](#внешний-http-и-https).
 
 ```sh
+# Сверьте восстановленную версию и доступную версию для отката.
 node dist/cli.js status --json
+# Проверьте готовность шлюза и публикаций на loopback.
 node dist/cli.js doctor --json
 ```
 
@@ -964,11 +1149,17 @@ node dist/cli.js doctor --json
 6. Для возврата рабочего сервиса повторите проверенный порядок на выделенной машине. Сначала проверьте доступ на loopback. Затем подключите внешний прокси либо поменяйте привязку Caddy и направьте DNS на восстановленный хост. Сохраните имя восстановленного проекта. Пример для штатного HTTPS использует ID из результата восстановления и архив TLS.
 
 ```sh
+# Введите ID активной версии после восстановления.
 read -r -p 'ID подтверждённой версии после восстановления: ' current_version
+# Укажите подготовленный каталог активной версии.
 export GIS_REVISION_DIR="$GIS_STATE_DIR/plans/$current_version"
+# Укажите внешний и внутренний порт HTTPS и порт перенаправления с HTTP.
 export GIS_PUBLIC_PORT=443 GIS_CADDY_PORT=443 GIS_HTTP_REDIRECT_PORT=80
+# Укажите сертификат из архива TLS активной версии.
 export GIS_TLS_CERT_FILE="$GIS_STATE_DIR/tls/$current_version/cert.pem"
+# Укажите соответствующий закрытый ключ из архива TLS.
 export GIS_TLS_KEY_FILE="$GIS_STATE_DIR/tls/$current_version/key.pem"
+# Пересоздайте только Caddy с HTTPS и доступом извне.
 GIS_PUBLIC_BIND= docker compose -p "$COMPOSE_PROJECT_NAME" \
   -f compose.yaml -f compose.tls.yaml up -d --no-deps caddy
 ```
@@ -982,11 +1173,17 @@ GIS_PUBLIC_BIND= docker compose -p "$COMPOSE_PROJECT_NAME" \
 Начните с точного URL, кода ответа и названия проекта. Проверяйте по очереди шлюз, компонент доступа, экземпляр и источник.
 
 ```sh
+# Убедитесь, что движок Docker доступен, и выведите его версию.
 docker info --format '{{.ServerVersion}}'
+# Найдите рабочий Compose-проект.
 docker compose ls --all
+# Посмотрите активную версию и состояние применения.
 node dist/cli.js status --json
+# Проверьте состояние шлюза и всех публикаций.
 node dist/cli.js doctor --json
+# Проверьте состояние конкретной публикации places.
 node dist/cli.js doctor --publication places --json
+# Посмотрите статус и заголовки ответа шлюза без тела ответа.
 curl -sS -D - -o /dev/null "$public_url/features/collections/places?f=json"
 ```
 
@@ -1007,17 +1204,18 @@ curl -sS -D - -o /dev/null "$public_url/features/collections/places?f=json"
 Запишите `X-Request-Id` из ответа клиента. По нему можно связать HTTP-код в журнале Caddy и событие `publication.request` в журнале `access`. Изменения прав пишутся как `access.change`. Для просмотра на хосте используйте имена контейнеров нужного проекта.
 
 ```sh
+# Посмотрите журнал шлюза за последние 10 минут.
 docker logs --since 10m gis-platform-caddy-1
+# Посмотрите журнал компонента доступа за последние 10 минут.
 docker logs --since 10m gis-platform-access-1
 ```
 
 ### Если применение прервалось
 
 1. Выполните `status --json`. `currentVersion` — действующая подтверждённая версия, `previousVersion` — предыдущая, `pendingPlanId` — незавершённый план, `closedRoutes` — закрытые маршруты. Сохраните вывод `config apply` и журналы.
-2. Если CLI сообщил `APPLY_IN_PROGRESS`, дождитесь работающего процесса. При `PLAN_STALE` постройте новый план по текущей версии.
+2. Если CLI сообщил `APPLY_IN_PROGRESS`, дождитесь работающего процесса. ОС освобождает блокировку после его завершения, в том числе принудительного. При `PLAN_STALE` постройте новый план по текущей версии.
 3. Если связь оборвалась, проверьте состояние и повторите `config apply` с тем же ID. CLI вернёт сохранённый результат завершённой операции либо продолжит обработку состояния. Если файл изменился после планирования, подготовьте новый план.
 4. При `APPLY_FAILED` выясните причину по сообщению CLI и проверьте прежнюю публикацию. При `RECOVERY_INCOMPLETE` затронутые маршруты остаются закрытыми. Исправьте доступность источника, PostgreSQL или Compose и повторите применение по указанному ID. Состояние и PostgreSQL нужны для корректного восстановления.
-5. Если после принудительного завершения остался `apply.lock`, сначала убедитесь на хосте, что процессы применения и Compose завершились. Только для оставшегося **пустого** каталога используйте `rmdir "$GIS_STATE_DIR/apply.lock"` и повторите `config apply`. Дальше CLI восстановит последнюю подтверждённую конфигурацию.
 
 ## Справочник команд
 
