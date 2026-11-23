@@ -3,7 +3,7 @@ import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService,
+import { builtInProviderId, configuredProviders, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService,
   postgisConnectionsForProvider, postgisSource, publicationEntries, publicationUrl, providerRoutes, providerServiceName,
   fileSource, serializeFeaturesConfig, usedFileSources, vectorFile, type FeaturesConfig, type Publication } from './config.js';
 import { pinProviderImages } from './provider-images.js';
@@ -14,6 +14,7 @@ import { CliError } from './cli-result.js';
 import { mapLibreFiles, mapLibreHashes, writeMapLibreFiles } from './maplibre-style.js';
 import { statusSnapshot, type ActiveState, type ApplyResult } from './configuration-state.js';
 import { archiveGatewayTls, gatewayTlsFiles, gatewayTlsFingerprint, GatewayTlsError } from './gateway-tls.js';
+import { checkedYaml, draftFile, draftYaml, readDraftText, textDigest, workingYaml } from './config-draft.js';
 
 interface Plan {
   planId: string;
@@ -27,7 +28,8 @@ interface Plan {
   vectorHashes?: Record<string, string | null>;
   maplibreHashes?: Record<string, string>;
   tlsFingerprint?: string | null;
-  edit?: { filename: string; before: string };
+  gatewayRevision?: number;
+  edit?: { filename: string; before: string; draftHash?: string };
 }
 
 const stateDirectory = resolve(process.env.GIS_STATE_DIR ??
@@ -35,6 +37,7 @@ const stateDirectory = resolve(process.env.GIS_STATE_DIR ??
 const legacyActiveFile = join(stateDirectory, 'active.json');
 const activeFile = join(stateDirectory, 'status', 'active.json');
 const planDirectory = (planId: string) => join(stateDirectory, 'plans', planId);
+const gatewayRevision = 1;
 
 function missing(error: unknown) {
   return error instanceof Error && 'code' in error && error.code === 'ENOENT';
@@ -193,9 +196,9 @@ function digest(value: string) {
 }
 
 function fingerprint({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, vectorHashes, edit, maplibreHashes,
-  tlsFingerprint }: Omit<Plan, 'planId'>) {
+  tlsFingerprint, gatewayRevision }: Omit<Plan, 'planId'>) {
   return `plan-${digest(JSON.stringify({ baseVersion, config, yaml, targetVersion, attempt, sourceHash, vectorHashes, edit,
-    maplibreHashes, tlsFingerprint }))}`;
+    maplibreHashes, tlsFingerprint, gatewayRevision }))}`;
 }
 
 async function tlsSource(config: FeaturesConfig, target: Plan | null) {
@@ -206,14 +209,14 @@ async function tlsSource(config: FeaturesConfig, target: Plan | null) {
 
 export async function createPlan(config: FeaturesConfig, yaml?: string,
   versions?: { targetVersion?: string; baseVersion: string | null }, editFile?: {
-    filename: string; original: string; originalConfig: FeaturesConfig;
+    filename: string; original: string; originalConfig?: FeaturesConfig; draftHash?: string;
   }) {
   let { baseVersion, targetVersion } = versions ?? {};
   if (baseVersion === undefined) baseVersion = (await readActive()).planId;
   const currentPlan = baseVersion ? await readPlan(baseVersion) : null;
   await checkPublicationIdentities(config, currentPlan);
   const current = currentPlan?.config ?? null;
-  if (current && editFile) {
+  if (current && editFile?.originalConfig) {
     const { providerServiceNames: _parsedNames, ...before } = editFile.originalConfig;
     const { providerServiceNames: _confirmedNames, ...confirmed } = current;
     for (const [id, provider] of Object.entries(before.providers ?? {})) {
@@ -230,7 +233,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   const fileHashes = config.vectorFiles || config.rasterFiles || config.tileArchives || config.dggsSources
     ? await fileFingerprints(config) : undefined;
   const changedFiles = await fileContentChanges(fileHashes, baseVersion);
-  const edit = editFile && { filename: editFile.filename, before: digest(editFile.original) };
+  const edit = editFile && { filename: editFile.filename, before: digest(editFile.original), draftHash: editFile.draftHash };
   const mapFiles = await mapLibreFiles(config, targetVersion && planDirectory(targetVersion)).catch((error: Error) => {
     throw new CliError('INVALID_CONFIG', 2, error.message);
   });
@@ -248,7 +251,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     throw new CliError('INVALID_CONFIG', 2, 'The archived DGGS snapshot no longer matches the selected version.');
   }
   const snapshot = { baseVersion, config, yaml, targetVersion, attempt: randomUUID(), sourceHash, vectorHashes: fileHashes, edit,
-    maplibreHashes, tlsFingerprint };
+    maplibreHashes, tlsFingerprint, gatewayRevision };
   const planId = fingerprint(snapshot);
   await writeMapLibreFiles(planDirectory(planId), mapFiles);
   await writeStateJson(join(planDirectory(planId), 'plan.json'), { ...snapshot, planId });
@@ -256,7 +259,8 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   const previousUrl = current ? firstPublicationUrl(current) : null;
   const newUrl = firstPublicationUrl(config);
   const changed = changedSource || changedFiles.size > 0 || JSON.stringify(current) !== JSON.stringify(config) ||
-    JSON.stringify(currentPlan?.maplibreHashes) !== JSON.stringify(maplibreHashes) || currentPlan?.tlsFingerprint !== tlsFingerprint;
+    JSON.stringify(currentPlan?.maplibreHashes) !== JSON.stringify(maplibreHashes) || currentPlan?.tlsFingerprint !== tlsFingerprint ||
+    currentPlan?.gatewayRevision !== gatewayRevision;
   const previous = new Map(current ? publicationEntries(current) : []);
   const next = new Map(publicationEntries(config));
   const fileChanged = changedSource || current?.sourcePath !== config.sourcePath;
@@ -312,6 +316,10 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     previousPublicUrl: current ? new URL(current.publicUrl).origin : null,
     publicUrl: new URL(config.publicUrl).origin,
     publications: outcomes,
+    postgisConnections: changesById(current?.postgisConnections, config.postgisConnections),
+    providers: changesById(current ? configuredProviders(current) : {}, configuredProviders(config)),
+    auth: { before: Boolean(current?.auth), after: Boolean(config.auth),
+      changed: JSON.stringify(current?.auth) !== JSON.stringify(config.auth) },
     routesToClose: changed ? affectedRoutes(config, current) : [],
     services: changed ? ['caddy', ...((builtIn || (current && builtInProviderId(current))) &&
       ((builtIn && dataChanged(builtIn)) || !currentPlan?.yaml ||
@@ -323,6 +331,23 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
       ...(current?.auth?.postgres_password_file !== config.auth?.postgres_password_file ? ['postgres'] : []),
       ...(mailPort(current) !== mailPort(config) ? ['mailpit'] : [])] : [],
   };
+}
+
+function changesById(before: Record<string, unknown> = {}, after: Record<string, unknown> = {}) {
+  return {
+    added: Object.keys(after).filter((id) => !Object.hasOwn(before, id)),
+    changed: Object.keys(after).filter((id) => Object.hasOwn(before, id) && JSON.stringify(before[id]) !== JSON.stringify(after[id])),
+    removed: Object.keys(before).filter((id) => !Object.hasOwn(after, id)),
+  };
+}
+
+export async function createDraftPlan(filename: string) {
+  const draft = await readDraftText(filename);
+  if (draft === undefined) throw new CliError('NOT_FOUND', 3, 'There is no draft for the working YAML.');
+  const original = await workingYaml(filename);
+  const { currentVersion: baseVersion } = await configurationStatus();
+  const yaml = draftYaml(draft, original, baseVersion);
+  return createPlan(checkedYaml(yaml, filename), yaml, { baseVersion }, { filename, original, draftHash: textDigest(draft) });
 }
 
 async function sourceContentChanged(sourceHash: string | null | undefined, baseVersion: string | null) {
@@ -343,7 +368,8 @@ function mailPort(config: FeaturesConfig | null) {
 }
 
 function revision(plan: Plan) {
-  return { config: plan.config, directory: planDirectory(plan.planId), tlsFingerprint: plan.tlsFingerprint };
+  return { config: plan.config, directory: planDirectory(plan.planId), tlsFingerprint: plan.tlsFingerprint,
+    gatewayRevision: plan.gatewayRevision };
 }
 
 function settled(state: ActiveState, planId: string, outcome: ApplyResult): ActiveState {
@@ -410,8 +436,15 @@ async function openConfirmedVersion(state: ActiveState, candidate: Plan) {
 }
 
 async function finishOpen(state: ActiveState, candidate: Plan) {
-  await persistProviderEdit(candidate);
   const { directory } = revision(candidate);
+  if (candidate.edit?.draftHash) {
+    await checkYamlEdit(candidate, 'resuming');
+    await openGateway(directory);
+    await persistYamlEdit(candidate);
+    await writeActive(settled(state, candidate.planId, { code: 'OK' })).catch(() => keepProviderOpenPending(state, candidate));
+    return;
+  }
+  await persistYamlEdit(candidate);
   try {
     await openGateway(directory);
     await writeActive(settled(state, candidate.planId, { code: 'OK' }));
@@ -430,7 +463,7 @@ async function keepProviderOpenPending(state: ActiveState, candidate: Plan) {
 async function resumeProviderOpen(state: ActiveState, candidate: Plan, previous: Plan | null) {
   const rev = revision(candidate);
   try {
-    await checkProviderEdit(candidate);
+    await checkYamlEdit(candidate, 'resuming');
     await closeGateway(rev.directory);
     await startFeaturesStack(rev, previous ? revision(previous) : undefined);
     await finishOpen(state, candidate);
@@ -445,7 +478,7 @@ async function resumeProviderOpen(state: ActiveState, candidate: Plan, previous:
   }
 }
 
-async function persistProviderEdit({ edit, yaml }: Plan) {
+async function persistYamlEdit({ edit, yaml }: Plan) {
   if (!edit || yaml === undefined) return;
   const original = await readFile(edit.filename, 'utf8');
   if (original === yaml) return;
@@ -459,11 +492,26 @@ async function persistProviderEdit({ edit, yaml }: Plan) {
   }
 }
 
-async function checkProviderEdit({ edit, yaml }: Plan) {
+async function checkYamlEdit({ edit, yaml }: Plan, phase: 'applying' | 'resuming' | 'no-change' = 'applying') {
   if (!edit) return;
   const original = await readFile(edit.filename, 'utf8').catch(() => null);
-  if (original === null || (digest(original) !== edit.before && original !== yaml)) {
+  const alreadyWritten = original === yaml && (!edit.draftHash || phase !== 'applying');
+  if (original === null || (digest(original) !== edit.before && !alreadyWritten)) {
     throw new CliError('PLAN_STALE', 5, 'The platform YAML changed after planning.');
+  }
+  if (edit.draftHash && !(phase === 'resuming' && alreadyWritten)) {
+    const draft = await readDraftText(edit.filename);
+    if (draft === undefined || textDigest(draft) !== edit.draftHash) {
+      throw new CliError('PLAN_STALE', 5, 'The draft changed after planning. Create a new plan.');
+    }
+  }
+}
+
+async function removeCommittedDraft({ edit }: Plan) {
+  if (!edit?.draftHash) return;
+  const draft = await readDraftText(edit.filename).catch(() => undefined);
+  if (draft !== undefined && textDigest(draft) === edit.draftHash) {
+    await rm(draftFile(edit.filename), { force: true }).catch(() => {});
   }
 }
 
@@ -495,6 +543,14 @@ async function finalizeRemoval(state: ActiveState, plan: Plan, current: Plan | n
   const runDatabase = (...args: string[]) => compose(database.config, database.directory, ...args);
   let deletionMayHaveRun = resume;
   try {
+    if (plan.edit?.draftHash && !resume) {
+      try {
+        await checkYamlEdit(plan);
+      } catch {
+        await restoreStack(state, plan, current, 'The working YAML or draft changed before publication removal.');
+        return;
+      }
+    }
     if (temporaryPostgres) await runDatabase('up', '-d', '--wait', 'postgres');
     deletionMayHaveRun = true;
     const committed = resume
@@ -510,7 +566,9 @@ async function finalizeRemoval(state: ActiveState, plan: Plan, current: Plan | n
       await closeGateway(candidate.directory);
       await startFeaturesStack(candidate, current ? revision(current) : undefined);
     }
+    if (plan.edit?.draftHash) await checkYamlEdit(plan, 'resuming');
     await openGateway(candidate.directory);
+    await persistYamlEdit(plan);
     await writeActive(settled({ ...state, planId: plan.planId, previousVersion: state.planId }, plan.planId, { code: 'OK' }));
   } catch {
     if (!deletionMayHaveRun) {
@@ -603,6 +661,10 @@ async function applicationLock(scope: string) {
   return lock;
 }
 
+export function lockDraft(filename: string) {
+  return applicationLock(`draft:${filename}`);
+}
+
 export const restoreMarker = join(stateDirectory, 'status', 'restore-required.json');
 
 export interface RestoreMarker {
@@ -654,6 +716,7 @@ async function lockConfiguration(directory: string) {
 
 export async function withConfirmedConfiguration<T>(run: (snapshot: {
   directory: string; project: string; current: Plan; previous: Plan | null; history: AsyncIterable<Plan>;
+  currentRevision: ReturnType<typeof revision>;
 }) => Promise<T>) {
   const directory = await realpath(stateDirectory);
   const lock = await lockConfiguration(directory);
@@ -663,7 +726,7 @@ export async function withConfirmedConfiguration<T>(run: (snapshot: {
       throw new CliError('RECOVERY_INCOMPLETE', 7, 'A settled, confirmed configuration is required. Check status.');
     }
     const current = await readPlan(state.planId);
-    return await run({ directory, project: lock.project, current,
+    return await run({ directory, project: lock.project, current, currentRevision: revision(current),
       previous: state.previousVersion ? await readPlan(state.previousVersion) : null, history: confirmedHistory(current) });
   } finally {
     lock.release();
@@ -681,7 +744,9 @@ function resultFor(state: ActiveState, plan: Plan) {
     planId: plan.planId, currentVersion: state.planId, url: firstPublicationUrl(plan.config),
   };
   if (plan.edit && state.phase === 'open' && state.pendingPlanId === plan.planId) {
-    throw new CliError('RECOVERY_INCOMPLETE', 7, 'The provider YAML was committed. Repeat the plan to reopen the gateway.',
+    throw new CliError('RECOVERY_INCOMPLETE', 7, plan.edit.draftHash ?
+      'The working YAML or gateway update is incomplete. Repeat the plan to finish applying the draft.' :
+      'The provider YAML was committed. Repeat the plan to reopen the gateway.',
       { ...data, closedRoutes: state.closedRoutes ?? [] });
   }
   const result = state.results?.[plan.planId] ?? { code: 'NO_CHANGE' };
@@ -695,15 +760,25 @@ function resultFor(state: ActiveState, plan: Plan) {
 export async function applyPlan(planId: string) {
   const plan = await readPlan(planId);
   const lock = await lockConfiguration(await realpath(stateDirectory));
+  const draftLocks = new Map<string, Awaited<ReturnType<typeof lockDraft>>>();
+  const lockPlanDraft = async ({ edit }: Plan) => {
+    if (edit?.draftHash && !draftLocks.has(edit.filename)) draftLocks.set(edit.filename, await lockDraft(edit.filename));
+  };
   try {
     if (await readRestoreMarker()) {
       throw new CliError('RECOVERY_INCOMPLETE', 7, 'Restore the verified current accounts database before applying configuration.');
     }
     await migrateActiveFile();
     let state = await readActive();
-    if (state.results?.[planId]) return resultFor(state, plan);
+    await lockPlanDraft(plan);
+    if (state.results?.[planId]) {
+      const result = resultFor(state, plan);
+      await removeCommittedDraft(plan);
+      return result;
+    }
     if (state.pendingPlanId) {
       const candidate = await readPlan(state.pendingPlanId);
+      await lockPlanDraft(candidate);
       const previousId = state.phase === 'open' ? state.previousVersion : state.planId;
       const previous = previousId ? await readPlan(previousId) : null;
       if (state.phase === 'finalize') {
@@ -723,6 +798,7 @@ export async function applyPlan(planId: string) {
         await restoreStack(state, candidate, previous, 'The interrupted application was rolled back.');
       }
       state = await readActive();
+      if (state.results?.[candidate.planId]?.code === 'OK') await removeCommittedDraft(candidate);
       if (state.results?.[planId]) return resultFor(state, plan);
       if (state.phase === 'recovery' || state.phase === 'open') return resultFor(state, candidate);
     }
@@ -733,13 +809,15 @@ export async function applyPlan(planId: string) {
         planId, baseVersion: plan.baseVersion, currentVersion: state.planId,
       });
     }
-    await checkProviderEdit(plan);
-    await checkPublicationIdentities(plan.config, current);
-    if (current && JSON.stringify(current.config) === JSON.stringify(plan.config) &&
+    const sameConfiguration = current && JSON.stringify(current.config) === JSON.stringify(plan.config) &&
+        current.gatewayRevision === plan.gatewayRevision &&
         current.tlsFingerprint === plan.tlsFingerprint &&
         JSON.stringify(current.maplibreHashes) === JSON.stringify(plan.maplibreHashes) &&
         !await sourceContentChanged(plan.sourceHash, current.planId) &&
-        !(await fileContentChanges(plan.vectorHashes, current.planId)).size) {
+        !(await fileContentChanges(plan.vectorHashes, current.planId)).size;
+    await checkYamlEdit(plan, sameConfiguration ? 'no-change' : 'applying');
+    await checkPublicationIdentities(plan.config, current);
+    if (sameConfiguration) {
       const sourceChangedAfterPlanning = hasGeoJson(plan.config) &&
         await sourceContentChanged(await sourceFingerprint(plan.config.sourcePath), current.planId);
       const plannedFileHashes = plan.vectorHashes;
@@ -753,20 +831,23 @@ export async function applyPlan(planId: string) {
       if (!sourceChangedAfterPlanning && !fileChangedAfterPlanning && !tlsChangedAfterPlanning && plan.config.providers &&
           !await featuresStackRunning(current.config, revision(current).directory)) {
         await activatePlan(state, plan, current);
-        return resultFor(await readActive(), plan);
+      } else {
+        const outcome = tlsChangedAfterPlanning
+          ? { code: 'APPLY_FAILED', message: 'TLS files changed after planning. Create a new plan.' } as const
+          : sourceChangedAfterPlanning || fileChangedAfterPlanning
+          ? { code: 'APPLY_FAILED', message: `The ${sourceChangedAfterPlanning ? 'GeoJSON' : 'file'} source changed after planning. Create a new plan.` } as const
+          : { code: 'NO_CHANGE' } as const;
+        if (outcome.code === 'NO_CHANGE') await persistYamlEdit(plan);
+        await writeActive(settled(state, planId, outcome));
       }
-      const outcome = tlsChangedAfterPlanning
-        ? { code: 'APPLY_FAILED', message: 'TLS files changed after planning. Create a new plan.' } as const
-        : sourceChangedAfterPlanning || fileChangedAfterPlanning
-        ? { code: 'APPLY_FAILED', message: `The ${sourceChangedAfterPlanning ? 'GeoJSON' : 'file'} source changed after planning. Create a new plan.` } as const
-        : { code: 'NO_CHANGE' } as const;
-      if (outcome.code === 'NO_CHANGE') await persistProviderEdit(plan);
-      await writeActive(settled(state, planId, outcome));
     } else {
       await activatePlan(state, plan, current);
     }
-    return resultFor(await readActive(), plan);
+    const result = resultFor(await readActive(), plan);
+    await removeCommittedDraft(plan);
+    return result;
   } finally {
+    for (const draftLock of draftLocks.values()) draftLock.close();
     lock.release();
   }
 }

@@ -125,6 +125,7 @@ openssl rand -hex 32 > .gis-platform/postgres-password
 
 ## Материалы
 
+- [Навыки Codex и OpenCode и команды черновика](ADMIN.md#навыки-и-черновик-конфигурации).
 - [Развёртывание на сервере в /opt/gis-platform](ADMIN.md#развёртывание-на-сервере).
 - [Правила работы и тестирования](AGENTS.md).
 - [Локальный запуск автотестов](tests/README.md).

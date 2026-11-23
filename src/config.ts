@@ -227,6 +227,11 @@ export function builtInProviderId(config: FeaturesConfig) {
     : config.publicationId === null ? config.providerId : config.publication.provider;
 }
 
+export function configuredProviders(config: FeaturesConfig): Record<string, Provider> {
+  const builtIn = builtInProviderId(config);
+  return config.providers ?? (builtIn ? { [builtIn]: { type: 'pygeoapi' } } : {});
+}
+
 const adapterProtocols: Record<ManagedProvider['type'], Publication['protocol'][]> = {
   pygeoapi: ['features', 'maps', 'tiles'], martin: ['mvt'], pydggsapi: ['dggs'],
 };
@@ -271,6 +276,10 @@ export function providerRoutes(config: FeaturesConfig) {
   }
   if (!routes.size) routes.set('/features', { protocol: 'features', ids: [], nested: false });
   return routes;
+}
+
+export function providerRouteOwner(route: { protocol: Publication['protocol']; ids: string[] }, firstPublication?: Publication) {
+  return route.protocol === 'tiles' ? firstPublication?.provider ?? route.ids[0] : route.ids[0];
 }
 
 export function hasProtocolMetadata({ protocol, nested }: { protocol: Publication['protocol']; nested: boolean }) {

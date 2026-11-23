@@ -1,8 +1,10 @@
 import { spawn } from 'node:child_process';
+import { realpath } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { publicationEntries, readFeaturesConfig } from './config.js';
-import { configurationDoctor, configurationStatus, createPlan, planRollback } from './plans.js';
+import { configurationDoctor, configurationStatus, createDraftPlan, createPlan, lockDraft, planRollback } from './plans.js';
+import { editDraft } from './config-draft.js';
 import type { ApplyReply } from './apply-worker.js';
 import { CliError } from './cli-result.js';
 import { runAdminCommand } from './admin-client.js';
@@ -10,6 +12,8 @@ import { parseAdminCommand } from './admin-command.js';
 import { planProviderCommand } from './provider-command.js';
 import { mapLibreFiles } from './maplibre-style.js';
 import { runBackupCommand } from './backup.js';
+import { providerInventory, publicationInventory, reportFilename, writeConfigurationDiagram } from './operator-inventory.js';
+import { writeUsersWorkbook, type ReportUser } from './users-workbook.js';
 
 const arguments_ = process.argv.slice(2);
 const json = arguments_.includes('--json');
@@ -22,6 +26,50 @@ function success(code: string, data: Record<string, unknown>, message: string) {
 }
 
 async function main() {
+  if (group === 'users' && command === 'list' && argument === '--xlsx') {
+    if (extra.length !== 1) throw new CliError('INVALID_INPUT', 2, 'Usage: users list [--xlsx <file.xlsx>] [--json]');
+    const file = reportFilename(extra[0]!, '.xlsx');
+    const { data: { users } } = await runAdminCommand(['users', 'list']);
+    const data = await writeUsersWorkbook(file, users as ReportUser[]);
+    success('OK', data, `Users exported to ${data.file} (${data.count})`);
+    return;
+  }
+  if (group === 'publications' || group === 'providers') {
+    if (command !== 'list' || argument) throw new CliError('INVALID_INPUT', 2, `Usage: ${group} list [--json]`);
+    if (group === 'publications') {
+      const data = await publicationInventory();
+      success('OK', data, data.publications.map(({ title, url, protocol, provider }) =>
+        [title.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' '), url, protocol, provider].join('\t')).join('\n') || 'No publications.');
+    } else {
+      const data = await providerInventory();
+      success('OK', data, data.providers.map(({ id, service, container, image, protocols }) =>
+        [id, container ?? `${service} (no container)`, image ?? 'unknown', protocols.join(', ')].join('\t')).join('\n') ||
+        'No provider instances.');
+    }
+    return;
+  }
+  if (group === 'config' && command === 'diagram') {
+    if (!argument || extra.length) throw new CliError('INVALID_INPUT', 2, 'Usage: config diagram <file.html> [--json]');
+    const data = await writeConfigurationDiagram(argument);
+    success('OK', data, `Configuration diagram: ${data.file}\nCurrent version: ${data.currentVersion}`);
+    return;
+  }
+  if (group === 'draft') {
+    const counts = new Map([['postgis', 2], ['provider', 3], ['publication', 2], ['access', 2], ['auth', 1], ['rebase', 1]]);
+    if (!command || !argument || counts.get(command) !== extra.length ||
+        (command !== 'auth' && command !== 'rebase' && !/^[a-z][a-z0-9-]{0,62}$/.test(extra[0]!))) {
+      throw new CliError('INVALID_INPUT', 2, 'Usage: draft (postgis|publication) <platform.yaml> <id> <settings.yaml> | ' +
+        'draft provider <platform.yaml> <id> <image> <integration.yaml> | draft access <platform.yaml> <id> <mode> | ' +
+        'draft (auth|rebase) <platform.yaml> <candidate.yaml>');
+    }
+    const updated = await withDraftLock(argument, async (filename) => {
+      const status = await configurationStatus();
+      if (status.pendingPlanId) throw new CliError('APPLY_IN_PROGRESS', 5, 'Finish the pending plan before editing the draft.');
+      return editDraft(command, filename, extra, status.currentVersion);
+    });
+    success('OK', updated, `Draft: ${updated.draftFile}`);
+    return;
+  }
   if (group === 'backup') {
     const data = await runBackupCommand(commandArguments.slice(1));
     success('OK', data, JSON.stringify(data, null, 2));
@@ -63,10 +111,12 @@ async function main() {
     return;
   }
   const rollback = group === 'config' && command === 'plan' && argument === '--rollback-to' && extra.length === 1 && !!extra[0];
-  if (group !== 'config' || !argument || (!rollback && (extra.length || argument === '--rollback-to')) ||
+  const draft = group === 'config' && command === 'plan' && argument === '--draft' && extra.length === 1 && !!extra[0];
+  if (group !== 'config' || !argument || (!rollback && !draft && (extra.length || argument.startsWith('--'))) ||
       (command !== 'validate' && command !== 'plan' && command !== 'apply')) {
     throw new CliError('INVALID_INPUT', 2,
-      'Usage: config validate <file> | config plan <file> | config plan --rollback-to <version> | config apply <plan-id> [--json]');
+      'Usage: config validate <file> | config plan <file> | config plan --draft <file> | ' +
+      'config plan --rollback-to <version> | config apply <plan-id> [--json]');
   }
 
   if (command === 'apply') {
@@ -76,7 +126,8 @@ async function main() {
     return;
   }
 
-  const plan = rollback ? await planRollback(extra[0]!) : await planFile(command, argument);
+  const plan = rollback ? await planRollback(extra[0]!) : draft ? await withDraftLock(extra[0]!, createDraftPlan) :
+    await planFile(command, argument);
   if (!plan) return;
   success('OK', plan, [
     plan.planId,
@@ -85,6 +136,10 @@ async function main() {
     `Added: ${plan.added.join(', ') || 'none'}`,
     `Changed: ${plan.changed.join(', ') || 'none'}`,
     `Removed: ${plan.removed.join(', ') || 'none'}`,
+    ...Object.entries({ 'PostGIS connections': plan.postgisConnections, 'Provider instances': plan.providers })
+      .flatMap(([name, diff]) => Object.entries(diff).filter(([, ids]) => ids.length)
+        .map(([change, ids]) => `${name} ${change}: ${ids.join(', ')}`)),
+    ...(plan.auth.changed ? [`Registration and sign-in: ${plan.auth.before ? 'on' : 'off'} → ${plan.auth.after ? 'on' : 'off'}`] : []),
     `Public URL: ${plan.previousPublicUrl ?? '(none)'} → ${plan.publicUrl}`,
     `URL: ${plan.previousUrl ?? '(none)'} → ${plan.newUrl ?? '(none)'}`,
     ...plan.publications.map(({ publicationId, previousUrl, newUrl, previousAccess, newAccess, personalGrants }) =>
@@ -92,6 +147,18 @@ async function main() {
     `Services: ${plan.services.join(', ') || 'none'}`,
     `Routes to close: ${plan.routesToClose.join(', ') || 'none'}`,
   ].join('\n'));
+}
+
+async function withDraftLock<T>(path: string, command: (filename: string) => Promise<T>) {
+  const filename = await realpath(resolve(path)).catch(() => {
+    throw new CliError('INVALID_CONFIG', 2, 'The working platform YAML was not found.');
+  });
+  const lock = await lockDraft(filename);
+  try {
+    return await command(filename);
+  } finally {
+    lock.close();
+  }
 }
 
 async function planFile(command: string, filename: string) {
@@ -122,8 +189,7 @@ async function applyPlan(planId: string) {
 
 function formatAdminResult({ code, data }: Pick<Awaited<ReturnType<typeof runAdminCommand>>, 'code' | 'data'>) {
   if (group === 'users' && command === 'list') {
-    const users = data.users as { email: string; name: string; registeredAt: string; status: string;
-      publications: { id: string; anonymous: boolean }[] }[];
+    const users = data.users as ReportUser[];
     return users.map((user) => {
       const publications = user.publications.map(({ id, anonymous }) => anonymous ? `${id} (anonymous)` : id);
       const displayName = user.name.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');

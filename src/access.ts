@@ -10,6 +10,7 @@ import type { NextFunction, Request, Response } from 'express';
 import nodemailer from 'nodemailer';
 import { Pool } from 'pg';
 import { mountAccountPages } from './account-pages.js';
+import { landingPage, landingPolicy, type Landing } from './platform-landing.js';
 import type { Publication } from './config.js';
 import { featuresError, mountFeaturesMetadata, readManagedMetadata } from './features-metadata.js';
 import { publicationAccess } from './publication-access.js';
@@ -29,6 +30,7 @@ interface Settings {
   publications: Record<string, Publication['access']>;
   administratorEmails?: string[];
   publicationTitles?: Record<string, string>;
+  landing?: Landing;
   operators?: Record<string, AdminPermission[]>;
   version?: string;
   managedFeatures?: boolean;
@@ -200,6 +202,12 @@ async function publicationReader(req: Request, res: Response, publication?: read
       userId: identified?.userId, tokenId: identified?.tokenId, status }));
   }
 }
+
+app.get('/', async (req, res) => {
+  if (!settings.landing) return res.sendStatus(404);
+  const reader = await publicationReader(req, res).then((identity) => identity.reader, () => null);
+  res.set('Content-Security-Policy', landingPolicy).type('html').send(landingPage(settings.landing, reader));
+});
 
 async function requireActiveSession(req: Request, res: Response, next: NextFunction) {
   const session = await readSession(req);

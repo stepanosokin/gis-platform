@@ -29,6 +29,18 @@ test('the applied public GeoJSON publication returns the expected feature throug
   assert.deepEqual(feature.geometry, { type: 'Point', coordinates: [37.62, 55.75] });
 });
 
+test('the applied public deployment has a home page with active links and no sign-in forms', async () => {
+  const response = await get('/');
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type'), /^text\/html/);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  const html = await response.text();
+  assert.ok(html.includes(`href="${canonical}/features/collections/places"`));
+  assert.ok(html.includes(`href="${canonical}/features?f=html"`));
+  assert.doesNotMatch(html, /\/account\/(login|register)/);
+  assert.equal((await get('/platform-landing.html')).status, 404);
+});
+
 test('the public catalog and OpenAPI 3.0 use the external Features URL', async () => {
   const landing = await getJson('/features?f=json');
   const advertised = landing.links.find(({ rel, type }) => rel === 'service-desc' && type.includes('json'));

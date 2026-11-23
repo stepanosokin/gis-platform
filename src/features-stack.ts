@@ -11,6 +11,7 @@ import { setTimeout } from 'node:timers/promises';
 import { checkServerIdentity, createSecureContext, TLSSocket } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { landingFor, landingPage, landingPolicy } from './platform-landing.js';
 import { parse, stringify } from 'yaml';
 import { mapBboxDescription, mapRelation, mapSize } from './maps-profile.js';
 import { checkTileJson, martinConfig, martinService, runMartin, tileArchivePath } from './martin-profile.js';
@@ -23,7 +24,7 @@ import { healthUrl, publicationChecks, publicationHealth } from './publication-h
 import { GatewayTlsError, gatewayTlsFiles, gatewayTlsProbe, inspectGatewayTls } from './gateway-tls.js';
 import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService, pinnedImage,
   postgisConnectionsForProvider, postgisSecretName, postgisSource,
-  providerBasePath, providerProtocols, providerRoot, providerRoutes, providerServiceName as serviceName, publicationEntries, publicationRoot, publicationsForProvider,
+  providerBasePath, providerProtocols, providerRoot, providerRouteOwner, providerRoutes, providerServiceName as serviceName, publicationEntries, publicationRoot, publicationsForProvider,
   publicationUrl, crs84, rasterFile, tileArchive, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
 
 const run = promisify(execFile);
@@ -269,14 +270,39 @@ http://:80 {
 		}
 	}
 ` : '';
+  const home = `${config.auth ? `
+	@personalHome {
+		method GET HEAD
+		path /
+		header Cookie *gis.session_token=*
+	}
+	handle @personalHome {
+		reverse_proxy access:3000 {
+			import gis_public_headers
+		}
+	}
+` : ''}
+	@home {
+		method GET HEAD
+		path /
+	}
+	handle @home {
+		header Cache-Control no-store
+		header Content-Security-Policy "${landingPolicy}"
+		header X-Content-Type-Options nosniff
+		root /etc/caddy/gis
+		rewrite * /platform-landing.html
+		file_server
+	}
+`;
   const managed = config.providers && managedGatewayRoutes(config, collectionRoute, featuresHtmlPolicy);
-  const routes = managed ? `${accounts}\n${managed.routes}
+  const routes = managed ? `${home}${accounts}\n${managed.routes}
 	handle {
 		header Cache-Control no-store
 		respond 404
 	}
 ` : `
-${accounts}
+${home}${accounts}
 ${metadataRoutes}
 ${config.auth ? publicationRoutes(protectedIds, false) + publicationRoutes(publicIds, true) : ''}
 	@features {
@@ -403,7 +429,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
     const mvt = protocol === 'mvt';
     const dggs = protocol === 'dggs';
     const tiles = protocol === 'tiles';
-    const rootProvider = (tiles && entries[0]?.[1].provider) || ids[0];
+    const rootProvider = providerRouteOwner(route, entries[0]?.[1]);
     const metadata = config.auth ? 'access' : 'metadata';
     const managedConformance = nested || entries.some(([, publication]) => vectorFile(config, publication.source));
     if (mvt && nested) {
@@ -571,6 +597,7 @@ interface Revision {
   config: FeaturesConfig;
   directory: string;
   tlsFingerprint?: string | null;
+  gatewayRevision?: number;
 }
 
 // The native Parquet provider builds projection and filter SQL from its broader
@@ -712,6 +739,7 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
   if (Object.keys(fileHashes).length) {
     await writeFile(join(revisionDirectory, 'vector-files.json'), JSON.stringify(fileHashes));
   }
+  const landing = landingFor(config);
   if (config.auth) {
     const { auth } = config;
     const secret = (await readFile(auth.secret_file, 'utf8')).trim();
@@ -725,6 +753,7 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
         secure: auth.smtp.secure, username: auth.smtp.username };
     await writeFile(join(revisionDirectory, 'access.json'), JSON.stringify({
       origin: new URL(config.publicUrl).origin, production: auth.mode === 'production', smtp,
+      landing,
       publications: Object.fromEntries(publicationEntries(config).map(([id, { access }]) => [id, access])),
       publicationTitles: Object.fromEntries(publicationEntries(config).map(([id, { title }]) => [id, title])),
       administratorEmails: auth.administrator_emails, managedFeatures: config.providers !== undefined,
@@ -757,6 +786,7 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
   }
   const providerConfig = JSON.stringify(pygeoapiConfig(config), null, 2);
   await writeFile(join(revisionDirectory, 'pygeoapi.yml'), providerConfig);
+  await writeFile(join(revisionDirectory, 'platform-landing.html'), landingPage(landing));
   await writeFile(join(revisionDirectory, 'Caddyfile'), caddyConfig(config));
   if (config.providers) {
     await reuseManagedArtifacts(config, revisionDirectory, previous,
@@ -1420,7 +1450,7 @@ export async function verifyLegacyGatewayTls({ config, directory, tlsFingerprint
   }
 }
 
-export async function diagnoseStack({ config, directory, tlsFingerprint }: Revision, publicationId?: string) {
+export async function diagnoseStack({ config, directory, tlsFingerprint, gatewayRevision }: Revision, publicationId?: string) {
   const entries = Object.fromEntries(publicationEntries(config)
     .map(([id, publication]) => [id, publicationHealth(config, id, publication)]));
   const gateway = async () => {
@@ -1428,7 +1458,7 @@ export async function diagnoseStack({ config, directory, tlsFingerprint }: Revis
       const { status, cacheControl } = await probeCollection(config, '/',
         await gatewayTlsProbe(config, directory, tlsFingerprint));
       if (cacheControl === 'no-store') {
-        if (status === 404) return 'ready';
+        if (status === 200 || (status === 404 && gatewayRevision === undefined)) return 'ready';
         if (status === 503) return 'closed';
       }
     } catch {

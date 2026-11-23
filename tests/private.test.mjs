@@ -287,11 +287,27 @@ test('personal grants and revocations apply to the next request for exactly one 
   await register(email, password, 'Grant reader');
   const cookie = await signIn(email, password);
   const options = { headers: { Cookie: cookie } };
+  const landing = async (sessionOptions) => {
+    const response = await request('/', sessionOptions);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.match(response.headers.get('content-type'), /^text\/html/);
+    return response.text();
+  };
+  const guest = await landing();
+  assert.match(guest, /\/account\/register/);
+  assert.match(guest, /\/account\/login/);
+  assert.match(guest, /\/features\/collections\/places/);
+  assert.doesNotMatch(guest, /registered-places|private-places|other-private/);
+  assert.match(await landing(options), /\/features\/collections\/registered-places/);
   const other = '/features/collections/other-private/items/central?f=json';
   assert.equal((await request(items, options)).status, 403);
   const grant = cli(['access', 'grant', 'private-places', '--email', '-GRANTEE@EXAMPLE.TEST']);
   assert.ok(grant.userId);
   assert.equal(grant.publicationId, 'private-places');
+  const personalized = await landing(options);
+  assert.ok(personalized.includes(`href="${gateway}${privateCollection}"`));
+  assert.doesNotMatch(personalized, /other-private/);
   cli(['access', 'grant', 'private-places', '--user-id', grant.userId], 'NO_CHANGE');
   const response = await request(items, options);
   assert.equal(response.status, 200);
@@ -321,6 +337,7 @@ test('personal grants and revocations apply to the next request for exactly one 
   assert.doesNotMatch(JSON.stringify(openapi), /other-private|Other closed places/);
 
   cli(['access', 'revoke', 'private-places', '--user-id', grant.userId]);
+  assert.doesNotMatch(await landing(options), /private-places/);
   cli(['access', 'revoke', 'private-places', '--user-id', grant.userId], 'NO_CHANGE');
   assert.equal((await request(items, options)).status, 403);
   assert.equal((await request(next, options)).status, 403);
@@ -357,6 +374,29 @@ test('a confirmed administrator can read all modes and an ordinary account lacks
   const users = cli(['users', 'list']).users;
   assert.deepEqual(publications(users.find(({ email }) => email === 'administrator@example.test')), ['places']);
   cli(['users', 'unblock', '--email', 'administrator@example.test']);
+});
+
+test('authorized operators export user access to an Excel workbook', async () => {
+  const email = 'export-reader@example.test';
+  await register(email, password, '=1+1');
+  cli(['access', 'grant', 'private-places', '--email', email]);
+  const file = join(process.env.GIS_TEST_RESULTS, 'users.xlsx');
+
+  cli(['users', 'list', '--xlsx', file], 'FORBIDDEN', 4, operator('agent'));
+  await assert.rejects(readFile(file), { code: 'ENOENT' });
+  const output = cli(['users', 'list', '--xlsx', file], 'OK', 0, operator('reader'));
+  assert.equal(output.file, file);
+  assert.ok(output.count >= 1);
+  const { strFromU8, unzipSync } = await import('fflate');
+  const workbook = unzipSync(await readFile(file));
+  assert.ok(workbook['xl/workbook.xml']);
+  const sheets = Object.entries(workbook).filter(([name]) => /^xl\/(worksheets\/sheet\d+|sharedStrings)\.xml$/.test(name))
+    .map(([, content]) => strFromU8(content)).join('\n');
+  assert.match(sheets, /export-reader@example\.test/);
+  assert.match(sheets, /=1\+1/);
+  assert.doesNotMatch(sheets, /<f[ >]/);
+  assert.match(sheets, /private-places/);
+  cli(['users', 'list', '--xlsx', file], 'INVALID_INPUT', 2, operator('reader'));
 });
 
 test('user summaries and the gateway reflect blocking and unblocking', async () => {
@@ -528,7 +568,16 @@ test('deleting and restoring a private publication drops its grants and keeps th
   await freshGet(items, headers, 200);
   const { currentVersion } = cli(['status']);
 
-  const removal = await planPrivateConfig(({ publications }) => { delete publications['private-places']; });
+  const workingFile = process.env.GIS_TEST_CONFIG;
+  const originalYaml = await readFile(workingFile, 'utf8');
+  const reviewed = parse(originalYaml);
+  delete reviewed.publications['private-places'];
+  const reviewedFile = join(dirname(workingFile), 'reviewed-removal.yaml');
+  const reviewedYaml = stringify(reviewed);
+  await writeFile(reviewedFile, reviewedYaml);
+  const { draftFile } = cli(['draft', 'access', workingFile, 'private-places', 'private']);
+  cli(['draft', 'rebase', workingFile, reviewedFile]);
+  const removal = cli(['config', 'plan', '--draft', workingFile]);
   assert.deepEqual(removal.removed, ['private-places']);
   assert.ok(removal.routesToClose.includes(new URL(privateCollection, gateway).href));
   assert.deepEqual(removal.publications.find(({ publicationId }) => publicationId === 'private-places'), {
@@ -538,6 +587,8 @@ test('deleting and restoring a private publication drops its grants and keeps th
   await freshGet(items, headers, 200);
 
   cli(['config', 'apply', removal.planId]);
+  assert.equal(await readFile(workingFile, 'utf8'), reviewedYaml);
+  await assert.rejects(readFile(draftFile), { code: 'ENOENT' });
   for (const path of [items, privateCollection, `${privateCollection}/schema`, `${privateCollection}/queryables`]) {
     await freshGet(path, headers, 404);
   }
@@ -552,6 +603,7 @@ test('deleting and restoring a private publication drops its grants and keeps th
   const restore = cli(['config', 'plan', '--rollback-to', currentVersion]);
   assert.deepEqual(restore.added, ['private-places']);
   cli(['config', 'apply', restore.planId]);
+  await writeFile(workingFile, originalYaml);
   await freshGet(items, headers, 403);
   cli(['access', 'grant', 'private-places', '--email', email]);
   assert.equal((await freshGet(items, headers, 200, true)).id, 'central');

@@ -8,6 +8,7 @@ import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { setTimeout } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import { parse, stringify } from 'yaml';
 
 const run = promisify(execFile);
 const file = process.env.GIS_TEST_CONFIG;
@@ -29,6 +30,66 @@ async function collection() {
   assert.equal(response.status, 200);
   return response.json();
 }
+
+test('a confirmed draft updates the platform inventory and diagram through the operator CLI', async () => {
+  const { data: { currentVersion } } = await cli('status');
+  const settings = join(dirname(file), 'draft-provider.yaml');
+  const { image, ...integration } = parse(await readFile('examples/mvt.yaml', 'utf8')).providers['live-martin'];
+  await writeFile(settings, stringify(integration));
+  const publication = join(dirname(file), 'draft-publication.yaml');
+  await writeFile(publication, stringify({ ...parse(original).publications.places, title: 'Operator & map <collection>' }));
+  const diagram = join(dirname(file), 'active-diagram.html');
+  const staged = await cli('draft', 'provider', file, 'idle-martin', image, settings);
+  assert.equal(staged.code, 'OK', staged.data.message);
+  const stale = await cli('config', 'plan', '--draft', file);
+  assert.deepEqual(stale.data.providers.added, ['idle-martin']);
+  assert.equal((await cli('draft', 'publication', file, 'operator-places', publication)).code, 'OK');
+  assert.equal((await cli('config', 'apply', stale.data.planId)).code, 'PLAN_STALE');
+
+  const before = await cli('publications', 'list');
+  assert.equal(before.code, 'OK', before.data.message);
+  assert.deepEqual(before.data.publications.map(({ id }) => id), ['places']);
+  const candidate = await cli('config', 'plan', '--draft', file);
+  assert.deepEqual(candidate.data.added, ['operator-places']);
+  assert.equal(await readFile(file, 'utf8'), original);
+  try {
+    const applied = await cli('config', 'apply', candidate.data.planId);
+    assert.equal(applied.code, 'OK', applied.data.message);
+    assert.match(await readFile(file, 'utf8'), /operator-places:/);
+    await assert.rejects(readFile(staged.data.draftFile), { code: 'ENOENT' });
+    assert.equal((await cli('config', 'apply', candidate.data.planId)).data.currentVersion, candidate.data.planId);
+    const published = await cli('publications', 'list');
+    assert.equal(published.data.currentVersion, candidate.data.planId);
+    const entry = published.data.publications.find(({ id }) => id === 'operator-places');
+    assert.deepEqual([entry.title, entry.url, entry.protocol, entry.provider],
+      ['Operator & map <collection>', `${gateway}/features/collections/operator-places`, 'features', 'file-features']);
+
+    const providers = await cli('providers', 'list');
+    assert.equal(providers.code, 'OK', providers.data.message);
+    assert.match(providers.data.providers.find(({ id }) => id === 'file-features').container, /-pygeoapi-1$/);
+    const idle = providers.data.providers.find(({ id }) => id === 'idle-martin');
+    assert.deepEqual([idle.container, idle.image, idle.protocols], [null, image, ['mvt']]);
+    assert.equal((await cli('config', 'diagram', diagram)).code, 'OK');
+    const html = await readFile(diagram, 'utf8');
+    assert.match(html, /sample-places[\s\S]*Operator &amp; map &lt;collection&gt;[\s\S]*file-features/);
+    const home = await fetch(`${gateway}/`, { headers: { Connection: 'close' } });
+    assert.match(await home.text(), /<li>idle-martin<\/li>/);
+
+    const unchanged = await cli('draft', 'access', file, 'operator-places', 'public');
+    assert.equal(unchanged.code, 'OK');
+    const reviewed = `${await readFile(file, 'utf8')}\n# reviewed without configuration changes\n`;
+    await writeFile(publication, reviewed);
+    assert.equal((await cli('draft', 'rebase', file, publication)).code, 'OK');
+    const noChange = await cli('config', 'plan', '--draft', file);
+    await writeFile(file, reviewed);
+    assert.equal((await cli('config', 'apply', noChange.data.planId)).code, 'NO_CHANGE');
+    await assert.rejects(readFile(unchanged.data.draftFile), { code: 'ENOENT' });
+  } finally {
+    const rollback = await cli('config', 'plan', '--rollback-to', currentVersion);
+    assert.equal((await cli('config', 'apply', rollback.data.planId)).code, 'OK');
+    await writeFile(file, original);
+  }
+});
 
 test('a rollback plan restores the previous publication and OpenAPI', async () => {
   const first = await cli('status');

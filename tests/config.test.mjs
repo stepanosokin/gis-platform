@@ -1,11 +1,46 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
 const valid = readFileSync('examples/features.yaml', 'utf8');
 const results = process.env.GIS_TEST_RESULTS ?? '/results';
+
+test('a shared draft accumulates PostGIS and access settings and detects a changed working YAML', () => {
+  const directory = mkdtempSync(join(results, 'shared-draft-'));
+  const platform = join(directory, 'platform.yaml');
+  const settings = join(directory, 'postgis.yaml');
+  writeFileSync(platform, valid);
+  writeFileSync(join(directory, 'places.geojson'), '{"type":"FeatureCollection","features":[]}');
+  writeFileSync(settings, 'host: postgis\ndatabase: spatial\nuser: reader\npassword_file: secret.txt\n');
+  const cli = (...args) => {
+    const result = spawnSync(process.execPath, ['dist/cli.js', ...args, '--json'], {
+      env: { ...process.env, GIS_STATE_DIR: join(directory, 'state') }, encoding: 'utf8', timeout: 10_000,
+    });
+    assert.ifError(result.error);
+    return JSON.parse(result.stdout);
+  };
+
+  const first = cli('draft', 'postgis', platform, 'live', settings);
+  assert.equal(first.code, 'OK', first.data.message);
+  assert.equal(cli('draft', 'postgis', platform, 'archive', settings).code, 'OK');
+  assert.equal(cli('draft', 'access', platform, 'places', 'registered').code, 'INVALID_CONFIG');
+  const auth = join(directory, 'auth.yaml');
+  writeFileSync(auth, 'mode: development\nsecret_file: auth-secret.txt\npostgres_password_file: accounts-password.txt\n');
+  assert.equal(cli('draft', 'auth', platform, auth).code, 'OK');
+  assert.equal(cli('draft', 'access', platform, 'places', 'registered').code, 'OK');
+  assert.equal(readFileSync(platform, 'utf8'), valid);
+  assert.equal(cli('config', 'validate', first.data.draftFile).code, 'OK');
+  const plan = cli('config', 'plan', '--draft', platform).data;
+  assert.deepEqual(plan.postgisConnections.added, ['live', 'archive']);
+  assert.equal(plan.auth.after, true);
+  assert.equal(plan.publications.find(({ publicationId }) => publicationId === 'places').newAccess, 'registered');
+  writeFileSync(platform, valid + '\n# changed by the owner\n');
+  assert.equal(cli('config', 'plan', '--draft', platform).code, 'PLAN_STALE');
+  assert.match(readFileSync(first.data.draftFile, 'utf8'), /archive:/);
+});
+
 const cases = [
   ['schema-version', 'schema_version: 1', 'schema_version: 2', /schema_version/],
   ['required-field', '    title: Example places\n', '', /required property.*title/],
