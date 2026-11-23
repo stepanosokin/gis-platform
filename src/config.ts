@@ -70,7 +70,7 @@ type Source = { type: 'geojson'; path: string } | FileSource | PostgisSource;
 
 interface PlatformConfig {
   schema_version: 1;
-  server: { host: string; port?: number; tls?: Partial<TlsConfig> };
+  server: { host: string; port?: number; public_url?: string; tls?: Partial<TlsConfig> };
   postgis_connections?: Record<string, PostgisConnection>;
   sources: Record<string, Source>;
   providers: Record<string, Provider>;
@@ -112,6 +112,7 @@ export type AuthConfig = {
 export type FeaturesConfig = {
   port: number;
   publicUrl: string;
+  publicOrigin?: string;
   sourcePath: string;
   geojsonSourceId?: string;
   vectorFiles?: Record<string, VectorFileSource>;
@@ -311,7 +312,7 @@ export function serializeFeaturesConfig(config: FeaturesConfig) {
     (config.publicationId === null ? config.sourceId : config.publication.source);
   const snapshot: PlatformConfig = {
     schema_version: 1,
-    server: { host: new URL(config.publicUrl).hostname, port: config.port, tls: config.tls },
+    server: { host: new URL(config.publicUrl).hostname, port: config.port, public_url: config.publicOrigin, tls: config.tls },
     postgis_connections: config.postgisConnections,
     sources: {
       ...(config.sourcePath && { [geojsonSourceId]: { type: 'geojson', path: config.sourcePath } }),
@@ -587,7 +588,13 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
   const sourceId = geojson?.[0] ?? sources[0]![0];
   const providerId = providers[0]?.[0] ?? '';
 
-  const { host, tls, port = tls?.cert_file ? 443 : 80 } = config.server;
+  const { host, tls, public_url, port = tls?.cert_file ? 443 : 80 } = config.server;
+  const gatewayAddress = new URL(`${tls?.cert_file ? 'https' : 'http'}://${host}:${port}`);
+  const publicAddress = public_url === undefined ? undefined : URL.parse(public_url);
+  if (public_url !== undefined &&
+      (!publicAddress || publicAddress.port === '0' || publicAddress.hostname !== gatewayAddress.hostname)) {
+    throw new Error('server.public_url requires the hostname from server.host and a valid TCP port (1–65535).');
+  }
   const auth = config.auth;
   if (auth) {
     auth.secret_file = resolve(directory, auth.secret_file);
@@ -611,7 +618,8 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     !config.providers[id.slice(servicePrefix.length)]?.image);
   return {
     port,
-    publicUrl: new URL('/features', `${tls?.cert_file ? 'https' : 'http'}://${host}:${port}`).href,
+    publicUrl: new URL('/features', publicAddress ?? gatewayAddress).href,
+    ...(publicAddress && { publicOrigin: publicAddress.origin }),
     sourcePath: geojson ? resolve(directory, geojson[1].path) : '',
     ...(config.postgis_connections && { postgisConnections }),
     ...(postgisSources.length && { postgisSources: Object.fromEntries(postgisSources) }),

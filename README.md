@@ -45,6 +45,20 @@ curl -fsS 'http://localhost:8080/features/collections/places/items?f=json&bbox=3
 
 Назначение каждого параметра указано в `description` в [JSON Schema платформы](src/platform.schema.json). Для `integration.yaml` используйте описание одной записи в `providers`. [Структура файлов и проверка перед применением](ADMIN.md#файлы-конфигурации-yaml)
 
+### Публичный адрес за HTTPS-прокси
+
+Прокси может принимать запросы на `https://gis.example.org` и подключаться к Caddy по HTTPS на порту `1443`. В `server.public_url` задайте адрес для клиентов, а в `server.port` укажите порт Caddy на хосте. [Настройка TLS и прокси](ADMIN.md#внешний-http-и-https)
+
+```yaml
+server:
+  host: gis.example.org
+  port: 1443
+  public_url: https://gis.example.org
+  tls:
+    cert_file: secrets/tls/fullchain.pem
+    key_file: secrets/tls/server-key.pem
+```
+
 ## Источники PostGIS
 
 Задайте подключения к внешним базам в `postgis_connections` и выберите подключение в `sources.<id>.connection` каждого источника PostGIS. Все публикации одного источника читают одну БД. Один экземпляр pygeoapi может выдавать Features из нескольких БД и из файлов. Один Martin может выдавать тайлы из нескольких БД и архивов. При обновлении старого YAML перенесите `providers.<id>.postgis` в реестр подключений. [Подготовка данных PostGIS](ADMIN.md#подготовить-данные-postgis)

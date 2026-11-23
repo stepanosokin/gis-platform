@@ -13,6 +13,12 @@
       "description": "Внешний адрес платформы и TLS шлюза Caddy.",
       "type": "object",
       "required": ["host"],
+      "dependencies": {
+        "public_url": {
+          "required": ["tls"],
+          "properties": { "tls": { "type": "object", "required": ["cert_file", "key_file"] } }
+        }
+      },
       "additionalProperties": false,
       "properties": {
         "host": {
@@ -20,8 +26,12 @@
           "type": "string", "maxLength": 253, "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"
         },
         "port": {
-          "description": "Внешний порт шлюза. По умолчанию 80 для HTTP и 443 для HTTPS.",
+          "description": "Порт шлюза на хосте. По умолчанию 80 для HTTP и 443 для HTTPS.",
           "type": "integer", "minimum": 1, "maximum": 65535
+        },
+        "public_url": {
+          "description": "Публичный HTTPS-адрес развёртывания. Укажите имя из server.host, необязательный порт от 1 до 65535 и при необходимости завершающий /. Требует server.tls.",
+          "type": "string", "pattern": "^[Hh][Tt][Tt][Pp][Ss]://[a-zA-Z0-9.-]+(?::[0-9]+)?/?$"
         },
         "tls": {
           "description": "Параметры HTTPS. Наличие cert_file включает HTTPS.",

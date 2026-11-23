@@ -1374,11 +1374,13 @@ async function composeRevision({ config, directory: revisionDirectory, tlsFinger
   return stdout;
 }
 
-function probeCollection(origin: URL, path: string, tls: Awaited<ReturnType<typeof gatewayTlsProbe>>,
+function probeCollection(config: FeaturesConfig, path: string, tls: Awaited<ReturnType<typeof gatewayTlsProbe>>,
   rejectUnauthorized = true) {
   return new Promise<{ status?: number; cacheControl?: string; body: string }>((resolve, reject) => {
+    const origin = new URL(config.publicUrl);
     const url = new URL(path, origin);
     url.hostname = '127.0.0.1';
+    url.port = String(config.port);
     const get = tls ? getHttps : getHttp;
     const request = get(url, {
       agent: false,
@@ -1411,7 +1413,7 @@ export async function verifyLegacyGatewayTls({ config, directory, tlsFingerprint
     const tls = await gatewayTlsProbe(config, directory);
     const running = await compose(config, directory, 'ps', '--status', 'running', '--services', 'caddy');
     // An expired certificate can still identify the pair that must be retained for a legacy revision.
-    if (running.trim()) await probeCollection(new URL(config.publicUrl), '/', tls, false);
+    if (running.trim()) await probeCollection(config, '/', tls, false);
   } catch {
     throw new GatewayTlsError('previous-files-unavailable',
       'Keep the previous TLS certificate and key at their original paths for recovery and rollback. Use new paths for the replacement.');
@@ -1423,7 +1425,7 @@ export async function diagnoseStack({ config, directory, tlsFingerprint }: Revis
     .map(([id, publication]) => [id, publicationHealth(config, id, publication)]));
   const gateway = async () => {
     try {
-      const { status, cacheControl } = await probeCollection(new URL(config.publicUrl), '/',
+      const { status, cacheControl } = await probeCollection(config, '/',
         await gatewayTlsProbe(config, directory, tlsFingerprint));
       if (cacheControl === 'no-store') {
         if (status === 404) return 'ready';
@@ -1628,7 +1630,7 @@ export async function startFeaturesStack(revision: Revision, confirmed?: Revisio
   };
   for (let attempt = 0; attempt < 15; attempt++) {
     try {
-      const gate = await probeCollection(origin, '/features/collections?f=json', tls);
+      const gate = await probeCollection(config, '/features/collections?f=json', tls);
       if (gate.status !== 503 || gate.cacheControl !== 'no-store') throw new Error('The gateway is not closed.');
       for (const [id, provider] of Object.entries(config.providers ?? {})) {
         if (!provider.image || provider.type !== 'pygeoapi' || reusedProviders.has(id) ||

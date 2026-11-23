@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { X509Certificate } from 'node:crypto';
+import { once } from 'node:events';
 import { readFile, rename, writeFile } from 'node:fs/promises';
 import { get } from 'node:https';
+import { connect, createServer } from 'node:net';
 import { dirname, join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import { test } from 'node:test';
@@ -319,6 +321,51 @@ function peerFingerprint(url) {
     req.on('error', reject);
   });
 }
+
+test('the public HTTPS address is independent of the gateway port', async (t) => {
+  const filename = process.env.GIS_TEST_CONFIG;
+  const previousVersion = cliResult(['status']).data.currentVersion;
+  const gatewayPort = Number(new URL(process.env.GIS_TEST_HTTPS_URL).port || 443);
+  let forwarding = false;
+  const proxy = createServer((client) => {
+    if (!forwarding) {
+      client.destroy();
+      return;
+    }
+    const upstream = connect(gatewayPort, '127.0.0.1');
+    client.on('error', () => upstream.destroy());
+    upstream.on('error', () => client.destroy());
+    client.on('close', () => upstream.destroy());
+    upstream.on('close', () => client.destroy());
+    client.pipe(upstream).pipe(client);
+  });
+  proxy.listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+  t.after(() => new Promise((resolve) => proxy.close(resolve)));
+  const publicOrigin = `https://localhost:${proxy.address().port}`;
+  const candidate = join(dirname(filename), 'public-address.yaml');
+  const yaml = httpsYaml(await readFile(filename, 'utf8')).replace('  host: localhost\n',
+    `  host: localhost\n  public_url: ${publicOrigin}\n`);
+  await writeFile(candidate, yaml);
+
+  const plan = cli('plan', candidate);
+  assert.equal(plan.previousPublicUrl, gateway);
+  assert.equal(plan.publicUrl, publicOrigin);
+  cli('apply', plan.planId);
+  t.after(() => cli('apply', cli('plan', '--rollback-to', previousVersion).planId));
+  const diagnostics = cliResult(['doctor']).data;
+  assert.equal(diagnostics.gateway, 'ready');
+  assert.equal(diagnostics.tls.state, 'ready');
+
+  forwarding = true;
+  const collectionUrl = `${publicOrigin}/features/collections/places`;
+  const metadata = await document(`${collectionUrl}?f=json`, undefined, { Connection: 'close' });
+  const items = metadata.links.find(({ rel, type }) => rel === 'items' && type === 'application/geo+json');
+  assert.equal(items?.href, `${collectionUrl}/items?f=json`);
+  assert.equal((await document(items.href, undefined, { Connection: 'close' })).type, 'FeatureCollection');
+  const openApi = await document(`${publicOrigin}/features/openapi?f=json`, undefined, { Connection: 'close' });
+  assert.equal(openApi.servers[0].url, `${publicOrigin}/features`);
+});
 
 test('HTTPS serves the account flow with a Secure session cookie', async () => {
   const filename = process.env.GIS_TEST_CONFIG;
