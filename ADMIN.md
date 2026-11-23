@@ -1,6 +1,6 @@
 # Руководство администратора GIS Platform
 
-Руководство рассчитано на администратора, который знаком с базовыми командами Docker. Основные команды выполняются в Bash на Linux. Для Windows есть шаги для WSL 2 и отдельный порядок работы с действующим alpha-стендом.
+Руководство рассчитано на администратора, который знаком с базовыми командами Docker. Основные команды выполняются в Bash на Linux. Для Windows приведены шаги для WSL 2 и постоянного локального стенда в Docker Desktop.
 
 ## Оглавление
 
@@ -61,13 +61,15 @@ Compose-проект объединяет контейнеры одного ра
 
 ### Как проходит запрос к публикации
 
-Разберём запрос QGIS к коллекции `places`.
+Разберём запрос QGIS к коллекции `places` на [постоянном локальном стенде](#постоянный-локальный-стенд). У экземпляра pygeoapi публичный префикс `pygeoapi`, а у протокола Features корень `/pygeoapi/features`.
 
-1. QGIS отправляет запрос по внешнему адресу, например `http://localhost:8080/features/collections/places/items?f=json`. Его принимает **Caddy**, единственная точка входа для запросов к публикациям.
-2. Шлюз определяет по URL ID публикации `places`. Публикация связывает конкретный источник, экземпляр сервис-провайдера, протокол и режим доступа. Одни и те же данные можно опубликовать несколько раз, например через Features и тайлы или с разными правилами доступа.
+1. QGIS отправляет запрос по адресу `http://localhost:8081/pygeoapi/features/collections/places/items?f=json`. Его принимает **Caddy**, единственная точка входа для запросов к публикациям.
+2. Шлюз сопоставляет путь с экземпляром `pygeoapi`, протоколом `features` и ID публикации `places`. Публикация задаёт источник и режим доступа. Одни и те же данные можно опубликовать несколько раз, например через Features и тайлы или с разными правилами доступа.
 3. Для защищённой публикации шлюз запрашивает решение у **компонента доступа**. Этот компонент использует PostgreSQL платформы для учётных записей, сеансов, токенов и персональных разрешений. Публичная публикация доступна без входа.
 4. Для разрешённого запроса шлюз обращается через внутреннюю сеть Compose к **экземпляру сервис-провайдера**. В нашем примере pygeoapi читает файл GeoJSON и возвращает объекты. Другие экземпляры, например Martin или pydggsapi, могут читать свои форматы и отвечать по другим протоколам.
 5. Клиент получает ответ через Caddy. По внешнему адресу также доступны каталоги, схемы и описания API. Видимость защищённых публикаций зависит от прав клиента.
+
+У управляемого экземпляра с `api.protocols` корень имеет вид `/<публичный-префикс>/<протокол>`. Встроенный pygeoapi из стартового примера использует `/features`. Действующие экземпляры с `api.protocol` и `api.public_root` публикуются по указанному `public_root`. Полный адрес конкретной публикации смотрите в `publications[].newUrl` вывода `config plan --json`.
 
 **Источник** определяет, где лежат данные. **Адаптер** платформы знает, как настроить конкретный сервис-провайдер. **Экземпляр** — отдельное настроенное подключение с собственным ID. **Публикация** определяет, как клиент получает данные и кто имеет к ним доступ. [Глоссарий проекта](GLOSSARY.md)
 
@@ -119,7 +121,7 @@ curl --version
 | Файл | Когда используется |
 | --- | --- |
 | `compose.yaml` | Базовые настройки Caddy и встроенного pygeoapi. |
-| `compose.empty.yaml` | Встроенный GeoJSON не используется. Убирает стандартное монтирование GeoJSON. |
+| `compose.empty.yaml` | Встроенный экземпляр pygeoapi не читает GeoJSON. Убирает стандартное монтирование GeoJSON из базового сервиса `pygeoapi`. |
 | `compose.tls.yaml` | Внешний HTTPS и HTTP-порт для перенаправления. |
 | `compose.auth.yaml` | В конфигурации задан `auth`. |
 | `compose.mailpit.yaml` | `auth.mode: development`. |
@@ -153,7 +155,7 @@ docker compose -p gis-guide-demo -f compose.yaml -f compose.auth.yaml -f compose
 
 Поля `schema_version`, `server`, `sources`, `providers` и `publications` обязательны. Чтобы начать с пустого каталога публикаций, оставьте хотя бы один допустимый источник и задайте `publications: {}`. Для работающего проекта сначала просмотрите, какие публикации и разрешения такой план удалит. [Полный пример GeoJSON](examples/features.yaml)
 
-**`integration.yaml`** содержит настройки одного экземпляра для команды `provider add`. На верхнем уровне идут `type` и `api`. Блок `api` задаёт `protocol`, `scheme`, `port`, `base_path`, `public_root`, `links` и `readiness`. Адаптер может поддерживать `environment` или `volumes`. Образ команда принимает отдельным аргументом, сама получает digest и после успеха записывает экземпляр под `providers.<id>` в полном YAML. Оставьте поля `image` и `digest` вне файла интеграции. Подключения к внешним БД задайте в `postgis_connections` в платформенном YAML. [Пример интеграции pygeoapi](examples/provider-features.yaml)
+**`integration.yaml`** содержит настройки одного экземпляра для команды `provider add`. На верхнем уровне идут `type` и `api`. Блок `api` задаёт `scheme`, `port`, `base_path`, `links` и `readiness`. Для вложенных адресов укажите `protocols` и при необходимости `public_prefix`. Для плоского адреса используйте `protocol` и `public_root`. Адаптер может поддерживать `environment` или `volumes`. Образ передайте аргументом команды. CLI сам получает digest и после успеха записывает экземпляр под `providers.<id>` в полном YAML. Оставьте поля `image` и `digest` вне файла интеграции. Подключения к внешним БД задайте в `postgis_connections` в платформенном YAML. [Пример интеграции с плоским адресом](examples/provider-features.yaml)
 
 В [JSON Schema](src/platform.schema.json) найдите раздел в `properties`. `description` объясняет назначение поля, `required` перечисляет обязательные поля, `enum` задаёт доступные значения. В `sources`, `providers` и `publications` блок `additionalProperties` описывает одну запись по ID. В `sources` выберите нужный `type` внутри `oneOf`. Для файла интеграции смотрите `properties.providers.additionalProperties`. Например, `server.port` — внешний порт Caddy, а `providers.<id>.api.port` — внутренний порт экземпляра в Compose.
 
@@ -163,7 +165,7 @@ docker compose -p gis-guide-demo -f compose.yaml -f compose.auth.yaml -f compose
 
 ### Локальная проба с GeoJSON
 
-1. Из корня репозитория соберите CLI и скопируйте пример в отдельный каталог. В примере источник `sample-places` указывает на `places.geojson` рядом с YAML. Экземпляр `file-features` обслуживает публичную публикацию `places`.
+1. Из корня репозитория соберите CLI и скопируйте пример в отдельный каталог. Источник `sample-places` указывает на `places.geojson` рядом с YAML. Встроенный экземпляр `file-features` обслуживает публичную публикацию `places` под корнем `/features`.
 
 ```sh
 # Установите зависимости из package-lock.json.
@@ -243,7 +245,7 @@ cp -n examples/places.geojson /opt/gis-platform/data/places.geojson
 
 В `/opt/gis-platform/platform.yaml` замените `sources.sample-places.path` на `data/places.geojson`. Подставьте рабочий источник, когда будете готовы. Относительный путь считается от `/opt/gis-platform`, где лежит YAML.
 
-2. Задайте внешний адрес и TLS. Для штатного HTTPS на 443 уберите `server.port: 8080` из скопированного примера. Если используете другой порт, добавьте его к `public_url` в командах проверки. При публикации с регистрацией подготовьте SMTP и секреты по [инструкции управления доступом](#учётные-записи-и-доступ). Проверьте доступ к реестрам образов, SMTP и внешнему PostGIS из сети Docker, если они используются.
+2. Задайте внешний адрес и TLS. Для штатного HTTPS на 443 уберите `server.port: 8080` из скопированного примера. Если используете другой порт, проверьте, что он указан в URL из плана. При публикации с регистрацией подготовьте SMTP и секреты по [инструкции управления доступом](#учётные-записи-и-доступ). Проверьте доступ к реестрам образов, SMTP и внешнему PostGIS из сети Docker, если они используются.
 3. До применения проверьте DNS и порт. Если клиенты обращаются к Caddy напрямую, ограничьте входящие соединения правилами межсетевого экрана. Выберите одну настройку привязки уже для первого применения. CLI проверяет Caddy через `127.0.0.1`, поэтому одного внешнего интерфейса для проверки недостаточно.
 
 ```sh
@@ -265,12 +267,10 @@ export COMPOSE_PROJECT_NAME=gis-platform
 export GIS_STATE_DIR=/opt/gis-platform/state
 # Сохраните путь к рабочему YAML.
 platform=/opt/gis-platform/platform.yaml
-# Замените пример адреса на внешний адрес своего шлюза.
-public_url=https://gis.example.org
 # Проверьте рабочий YAML.
 node dist/cli.js config validate "$platform"
 # Подготовьте план для сервера и проверьте изменения.
-node dist/cli.js config plan "$platform"
+node dist/cli.js config plan "$platform" --json
 # Введите ID проверенного плана.
 read -r -p 'ID плана: ' plan_id
 # Примените план и запустите сервисы.
@@ -281,11 +281,13 @@ node dist/cli.js status --json
 node dist/cli.js doctor --json
 ```
 
-4. Проверьте внешний URL из плана через Caddy с серверной и клиентской сети. Для защищённых публикаций проверьте ответы анонимного и разрешённого клиента. Ожидайте `ready` в `doctor` и данные публикации в ответе на запрос.
+4. Проверьте внешний URL из плана через Caddy с серверной и клиентской сети. Скопируйте полный `newUrl` для `places`. Для защищённых публикаций проверьте ответы анонимного и разрешённого клиента. Ожидайте `ready` в `doctor` и данные публикации в ответе на запрос.
 
 ```sh
+# Введите полный адрес коллекции из плана.
+read -r -p 'URL коллекции places: ' collection_url
 # Запросите один объект через внешний адрес шлюза.
-curl -fsS "$public_url/features/collections/places/items?f=json&limit=1"
+curl -fsS "$collection_url/items?f=json&limit=1"
 ```
 
 ### Внешний HTTP и HTTPS
@@ -305,13 +307,13 @@ server:
 
 Для замены сертификата подготовьте комплект и создайте новый план. CLI проверяет цепочку, ключ, имя хоста и срок действия, затем сохраняет принятую копию в `GIS_STATE_DIR/tls/`. `doctor --json` показывает состояние и `data.tls.expiresAt`. У старой версии без архива комплект должен оставаться доступен по прежним путям для отката. Для возврата на HTTP уберите `server.tls`, проверьте изменение внешнего адреса и примените новый план. При смене схемы или адреса пользователи входят заново.
 
-Для проверки ещё не открытого наружу HTTPS замените значения в примере именем и портом из YAML. `--resolve` направляет запрос на loopback и сохраняет правильное имя хоста в TLS.
+Для проверки ещё не открытого наружу HTTPS подставьте имя и порт из YAML и корень Features из URL публикации. В примере используется `/pygeoapi/features`, в стартовом YAML с GeoJSON — `/features`. `--resolve` направляет запрос на loopback и сохраняет правильное имя хоста в TLS.
 
 ```sh
 # Проверьте TLS и каталог Features через loopback с публичным именем сервера.
 curl -fsS --resolve 'gis.example.org:443:127.0.0.1' \
   --cacert /opt/gis-platform/secrets/tls/it-root.pem \
-  'https://gis.example.org/features/collections?f=json'
+  'https://gis.example.org/pygeoapi/features/collections?f=json'
 ```
 
 ## Повседневная эксплуатация
@@ -368,9 +370,28 @@ node dist/cli.js doctor --json
 
 Если контейнеры уже удалены, проверьте наличие томов, `GIS_STATE_DIR`, исходных данных и секретов. Подготовьте новый план из действующего полного YAML и проверьте результат применения. Если CLI возвращает `NO_CHANGE` при отсутствующих контейнерах, используйте порядок повторного развёртывания из [обновления версии](#обновить-версию-платформы). При потере состояния или тома учётных записей переходите к [восстановлению из копии](#резервное-копирование-и-восстановление).
 
+### Постоянный локальный стенд
+
+В Docker Desktop постоянный проект называется `gis-platform`. Его рабочий YAML и служебное состояние лежат в `.gis-platform/stable/`. В YAML указан адрес шлюза `http://localhost:8081`. Порты опубликованы на `127.0.0.1` через `GIS_PUBLIC_BIND`. Корни протоколов — `/pygeoapi/features`, `/pygeoapi/maps`, `/pygeoapi/tiles`, `/martin/mvt` и `/pydggsapi/dggs`. Список коллекций каждого протокола зависит от публикаций и прав клиента.
+
+В PowerShell из корня рабочей копии выполните следующие команды. Для обновления используйте CLI выбранной версии кода и сохраняйте имя проекта, состояние и тома.
+
+```powershell
+$stableRoot = (Resolve-Path '.gis-platform/stable').Path
+$env:COMPOSE_PROJECT_NAME = 'gis-platform'
+$env:GIS_STATE_DIR = Join-Path $stableRoot 'state'
+$env:GIS_PUBLIC_BIND = '127.0.0.1'
+$platform = Join-Path $stableRoot 'platform.yaml'
+node dist/cli.js status --json
+node dist/cli.js doctor --json
+curl.exe -fsS 'http://localhost:8081/pygeoapi/features/collections/places/items?f=json&limit=1'
+```
+
+Для изменения YAML выполните `validate → plan → apply` с теми же переменными и проверьте адрес публикации из плана. Если контейнеры остановлены, запустите их [в порядке зависимостей](#остановить-запустить-или-перезапустить). Тестовые прогоны выполняйте в отдельных проектах Compose. [Локальные тесты](tests/README.md)
+
 ### Обновление локального alpha-стенда
 
-В PowerShell с Docker Desktop выполните `docker compose ls --all` и найдите `gis-platform-alpha`. Проверьте монтирование Caddy и настройки запущенных сервисов. В этом репозитории конфигурация и состояние стенда находятся под `test_results/gis-platform-alpha/`. Путь к активному YAML определите по последней применённой версии и файлу оператора. Сохраняйте источник, секреты, каталог состояния, порты и тома.
+Для сохранившегося alpha-стенда выполните в PowerShell `docker compose ls --all` и найдите `gis-platform-alpha`. Проверьте монтирование Caddy и настройки сервисов. Конфигурация и состояние этого стенда находятся под `test_results/gis-platform-alpha/`. Путь к рабочему YAML определите по последней применённой версии и файлу оператора. Сохраняйте источник, секреты, каталог состояния, порты и тома.
 
 ```powershell
 # Найдите абсолютный путь каталога alpha-стенда.
@@ -419,7 +440,7 @@ node dist/cli.js doctor --json
 ### Файлы и системы координат Features
 
 - Для GeoJSON используйте строковый `id` объекта. Платформа допускает один источник `geojson` на полный YAML.
-- Для GeoPackage укажите точное имя слоя. Для Shapefile укажите имя слоя без расширения. Положите рядом файлы с тем же базовым именем и расширениями `.shx`, `.dbf`, `.prj` и `.cpg` при наличии.
+- Для GeoPackage укажите точное имя слоя. Для Shapefile укажите имя слоя без расширения и положите рядом обязательные файлы `.shx`, `.dbf` и `.prj` с тем же базовым именем. Скопируйте также `.cpg`, если он есть.
 - Для GeoPackage, Shapefile и GeoParquet укажите `id_field` с уникальными непустыми строками или целыми числами. Для GeoParquet подготовьте метаданные `geo`, первичную геометрию WKB и плоские рёбра. При отсутствии `crs` в метаданных GeoParquet используется CRS84.
 - Встроенный pygeoapi для GeoParquet собирается с PyArrow 23.0.1. В дополнительном образе для GeoParquet нужен совместимый PyArrow, а для GeoPackage и Shapefile — Fiona.
 
@@ -461,7 +482,7 @@ sources:
 
 | Адаптер | Когда использовать |
 | --- | --- |
-| `pygeoapi` | Features, Maps и публичное OGC API — Tiles. Тайлы для этого API формирует Martin. |
+| `pygeoapi` | Features, Maps и OGC API — Tiles. Тайлы для этого API формирует Martin. |
 | `martin` | Векторные тайлы из PostGIS, прямые тайлы из MBTiles/PMTiles и формирование тайлов для Tiles. |
 | `pydggsapi` | Доступ к снимку H3 Parquet через DGGS. |
 
@@ -481,12 +502,12 @@ sources:
 
 Можно дописать запись в `providers` полного YAML и применить её вместе с публикацией через `config plan` и `config apply`. Это удобнее, когда экземпляр и публикация добавляются одновременно.
 
-Для отдельного добавления подготовьте [файл интеграции](examples/provider-features.yaml). Пример ниже использует собранный CLI и переменную `platform`, указывающую на полную конфигурацию. Сначала примените черновые изменения в полном YAML или подготовьте копию из действующей версии. Для нового экземпляра выберите свободный ID.
+Для отдельного добавления подготовьте `integration.yaml`. В [примере интеграции](examples/provider-features.yaml) замените `api.protocol: features` и `api.public_root: /features` одним полем `api.protocols: [features]`, чтобы создать корень `/pygeoapi-archive/features`. Команда ниже использует собранный CLI и переменную `platform` с путём к полному YAML. Сначала примените черновые изменения полного YAML или подготовьте копию из действующей версии. Для нового экземпляра выберите свободный ID.
 
 ```sh
 # Добавьте управляемый экземпляр pygeoapi из образа и файла интеграции.
 node dist/cli.js provider add pygeoapi-archive geopython/pygeoapi:0.24.0 \
-  examples/provider-features.yaml "$platform"
+  integration.yaml "$platform"
 ```
 
 Команда сама создаёт и применяет план, а затем записывает секцию `providers.pygeoapi-archive` с digest в полный YAML. В Compose появляется сервис `provider-pygeoapi-archive`. Martin запускается, когда на него ссылается публикация через `provider` либо `tile_provider`. У некоторых адаптеров доступны `environment` и `volumes`. Имена томов привязаны к ID экземпляра.
@@ -515,7 +536,7 @@ node dist/cli.js provider remove pygeoapi-archive "$platform"
 
 ## Публикация данных
 
-Во всех рецептах выполняйте команды из каталога приложения с параметрами своего проекта. `platform` указывает на ваш полный YAML, `public_url` — внешний адрес из плана, например `https://gis.example.org`. Если пример YAML содержит только один сценарий, добавьте нужные записи `postgis_connections`, `sources`, `providers` и `publications` к действующим разделам. При копировании полного примера на другое место исправьте относительные пути.
+Во всех рецептах выполняйте команды из каталога приложения. `platform` указывает на ваш полный YAML. Добавьте нужные записи `postgis_connections`, `sources`, `providers` и `publications` к действующим разделам. При переносе примера YAML исправьте относительные пути.
 
 Для каждого нового рецепта сначала проверьте входные данные, затем выполните общий цикл.
 
@@ -523,14 +544,14 @@ node dist/cli.js provider remove pygeoapi-archive "$platform"
 # Проверьте источники, экземпляры и публикации в YAML.
 node dist/cli.js config validate "$platform"
 # Постройте план и проверьте изменения публикаций и адресов.
-node dist/cli.js config plan "$platform"
+node dist/cli.js config plan "$platform" --json
 # Введите ID проверенного плана.
 read -r -p 'ID проверенного плана: ' plan_id
 # Примените план с изменениями публикаций.
 node dist/cli.js config apply "$plan_id"
 ```
 
-В плане проверьте добавляемые, меняемые и удаляемые публикации, внешний адрес и последствия для персональных разрешений. Подтвердите готовность по ID через `doctor --publication`, затем выполните соответствующий запрос через Caddy.
+В плане проверьте добавляемые, меняемые и удаляемые публикации и последствия для персональных разрешений. В `config plan --json` поле `data.publicUrl` содержит адрес шлюза, а в `data.publications` у каждого `publicationId` есть полный `newUrl`. В командах ниже вводите этот полный адрес без параметров запроса. Он включает корень протокола и ID публикации. После применения проверьте готовность по ID через `doctor --publication <id>` и выполните запрос через Caddy.
 
 ### Объекты через OGC API — Features
 
@@ -539,14 +560,17 @@ node dist/cli.js config apply "$plan_id"
 3. Проверьте каталог, OpenAPI и чтение объектов. `limit` ограничивает число объектов, `bbox` задаёт окно в координатах CRS84.
 
 ```sh
+# Введите полный адрес коллекции places из плана.
+read -r -p 'URL коллекции places: ' collection_url
+features_url="${collection_url%/collections/*}"
 # Получите каталог коллекций Features.
-curl -fsS "$public_url/features/collections?f=json"
+curl -fsS "$features_url/collections?f=json"
 # Получите описание интерфейса Features в OpenAPI.
-curl -fsS "$public_url/features/openapi?f=json"
+curl -fsS "$features_url/openapi?f=json"
 # Запросите один объект из коллекции places.
-curl -fsS "$public_url/features/collections/places/items?f=json&limit=1"
+curl -fsS "$collection_url/items?f=json&limit=1"
 # Отфильтруйте объекты по прямоугольнику bbox.
-curl -fsS "$public_url/features/collections/places/items?f=json&bbox=37,55,38,56"
+curl -fsS "$collection_url/items?f=json&bbox=37,55,38,56"
 ```
 
 | Источник Features | Пространственный фильтр | Временной фильтр | CQL2 |
@@ -559,7 +583,7 @@ curl -fsS "$public_url/features/collections/places/items?f=json&bbox=37,55,38,56
 
 ### Динамическая публикация Features из PostGIS
 
-1. [Подготовьте PostGIS](#подготовить-данные-postgis) и файл с паролем. Ниже дополнения к платформенному YAML. Публикация может использовать тот же экземпляр pygeoapi, который обслуживает файловые коллекции Features.
+1. [Подготовьте PostGIS](#подготовить-данные-postgis) и файл с паролем. Ниже дополнения к платформенному YAML. В `provider` укажите ID существующего экземпляра с Features. В примере это `pygeoapi`, а в стартовом YAML с GeoJSON — `file-features`. Один экземпляр может обслуживать файловые коллекции и PostGIS.
 2. Замените имена схемы, отношения, полей и сервера своими. Если источник не содержит поля времени, опустите `time_field`. Сохраните `extent` в соответствующем данным охвате.
 
 ```yaml
@@ -578,13 +602,10 @@ sources:
     id_field: id
     geometry_field: geom
     max_lag_seconds: 0
-providers:
-  live-features:
-    type: pygeoapi
 publications:
   observations:
     source: observations
-    provider: live-features
+    provider: pygeoapi
     protocol: features
     access: public
     title: Observations
@@ -598,27 +619,32 @@ publications:
 3. Примените полный YAML. Проверьте выдачу данных и, если нужно, временной фильтр. `datetime` принимает момент времени, интервал и открытые границы `..`.
 
 ```sh
+# Введите полный адрес коллекции observations из плана.
+read -r -p 'URL коллекции observations: ' collection_url
 # Проверьте чтение одного объекта из PostGIS через шлюз.
-curl -fsS "$public_url/features/collections/observations/items?f=json&limit=1"
+curl -fsS "$collection_url/items?f=json&limit=1"
 # Запросите объекты начиная с указанного момента времени.
-curl -fsS --get "$public_url/features/collections/observations/items" \
+curl -fsS --get "$collection_url/items" \
   --data-urlencode 'f=json' \
   --data-urlencode 'datetime=2026-01-01T00:00:00Z/..'
 ```
 
-Для CQL2 Text передайте `filter` и `filter-lang=cql2-text`. Для CQL2 JSON отправьте POST на `/features/collections/observations/items?f=json` с `Content-Type: application/json` и выражением в теле запроса. При переходе по ссылке на следующую страницу повторите POST с тем же выражением. Параметры перечислены в `/features/openapi?f=json`.
+Для CQL2 Text передайте `filter` и `filter-lang=cql2-text`. Для CQL2 JSON отправьте POST на `$collection_url/items?f=json&filter-lang=cql2-json` с `Content-Type: application/json` и выражением в теле запроса. При переходе по ссылке на следующую страницу повторите POST с тем же выражением. Параметры перечислены в `/openapi?f=json` под корнем Features.
 
 ### Растровая публикация Maps
 
 1. Подготовьте геопривязанный GeoTIFF или COG. В [примере YAML](examples/maps.yaml) укажите путь, `type: geotiff` либо `type: cog`, EPSG исходного растра и охват. Если `epsg` опущен, используется 4326. Охват должен иметь ненулевую ширину и высоту.
-2. Используйте pygeoapi для `protocol: maps` под `/maps`. При применении CLI проверит формат, геопривязку, CRS и пробное получение PNG.
+2. Укажите экземпляр pygeoapi, у которого настроен протокол `maps`. При применении CLI проверит формат, геопривязку, CRS и пробное получение PNG.
 3. Запросите карту через Caddy. Меняйте `bbox`, `width` и `height` под свой участок.
 
 ```sh
+# Введите полный адрес коллекции terrain из плана.
+read -r -p 'URL коллекции terrain: ' collection_url
+maps_url="${collection_url%/collections/*}"
 # Получите карту заданного охвата и размера и сохраните её в terrain.png.
-curl -fsS "$public_url/maps/collections/terrain/map?bbox=36,54,40,58&width=800&height=600&f=png" -o terrain.png
+curl -fsS "$collection_url/map?bbox=36,54,40,58&width=800&height=600&f=png" -o terrain.png
 # Получите описание интерфейса Maps в OpenAPI.
-curl -fsS "$public_url/maps/openapi?f=json"
+curl -fsS "$maps_url/openapi?f=json"
 ```
 
 Размеры задаются целыми числами от 1 до 2048 пикселей, по умолчанию 500 × 300. Без `bbox` провайдер использует мировой охват. Ошибочные параметры получают HTTP 400 с кодом `InvalidParameterValue`. Фактический охват и CRS возвращаются в `Content-Bbox` и `Content-Crs`. Режим доступа применяется и к метаданным, и к изображению.
@@ -630,8 +656,10 @@ curl -fsS "$public_url/maps/openapi?f=json"
 3. Примените план и запросите TileJSON. Ссылки указывают на тайлы XYZ в Web Mercator через Caddy.
 
 ```sh
+# Введите полный адрес TileJSON публикации observations из плана.
+read -r -p 'URL TileJSON observations: ' tilejson_url
 # Получите TileJSON векторной публикации через шлюз.
-curl -fsS "$public_url/mvt/observations"
+curl -fsS "$tilejson_url"
 ```
 
 В MapLibre укажите этот URL для векторного источника, а `observations` — как `source-layer`. При использовании другого веб-сайта добавьте его origin в `cors.allowed_origins`. Для защищённых публикаций передавайте Bearer-токен запросам этой публикации, её TileJSON, тайлам и ресурсам.
@@ -661,11 +689,11 @@ publications:
 
 В стиле используйте `"url": "./"` для TileJSON той же публикации, `"sprite": "./resources/markers"` для атласа, `"data": "./resources/labels.geojson"` для вспомогательного GeoJSON и `"glyphs": "./resources/fonts/{fontstack}/{range}.pbf"` для шрифтов. Укажите `"text-font": ["MapSans"]` в слое с подписями. Включайте JSON и PNG для каждого разрешения атласа, которое запрашивает клиент.
 
-CLI сохраняет стиль и ресурсы в план и преобразует ссылки в URL шлюза. После изменений подготовьте новый план. При откате выдаются сохранённые файлы выбранной версии. Стиль в примере открывается по `/mvt/observations/style.json`.
+CLI сохраняет стиль и ресурсы в план и преобразует ссылки в URL шлюза. После изменений подготовьте новый план. При откате выдаются сохранённые файлы выбранной версии. Добавьте `/style.json` к `newUrl` публикации из плана. В примере используется экземпляр Martin с префиксом `martin`.
 
 ```js
 // token содержит токен пользователя, полученный вне кода приложения.
-const publication = 'https://gis.example.org/mvt/observations';
+const publication = 'https://gis.example.org/martin/mvt/observations';
 const map = new maplibregl.Map({
   container: 'map',
   style: publication + '/style.json',
@@ -679,27 +707,32 @@ const map = new maplibregl.Map({
 ### Готовые растровые веб-тайлы через Martin
 
 1. Подготовьте MBTiles или PMTiles с готовыми тайлами Web Mercator. В [примере YAML](examples/raster-tiles.yaml) поменяйте пути и охват. Для архивов можно использовать экземпляр Martin, который уже обслуживает публикации из PostGIS.
-2. В полном YAML `protocol: mvt` выбирает прямые маршруты Martin и для растрового архива. В клиенте тип источника и слоя будет `raster`. Примените план. В TileJSON проверьте шаблон URL шлюза `/mvt/aerial/{z}/{x}/{y}`.
+2. В полном YAML `protocol: mvt` выбирает прямые маршруты Martin и для растрового архива. Примените план. В TileJSON проверьте, что шаблон тайла состоит из полного URL публикации и суффикса `/{z}/{x}/{y}`.
 
 ```sh
+# Введите полный адрес TileJSON публикации aerial из плана.
+read -r -p 'URL TileJSON aerial: ' tilejson_url
 # Получите TileJSON растрового архива через шлюз.
-curl -fsS "$public_url/mvt/aerial"
+curl -fsS "$tilejson_url"
 ```
-3. В MapLibre задайте `{type: 'raster', url: 'https://gis.example.org/mvt/aerial', tileSize: 256}` и подставьте реальный размер тайла архива. Проверьте, что клиент получил сами тайлы и отобразил слой.
+3. В MapLibre задайте `type: 'raster'` для источника и слоя, `url` из плана и фактический размер тайла архива в `tileSize`. Проверьте, что клиент получил тайлы и отобразил слой.
 
 ### Векторные тайлы через OGC API — Tiles
 
-1. В [примере YAML](examples/tiles.yaml) укажите свой источник PostGIS и его подключение. `provider` указывает на pygeoapi с корнем `/tiles`, а `tile_provider` — на экземпляр Martin, который строит тайлы.
+1. В [примере YAML](examples/tiles.yaml) укажите свой источник PostGIS и его подключение. `provider` указывает на экземпляр pygeoapi с протоколом `tiles`, а `tile_provider` — на экземпляр Martin, который строит тайлы.
 2. Примените конфигурацию и откройте коллекцию. Перейдите по ссылкам к списку наборов, набору WebMercatorQuad и определению матрицы. В шаблоне URL тайла подставьте номер матрицы, строки и столбца.
 
 ```sh
+# Введите полный адрес коллекции observations из плана.
+read -r -p 'URL коллекции observations: ' collection_url
+tiles_url="${collection_url%/collections/*}"
 # Получите метаданные коллекции Tiles и ссылки на наборы тайлов.
-curl -fsS "$public_url/tiles/collections/observations?f=json"
+curl -fsS "$collection_url?f=json"
 # Получите описание интерфейса Tiles в OpenAPI.
-curl -fsS "$public_url/tiles/openapi?f=json"
+curl -fsS "$tiles_url/openapi?f=json"
 ```
 
-3. Для MapLibre используйте ссылку TileJSON из описания набора и ID публикации как `source-layer`. Хотите ещё прямой URL `/mvt` для тех же данных — создайте отдельную публикацию MVT со своим ID и правами. При недоступном Martin или PostGIS запрос за тайлом может вернуть HTTP 503.
+3. Для MapLibre используйте ссылку TileJSON из описания набора и ID публикации как `source-layer`. Для выдачи тех же данных по прямому URL Martin добавьте публикацию `mvt` со своим ID и правами. При недоступном Martin или PostGIS запрос за тайлом может вернуть HTTP 503.
 
 ### Ячейки H3 из PostGIS
 
@@ -724,19 +757,22 @@ GRANT USAGE ON SCHEMA h3_data TO h3_reader;
 GRANT SELECT ON h3_data.published_observations TO h3_reader;
 ```
 
-Проверьте ID и геометрию. Примените план и откройте `/features/collections/h3-observations/items?f=json&limit=1` и `/mvt/h3-observation-tiles`. Features сохраняет границу объекта целиком. Martin режет геометрию по области тайла с буфером. Отсутствующее значение приходит как `null` в Features и опускается в MVT. Нулевое значение сохраняется в обоих.
+Проверьте ID и геометрию. Примените план и добавьте `/items?f=json&limit=1` к `newUrl` коллекции `h3-observations`. Затем откройте `newUrl` публикации `h3-observation-tiles` для получения TileJSON. Features сохраняет границу объекта целиком. Martin режет геометрию по области тайла с буфером. Отсутствующее значение приходит как `null` в Features и опускается в MVT. Нулевое значение сохраняется в обоих.
 
 ### Ячейки H3 из Parquet через DGGS
 
 1. Подготовьте Parquet с одной строкой на уникальный строковый ID H3 в нижнем регистре. Все ячейки имеют одно разрешение. Файл содержит ровно столбец `id_field` и перечисленные в `properties` столбцы показателей. Для целых значений используйте `BIGINT`, для вещественных — `DOUBLE`. Границы строятся из ID.
-2. Укажите путь, разрешение и охват в [примере YAML](examples/h3-parquet.yaml). Используйте закреплённый pydggsapi 0.4.0 для `linux/amd64`, `protocol: dggs`, оба пути `/dggs` и `readiness: /conformance`. При инициализации DuckDB загружает расширение `httpfs`.
+2. Укажите путь, разрешение и охват в [примере YAML](examples/h3-parquet.yaml). Используйте закреплённый pydggsapi 0.4.0 для `linux/amd64`. Для корня `/pydggsapi/dggs` задайте `api.protocols: [dggs]`, `api.public_prefix: pydggsapi` и `api.base_path: /`, удалив из примера `api.protocol` и `api.public_root`. Оставьте `readiness: /conformance`. При инициализации DuckDB загружает расширение `httpfs`.
 3. Примените конфигурацию. Проверьте каталог, затем получите зоны и показатели. Для запросов к зонам укажите `Accept: */*`. Выберите реальный ID ячейки из свойства `zoneId` в ответе GeoJSON.
 
 ```sh
+# Введите полный адрес коллекции h3-measurements из плана.
+read -r -p 'URL коллекции h3-measurements: ' collection_url
+dggs_url="${collection_url%/collections/*}"
 # Получите каталог коллекций DGGS.
-curl -fsS "$public_url/dggs/collections"
+curl -fsS "$dggs_url/collections"
 # Сохраните адрес зон H3 для выбранной коллекции.
-zones="$public_url/dggs/collections/h3-measurements/dggs/h3/zones"
+zones="$collection_url/dggs/h3/zones"
 # Запросите границы ячеек уровня 7 в указанном прямоугольнике.
 curl -fsS -H 'Accept: */*' \
   "$zones?bbox=12.28,45.41,12.36,45.47&zone-level=7&compact-zones=false&f=geojson&geometry=zone-region"
@@ -748,7 +784,7 @@ curl -fsS -H 'Accept: */*' "$zones/$h3_id"
 curl -fsS -H 'Accept: */*' "$zones/$h3_id/data?zone-depth=0"
 ```
 
-Swagger доступен на `/dggs/docs`, OpenAPI — на `/dggs/openapi`. Ответ `/data` сохраняет ноль и `null`. Для отсутствующей строки возвращается HTTP 204. Точные целые гарантированы в диапазоне от −9007199254740991 до 9007199254740991, дальше pydggsapi может округлить `BIGINT`.
+Swagger доступен по `$dggs_url/docs`, OpenAPI — по `$dggs_url/openapi`. Ответ `/data` сохраняет ноль и `null`. Для отсутствующей строки возвращается HTTP 204. Точные целые гарантированы в диапазоне от −9007199254740991 до 9007199254740991, дальше pydggsapi может округлить `BIGINT`.
 
 `limit` ограничивает число ячеек-кандидатов до их сопоставления со строками Parquet. По умолчанию это 1000. Для широкого охвата увеличьте лимит в допустимых пределах или делите `bbox` на небольшие окна и объединяйте результаты по `zoneId`. Для уровня 7 проверено окно `11.8,45.0,12.9,45.9` с `limit=10000`. [Проверки DGGS](tests/README.md#ячейки-h3-из-parquet)
 
@@ -757,7 +793,7 @@ Swagger доступен на `/dggs/docs`, OpenAPI — на `/dggs/openapi`. О
 ### Снять публикацию и вернуть её
 
 1. Уберите запись публикации из полного YAML. Перед применением найдите её в `removed`, проверьте `routesToClose` и последствия `personalGrants: delete`. После успешного удаления URL возвращает 404. Источник может продолжать использоваться другими публикациями.
-2. Для возврата добавьте прежнюю публикацию обратно либо подготовьте [откат конфигурации](#обновление-и-откат). Прежний ID зарезервирован за тем же источником и протоколом. Для других данных с другой идентичностью или другого протокола выберите новый ID.
+2. Для возврата восстановите прежнюю запись публикации и её источник либо подготовьте [откат конфигурации](#обновление-и-откат). Сохраните ID источника, протокол и прежний путь к файлу или расположение отношения PostGIS. Для другого источника или протокола выберите новый ID публикации.
 3. В случае закрытой публикации после возврата выдайте нужные персональные разрешения заново. Откат YAML использует текущее состояние БД доступа. Например, откат после снятия закрытого слоя возвращает маршрут, но разрешение на него нужно восстановить отдельной командой.
 
 ## Учётные записи и доступ
@@ -799,7 +835,7 @@ auth:
   administrator_emails: [administrator@example.org]
 ```
 
-3. На рабочем сервере используйте `mode: production`. Удалите поле `mailpit_port`, добавьте SMTP-реле. Сохраните `username` и `password_file` вместе для реле с аутентификацией. Для реле без аутентификации опустите оба. Запишите пароль SMTP в отдельный закрытый файл. На порту 587 обычно используется STARTTLS. Для TLS при подключении задайте `secure: true`.
+3. На рабочем сервере используйте `mode: production`. Удалите поле `mailpit_port`, добавьте SMTP-реле. Сохраните `username` и `password_file` вместе для реле с аутентификацией. Для реле без аутентификации опустите оба. Запишите пароль SMTP в отдельный закрытый файл. Платформа требует шифрования SMTP. Для STARTTLS на порту 587 опустите поле `secure`. Для TLS с начала соединения задайте `secure: true`. На порту 465 этот режим включён по умолчанию.
 
 ```yaml
 auth:
@@ -854,7 +890,7 @@ export GIS_ADMIN_CERT_FILE=/opt/gis-platform/operator/operator.pem
 # Укажите закрытый ключ клиентского сертификата.
 export GIS_ADMIN_KEY_FILE=/opt/gis-platform/operator/operator-key.pem
 # Проверьте подключение и разрешение diagnostics.
-node dist/cli.js status --json
+node dist/cli.js doctor --json
 # Проверьте разрешение users-read и получите список учётных записей.
 node dist/cli.js users list --json
 ```
@@ -1065,7 +1101,7 @@ node dist/cli.js backup create pre-update /opt/gis-platform/platform.yaml --json
 ### Пробное восстановление и запуск
 
 1. На отдельной машине или изолированной виртуальной машине разместите ту же версию кода в `/opt/gis-platform` и соберите CLI. Освободите прежние порты и пути для восстановленных файлов. Выполняйте команды из `/opt/gis-platform`. Подключите файл окружения restic и настройте контролируемый доступ к внешнему PostGIS и SMTP.
-2. Извлеките базовый снимок и, при необходимости, снимок с актуальным дампом в разные новые каталоги. Подставьте полный ID из `restic snapshots`. Команда проверяет файлы и отмечает состояние шлюза закрытым.
+2. Извлеките базовый снимок и, при необходимости, снимок с актуальным дампом в разные новые каталоги. Подставьте полный ID из `restic snapshots`. Команда проверяет файлы и отмечает извлечённые версии как закрытые.
 
 ```sh
 # Ограничьте доступ к новым файлам владельцем.
@@ -1087,7 +1123,7 @@ read -r -p 'Полный ID снимка с актуальными правам�
 node dist/cli.js backup extract "$authority_id" /opt/gis-platform/restore/authority --json
 ```
 
-Из первого результата выпишите `data.directory` и `data.originalStateDirectory`, из выбранного снимка с дампом — `data.payload`. `data.payload` — абсолютный путь к служебному комплекту, передаваемому в `backup recover`.
+Из результата извлечения базового снимка выпишите `data.directory` и `data.originalStateDirectory`. Для `backup recover` скопируйте абсолютный `data.payload` из результата извлечения снимка, выбранного для проверки прав. Для `--verified-no-changes` используйте путь из базового снимка, для `--verified-authority` — из более свежего. До конца восстановления сохраните оба каталога извлечения, которые используются в процедуре.
 
 3. Восстановите служебный каталог из `data.directory` по пути `data.originalStateDirectory`. Следующий пример применим, если исходный путь состояния — `/opt/gis-platform/state`.
 
@@ -1104,7 +1140,7 @@ else
 fi
 ```
 
-Если исходный путь занят, проверьте его содержимое перед восстановлением. Верните `platform.yaml`, данные и секреты из `/opt/gis-platform/restore/baseline/opt/gis-platform/` по их исходным путям, сохраняя владельцев и права. Если снимок содержит файлы из других каталогов, восстановите и их по исходным путям. Продолжайте после восстановления состояния и нужных файлов.
+Если исходный путь занят, проверьте его содержимое перед восстановлением. Верните данные и секреты из `/opt/gis-platform/restore/baseline/opt/gis-platform/` по их исходным путям, сохраняя владельцев и права. Верните редактируемый `platform.yaml` из этого же каталога, если передавали его в `backup create`, либо из отдельной копии. Если снимок содержит файлы из других каталогов, восстановите и их по исходным путям. Продолжайте после восстановления состояния и нужных файлов.
 
 4. Выберите новое имя проекта с префиксом `gis-restore-`. Оно должно быть свободно, без прежних контейнеров и томов. Укажите исходный абсолютный путь каталога состояния и loopback.
 
@@ -1183,8 +1219,10 @@ node dist/cli.js status --json
 node dist/cli.js doctor --json
 # Проверьте состояние конкретной публикации places.
 node dist/cli.js doctor --publication places --json
+# Введите полный адрес коллекции из плана действующей версии.
+read -r -p 'URL коллекции places: ' collection_url
 # Посмотрите статус и заголовки ответа шлюза без тела ответа.
-curl -sS -D - -o /dev/null "$public_url/features/collections/places?f=json"
+curl -sS -D - -o /dev/null "$collection_url?f=json"
 ```
 
 | Симптом | Что проверить |
@@ -1192,7 +1230,7 @@ curl -sS -D - -o /dev/null "$public_url/features/collections/places?f=json"
 | Docker недоступен | `docker context show`, запущенный движок и доступ текущей учётной записи. В Windows проверьте Docker Desktop и интеграцию с нужным дистрибутивом WSL. |
 | Запрос не доходит до шлюза | Контейнер Caddy, адрес и порт из плана, привязку интерфейсов, DNS и межсетевой экран. В HTTPS проверьте имя хоста, цепочку и срок сертификата. |
 | HTTP 401 или 403 | Состояние сеанса или токена, режим доступа, подтверждение email и персональное разрешение. Сверьте запись в `users list --json`. |
-| HTTP 404 или коллекция пропала из каталога | Правильный корень протокола и ID, актуальную версию YAML, режим доступа и видимость для текущего клиента. Проверьте `config plan` на удаление. |
+| HTTP 404 или коллекция пропала из каталога | Сверьте полный URL с `data.publications[].newUrl` в плане, включая публичный префикс и протокол. Проверьте ID, действующую версию, режим доступа и видимость для текущего клиента. |
 | HTTP 503 | `closedRoutes` в `status`, готовность экземпляра и источника в `doctor`, журналы Caddy и провайдера. Для PostGIS проверьте доступ к БД из контейнера и прежнюю схему. |
 | CLI не видит действующую версию | Проверьте каталог запуска, `GIS_STATE_DIR` и `COMPOSE_PROJECT_NAME`. Для оператора CLI проверьте порт, УЦ и клиентскую пару. |
 | `config validate` сообщает ошибку | Найдите указанный путь поля в YAML и в `description` схемы. Проверьте имена ID, сочетание протокола, источника и адаптера. Наличие файлов и готовность провайдера проверяются при подготовке и применении плана. |
