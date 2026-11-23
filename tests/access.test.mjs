@@ -103,7 +103,7 @@ test('password change and email recovery revoke all previous sessions', async ()
   assert.ok(await signIn(email, recovered));
 });
 
-const collection = '/features/collections/registered-places';
+const collection = '/pygeoapi/features/collections/registered-places';
 
 function features(path, cookie, headers) {
   return request(path, { headers: { ...headers, ...(cookie && { Cookie: cookie }) } });
@@ -117,21 +117,21 @@ async function document(path, cookie, headers) {
 }
 
 test('the catalog, OpenAPI and related URLs reflect the current session', async () => {
-  const anonymous = await document('/features/collections?f=json');
+  const anonymous = await document('/pygeoapi/features/collections?f=json');
   assert.deepEqual(anonymous.collections.map(({ id }) => id), ['places']);
   const jsonLdUrl = anonymous.links.find(({ type }) => type === 'application/ld+json').href;
   const publicLinkedData = await features(jsonLdUrl);
   assert.equal(publicLinkedData.status, 200);
   assert.match(publicLinkedData.headers.get('content-type'), /^application\/ld\+json/);
-  assert.deepEqual((await publicLinkedData.json()).dataset.map((item) => item['@id']), [`${gateway}/features/collections/places`]);
-  const html = await features('/features/collections?f=html');
+  assert.deepEqual((await publicLinkedData.json()).dataset.map((item) => item['@id']), [`${gateway}/pygeoapi/features/collections/places`]);
+  const html = await features('/pygeoapi/features/collections?f=html');
   assert.match(html.headers.get('content-type'), /^text\/html/);
   assert.doesNotMatch(await html.text(), /registered-places|Registered example/);
-  const openapi = await document('/features/openapi?f=json');
+  const openapi = await document('/pygeoapi/features/openapi?f=json');
   assert.match(openapi.openapi, /^3\.0\./);
   assert.ok(openapi.paths['/collections/places/items']);
   assert.doesNotMatch(JSON.stringify(openapi), /registered-places|Registered example/);
-  assert.equal((await document('/features/collections/places/items/central?f=json', 'gis.session_token=invalid')).id, 'central');
+  assert.equal((await document('/pygeoapi/features/collections/places/items/central?f=json', 'gis.session_token=invalid')).id, 'central');
 
   for (const suffix of ['', '/items', '/items/central', '/schema', '/queryables']) {
     const denied = await features(`${collection}${suffix}?f=json`, 'gis.session_token=invalid');
@@ -145,25 +145,25 @@ test('the catalog, OpenAPI and related URLs reflect the current session', async 
 
   await register('features@example.test', 'features-password-15');
   const cookie = await signIn('features@example.test', 'features-password-15');
-  const catalog = await document('/features/collections?f=json', cookie);
+  const catalog = await document('/pygeoapi/features/collections?f=json', cookie);
   assert.deepEqual(catalog.collections.map(({ id }) => id), ['registered-places', 'places']);
-  const linkedData = await request('/features/collections', { headers: { Accept: 'application/ld+json', Cookie: cookie } });
+  const linkedData = await request('/pygeoapi/features/collections', { headers: { Accept: 'application/ld+json', Cookie: cookie } });
   assert.match(linkedData.headers.get('content-type'), /^application\/ld\+json/);
   assert.deepEqual((await linkedData.json()).dataset.map((item) => item['@id']), [
-    `${gateway}${collection}`, `${gateway}/features/collections/places`,
+    `${gateway}${collection}`, `${gateway}/pygeoapi/features/collections/places`,
   ]);
-  const authenticatedHtml = await features('/features/collections?f=html', cookie);
+  const authenticatedHtml = await features('/pygeoapi/features/collections?f=html', cookie);
   assert.match(await authenticatedHtml.text(), /registered-places/);
-  const api = await document('/features/openapi?f=json', cookie);
+  const api = await document('/pygeoapi/features/openapi?f=json', cookie);
   const operation = api.paths['/collections/registered-places/items'].get;
-  assert.deepEqual(api.servers.map(({ url }) => url), [`${gateway}/features`]);
+  assert.deepEqual(api.servers.map(({ url }) => url), [`${gateway}/pygeoapi/features`]);
   assert.ok(operation.responses['401'].headers['WWW-Authenticate']);
   assert.ok(operation.responses['503']);
   assert.equal(api.components.securitySchemes.session.in, 'cookie');
   assert.deepEqual(operation.security, [{ session: [] }, { bearer: [] }]);
   assert.equal(api.paths['/collections/places/items'].get.security, undefined);
   for (const id of ['places', 'registered-places']) {
-    const itemsPage = await features(`/features/collections/${id}/items?f=html`, cookie);
+    const itemsPage = await features(`/pygeoapi/features/collections/${id}/items?f=html`, cookie);
     assert.equal(itemsPage.status, 200);
     assert.match(itemsPage.headers.get('content-security-policy'), /script-src 'none'/);
     await itemsPage.body?.cancel();
@@ -202,7 +202,7 @@ test('blocking a confirmed account takes effect on the next request with its exi
   assert.equal((await denied.json()).code, 'Forbidden');
   assert.equal(await session(cookie), null);
   assert.equal((await auth('sign-in/email', { email, password })).status, 403);
-  assert.deepEqual((await document('/features/collections?f=json', cookie)).collections.map(({ id }) => id), ['places']);
+  assert.deepEqual((await document('/pygeoapi/features/collections?f=json', cookie)).collections.map(({ id }) => id), ['places']);
 });
 
 test('account and session are preserved when PostgreSQL and access containers are recreated', async () => {
@@ -227,7 +227,7 @@ test('access and PostgreSQL outages return Features 503 and leave public data av
   for (const component of ['access', 'postgres']) {
     compose('stop', component);
     try {
-      for (const path of [`${collection}/items?f=json`, '/features/collections?f=json', '/features/openapi?f=json']) {
+      for (const path of [`${collection}/items?f=json`, '/pygeoapi/features/collections?f=json', '/pygeoapi/features/openapi?f=json']) {
         const response = await features(path, cookie);
         assert.equal(response.status, 503, `${component}: ${path}`);
         assert.equal(response.headers.get('cache-control'), 'no-store');
@@ -239,7 +239,7 @@ test('access and PostgreSQL outages return Features 503 and leave public data av
       const login = await auth('sign-in/email', { email, password });
       assert.equal(login.status, 503);
       assert.equal((await login.json()).code, 'ServiceUnavailable');
-      assert.equal((await document('/features/collections/places/items/central?f=json')).id, 'central');
+      assert.equal((await document('/pygeoapi/features/collections/places/items/central?f=json')).id, 'central');
     } finally {
       compose('up', '-d', '--no-deps', '--wait', component);
     }
@@ -277,7 +277,7 @@ test('TLS rejects invalid certificate material before opening or closing routes'
   const closedRedirect = process.env.GIS_TEST_EMPTY_REDIRECT_PORT;
   const empty = { ...process.env, GIS_STATE_DIR: join(dirname(filename), 'empty-tls-state'),
     COMPOSE_PROJECT_NAME: `${process.env.COMPOSE_PROJECT_NAME}-empty-tls`, GIS_HTTP_REDIRECT_PORT: closedRedirect };
-  const ready = '/features/collections/places?f=json';
+  const ready = '/pygeoapi/features/collections/places?f=json';
   for (const [name, yaml, reason] of [
     ['missing', httpsYaml(current, 'missing-cert.pem'), /TLS.*file/i],
     ['malformed', httpsYaml(current, 'places.geojson'), /TLS certificate.*PEM/i],
@@ -358,13 +358,13 @@ test('the public HTTPS address is independent of the gateway port', async (t) =>
   assert.equal(diagnostics.tls.state, 'ready');
 
   forwarding = true;
-  const collectionUrl = `${publicOrigin}/features/collections/places`;
+  const collectionUrl = `${publicOrigin}/pygeoapi/features/collections/places`;
   const metadata = await document(`${collectionUrl}?f=json`, undefined, { Connection: 'close' });
   const items = metadata.links.find(({ rel, type }) => rel === 'items' && type === 'application/geo+json');
   assert.equal(items?.href, `${collectionUrl}/items?f=json`);
   assert.equal((await document(items.href, undefined, { Connection: 'close' })).type, 'FeatureCollection');
-  const openApi = await document(`${publicOrigin}/features/openapi?f=json`, undefined, { Connection: 'close' });
-  assert.equal(openApi.servers[0].url, `${publicOrigin}/features`);
+  const openApi = await document(`${publicOrigin}/pygeoapi/features/openapi?f=json`, undefined, { Connection: 'close' });
+  assert.equal(openApi.servers[0].url, `${publicOrigin}/pygeoapi/features`);
 });
 
 test('HTTPS serves the account flow with a Secure session cookie', async () => {
@@ -404,8 +404,8 @@ test('HTTPS serves the account flow with a Secure session cookie', async () => {
   for (const attribute of [/; Secure\b/i, /; HttpOnly\b/i, /; SameSite=Lax\b/i]) assert.match(setCookie, attribute);
   const cookie = cookieFrom(login);
   assert.equal((await document(`${origin}${collection}/items/central?f=json`, cookie)).id, 'central');
-  const api = await document(`${origin}/features/openapi?f=json`, cookie);
-  assert.equal(api.servers[0].url, `${origin}/features`);
+  const api = await document(`${origin}/pygeoapi/features/openapi?f=json`, cookie);
+  assert.equal(api.servers[0].url, `${origin}/pygeoapi/features`);
   assert.equal(api.components.securitySchemes.session.name, '__Secure-gis.session_token');
   const metadata = await document(`${origin}${collection}?f=json`, cookie, {
     Forwarded: 'host=other.test;proto=http', 'X-Forwarded-Host': 'other.test',
@@ -468,6 +468,6 @@ test('HTTPS serves the account flow with a Secure session cookie', async () => {
   assert.match(httpCookie, /^gis\.session_token=/);
   const cookieHeader = httpLogin.headers.getSetCookie().find((value) => value.startsWith('gis.session_token='));
   assert.doesNotMatch(cookieHeader, /; Secure\b/i);
-  assert.equal((await document('/features/openapi?f=json', httpCookie)).servers[0].url, `${gateway}/features`);
+  assert.equal((await document('/pygeoapi/features/openapi?f=json', httpCookie)).servers[0].url, `${gateway}/pygeoapi/features`);
   assert.equal(cliResult(['doctor']).data.tls, undefined);
 });

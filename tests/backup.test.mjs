@@ -45,9 +45,9 @@ const project = process.env.COMPOSE_PROJECT_NAME;
 const state = process.env.GIS_STATE_DIR;
 const fixture = process.env.GIS_TEST_RESULTS;
 const config = process.env.GIS_TEST_CONFIG;
-const privateItems = '/features/collections/private-places/items/central?f=json';
-const publicItems = '/features/collections/places/items/central?f=json';
-const registeredItems = '/features/collections/registered-places/items/central?f=json';
+const privateItems = '/pygeoapi/features/collections/private-places/items/central?f=json';
+const publicItems = '/pygeoapi/features/collections/places/items/central?f=json';
+const registeredItems = '/pygeoapi/features/collections/registered-places/items/central?f=json';
 const password = 'backup-test-password';
 
 const docker = (...args) => command('docker', args);

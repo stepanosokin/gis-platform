@@ -167,19 +167,19 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
   await writeFile(filename, stringify(draft));
   let { planId: confirmed } = cli('plan', filename);
   cli('apply', confirmed);
-  const collection = '/features/collections/observations';
+  const collection = '/pygeoapi/features/collections/observations';
   const items = collection + '/items?f=json';
   const ids = ({ features }) => features.map(({ id }) => id);
-  const archive = '/features/collections/archive/items?f=json';
+  const archive = '/pygeoapi/features/collections/archive/items?f=json';
   const file = '/features/collections/file/items?f=json';
   let registeredReader;
   await t.test('one pygeoapi instance reads two databases and exposes only explicit sources', async () => {
-    const catalog = await request('/features/collections?f=json');
-    assert.deepEqual(catalog.collections.map(({ id }) => id).sort(), ['archive', 'file', 'observations']);
+    const catalog = await request('/pygeoapi/features/collections?f=json');
+    assert.deepEqual(catalog.collections.map(({ id }) => id).sort(), ['archive', 'observations']);
     assert.deepEqual(ids(await request(archive)), ['alternate']);
     assert.deepEqual(ids(await request(items)), []);
     assert.equal(ids(await request(file)).length, 3);
-    await request('/features/collections/unlisted/items?f=json', 404);
+    await request('/pygeoapi/features/collections/unlisted/items?f=json', 404);
   });
   await t.test('read-only view reflects INSERT, UPDATE and DELETE after COMMIT at the same URL', async () => {
     assert.deepEqual((await request(items)).features, []);
@@ -228,7 +228,7 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     assert.equal((await request(items + '&filter-lang=cql2-text&filter=invalid', 400)).code, 'InvalidParameterValue');
     const queryables = await request(collection + '/queryables?f=json');
     assert.equal(queryables.properties.label.type, 'string');
-    const api = await request('/features/openapi?f=json');
+    const api = await request('/pygeoapi/features/openapi?f=json');
     const operations = api.paths['/collections/observations/items'];
     assert.ok(operations.get.parameters.some((parameter) => parameter.$ref?.endsWith('/parameters/datetime')));
     assert.ok(operations.get.parameters.some((parameter) => parameter.name === 'filter'));
@@ -236,10 +236,11 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
       parameter.name === 'filter-lang' && parameter.schema.enum.includes('cql2-text')));
     assert.ok(operations.post.requestBody.content['application/json']);
     assert.ok(!api.paths['/collections/archive/items'].get.parameters.some((parameter) => parameter.$ref?.endsWith('/parameters/datetime')));
-    assert.equal(api.paths['/collections/file/items'].post, undefined);
+    assert.equal(api.paths['/collections/file/items'], undefined);
+    assert.equal((await request('/features/openapi?f=json')).paths['/collections/file/items'].post, undefined);
   });
   await t.test('CQL2 JSON follows publication access and the OpenAPI describes the protected operation', async () => {
-    const path = '/features/collections/registered/items?f=json';
+    const path = '/pygeoapi/features/collections/registered/items?f=json';
     const filter = { method: 'POST', headers: { 'Content-Type': 'application/json; charset=UTF-8' },
       body: JSON.stringify({ op: '=', args: [{ property: 'label' }, 'Other'] }) };
     await request(path, 401, filter);
@@ -248,7 +249,7 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     await register(email, password);
     registeredReader = { headers: { Cookie: await signIn(email, password) } };
     assert.deepEqual(ids(await request(path, 200, { ...filter, headers: { ...filter.headers, ...registeredReader.headers } })), ['middle']);
-    const api = await request('/features/openapi?f=json', 200, registeredReader);
+    const api = await request('/pygeoapi/features/openapi?f=json', 200, registeredReader);
     assert.deepEqual(api.paths['/collections/registered/items'].post.security, [{ session: [] }, { bearer: [] }]);
   });
   await t.test('loss of read access is reported as unavailable and other publications can still read', async () => {
@@ -264,9 +265,9 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     assert.deepEqual(ids(await request(items)), ['early', 'late', 'middle']);
   });
   await t.test('a cold start serves saved OpenAPI and recovers from an offline database without apply', async () => {
-    const openapi = '/features/openapi?f=json';
+    const openapi = '/pygeoapi/features/openapi?f=json';
     const before = await request(openapi);
-    const item = '/features/collections/archive/items/alternate?f=json';
+    const item = '/pygeoapi/features/collections/archive/items/alternate?f=json';
     const existing = await request(item);
     const containers = docker('ps', '-q', '--filter', `label=com.docker.compose.project=${project}`).split(/\s+/);
     assert.ok(containers.length > 1);
@@ -293,7 +294,7 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
     assert.equal(cli('apply', confirmed).currentVersion, confirmed);
   });
   await t.test('catalog and doctor distinguish a source outage from an instance or gateway outage', async () => {
-    const catalog = '/features/collections?f=json';
+    const catalog = '/pygeoapi/features/collections?f=json';
     const item = collection + '/items/early?f=json';
     const caddy = docker('ps', '-q', '--filter', `label=com.docker.compose.project=${project}`,
       '--filter', 'label=com.docker.compose.service=caddy');
@@ -318,7 +319,7 @@ test('dynamic PostGIS publications through the gateway', async (t) => {
       assert.ok(!anonymous.some(({ id }) => id === 'registered'));
       const admitted = (await request(catalog, 200, registeredReader)).collections;
       assert.equal(admitted.find(({ id }) => id === 'registered').status, 'unavailable');
-      assert.match((await request('/features/openapi?f=json', 200, registeredReader)).openapi, /^3\.0\./);
+      assert.match((await request('/pygeoapi/features/openapi?f=json', 200, registeredReader)).openapi, /^3\.0\./);
       const error = await request(item, 503);
       assert.deepEqual(error, { code: 'ServiceUnavailable' });
       doctor('ready', 'ready', 'unavailable');

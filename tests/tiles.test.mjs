@@ -338,13 +338,14 @@ test('one pygeoapi serves nested Features, Maps and Tiles with separate catalogs
   }
   const legacy = structuredClone(config);
   const renderer = 'provider-martin';
-  const combined = 'provider-pygeoapi';
+  const combined = 'built-in-pygeoapi';
   const grids = 'provider-pydggsapi';
   legacy.sources.places = { type: 'geojson', path: 'places.geojson' };
   legacy.sources.terrain = { type: 'geotiff', path: 'map-control.tif', epsg: 4326 };
   legacy.sources.cells = { type: 'parquet', path: 'sparse-v1.parquet', id_field: 'h3_id', resolution: 7,
     properties: ['tally', 'metric'] };
-  legacy.providers.features = { type: 'pygeoapi' };
+  legacy.providers.features = { ...legacy.providers.tiles,
+    api: { ...legacy.providers.tiles.api, protocol: 'features', public_root: '/features' } };
   legacy.providers.maps = { ...legacy.providers.tiles,
     api: { ...legacy.providers.tiles.api, protocol: 'maps', public_root: '/maps' } };
   legacy.providers[grids] = { type: 'pydggsapi', image: dggsImage,
@@ -388,8 +389,7 @@ test('one pygeoapi serves nested Features, Maps and Tiles with separate catalogs
 
   const nested = structuredClone(legacy);
   const archive = 'provider-pygeoapi-archive';
-  nested.providers[combined] = { ...legacy.providers.tiles, api: { ...api, protocols: ['features', 'maps', 'tiles'],
-    public_prefix: 'pygeoapi', port: 80, base_path: '/', readiness: '/openapi' } };
+  nested.providers[combined] = { type: 'pygeoapi' };
   nested.providers[archive] = { ...legacy.providers.tiles, api: { ...api, protocols: ['features'],
     port: 80, base_path: '/', readiness: '/openapi' } };
   nested.providers[renderer] = { ...legacy.providers.martin, api: { ...api, protocols: ['mvt'], public_prefix: 'martin',
@@ -421,9 +421,12 @@ test('one pygeoapi serves nested Features, Maps and Tiles with separate catalogs
   const containers = docker('ps', '-q', '--filter', `label=com.docker.compose.project=${project}`)
     .split(/\r?\n/).filter(Boolean);
   const services = JSON.parse(docker('inspect', ...containers));
-  const providers = services.filter(({ Config }) => Config.Labels['com.docker.compose.service'].startsWith('provider-'));
+  const providers = services.filter(({ Config }) => {
+    const service = Config.Labels['com.docker.compose.service'];
+    return service === 'pygeoapi' || service.startsWith('provider-');
+  });
   assert.deepEqual(providers.map(({ Config }) => Config.Labels['com.docker.compose.service']).sort(),
-    [combined, archive, renderer, grids].sort());
+    ['pygeoapi', 'provider-features', archive, renderer, grids].sort());
   for (const container of providers) assert.deepEqual(container.HostConfig.PortBindings ?? {}, {});
   const featuresRoot = '/pygeoapi/features';
   const mapsRoot = '/pygeoapi/maps';

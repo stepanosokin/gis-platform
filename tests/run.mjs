@@ -77,7 +77,7 @@ async function runHttpTests() {
   const plan = cli('plan', ['plan', file]).data;
   assert.deepEqual(plan.added, ['places']);
   const publicUrl = `http://localhost:${port}`;
-  assert.equal(plan.newUrl, `${publicUrl}/features/collections/places`);
+  assert.equal(plan.newUrl, `${publicUrl}/pygeoapi/features/collections/places`);
 
   try {
     assert.equal(cli('apply', ['apply', plan.planId]).code, 'OK');

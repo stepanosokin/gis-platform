@@ -12,6 +12,7 @@ const run = promisify(execFile);
 const file = process.env.GIS_TEST_CONFIG;
 const gateway = process.env.GIS_TEST_PUBLIC_URL;
 const project = process.env.COMPOSE_PROJECT_NAME;
+const builtInFeatures = '/pygeoapi/features';
 const base = 'geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a';
 const registryImage = 'registry:3@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c';
 
@@ -61,7 +62,7 @@ async function applyConfig(config) {
   return plan.data;
 }
 
-test('explicit provider prefixes move only their own publications off a shared flat root', async (t) => {
+test('explicit provider prefixes isolate publications moved from the built-in instance', async (t) => {
   const original = await readFile(file, 'utf8');
   t.after(() => writeFile(file, original));
   const config = parse(original);
@@ -69,7 +70,7 @@ test('explicit provider prefixes move only their own publications off a shared f
   assert.equal(previous.code, 'OK', previous.data.message);
   const legacy = config.publications.places;
   config.providers['provider-pygeoapi'] = { type: 'pygeoapi', image: base,
-    api: { protocols: ['features', 'maps', 'tiles'], public_prefix: 'pygeoapi', scheme: 'http',
+    api: { protocols: ['features', 'maps', 'tiles'], public_prefix: 'combined', scheme: 'http',
       port: 80, base_path: '/', links: 'canonical', readiness: '/openapi' } };
   config.providers['provider-pygeoapi-archive'] = { type: 'pygeoapi', image: base,
     api: { ...config.providers['provider-pygeoapi'].api, protocols: ['features'] } };
@@ -79,24 +80,24 @@ test('explicit provider prefixes move only their own publications off a shared f
   config.publications['archive-places'] = { ...legacy, provider: 'provider-pygeoapi-archive' };
   const plan = await applyConfig(config);
   const moved = plan.publications.find(({ publicationId }) => publicationId === 'places');
-  assert.equal(moved.previousUrl, gateway + '/features/collections/places');
-  assert.equal(moved.newUrl, gateway + '/pygeoapi/features/collections/places');
+  assert.equal(moved.previousUrl, gateway + builtInFeatures + '/collections/places');
+  assert.equal(moved.newUrl, gateway + '/combined/features/collections/places');
   assert.equal(moved.personalGrants, 'preserve');
   const [instance] = JSON.parse(await docker('inspect', `${project}-provider-pygeoapi-1`));
   assert.ok(instance.State.Running);
   assert.deepEqual(instance.HostConfig.PortBindings ?? {}, {});
-  const data = await (await get('/pygeoapi/features/collections/places/items?f=json&limit=1')).json();
+  const data = await (await get('/combined/features/collections/places/items?f=json&limit=1')).json();
   assert.equal(data.features.length, 1);
   const next = data.links.find(({ rel }) => rel === 'next').href;
-  assert.equal(next.startsWith(gateway + '/pygeoapi/features/collections/places/items?'), true);
+  assert.equal(next.startsWith(gateway + '/combined/features/collections/places/items?'), true);
   assert.equal((await (await get(next.slice(gateway.length))).json()).features.length, 1);
   await get('/provider-pygeoapi-archive/features/collections/archive-places/items?f=json');
-  await get('/features/collections/other-places/items?f=json');
-  await get('/features/collections/places/items?f=json', 404);
-  await get('/pygeoapi/maps/collections/places/items?f=json', 404);
+  await get(builtInFeatures + '/collections/other-places/items?f=json');
+  await get(builtInFeatures + '/collections/places/items?f=json', 404);
+  await get('/combined/maps/collections/places/items?f=json', 404);
   await get('/provider-pygeoapi-archive/features/collections/places/items?f=json', 404);
-  for (const [root, ids] of [['/pygeoapi/features', ['places']], ['/pygeoapi/maps', []],
-    ['/pygeoapi/tiles', []], ['/features', ['other-places']]]) {
+  for (const [root, ids] of [['/combined/features', ['places']], ['/combined/maps', []],
+    ['/combined/tiles', []], [builtInFeatures, ['other-places']]]) {
     const catalog = await (await get(`${root}/collections?f=json`)).json();
     assert.deepEqual(catalog.collections.map(({ id }) => id), ids);
     const openapi = await (await get(`${root}/openapi?f=json`)).json();
@@ -109,8 +110,8 @@ test('explicit provider prefixes move only their own publications off a shared f
   assert.equal(rollback.code, 'OK', rollback.data.message);
   const restored = await cli('config', 'apply', rollback.data.planId);
   assert.equal(restored.code, 'OK', restored.data.message);
-  await get('/features/collections/places/items?f=json');
-  await get('/pygeoapi/features/collections/places/items?f=json', 404);
+  await get(builtInFeatures + '/collections/places/items?f=json');
+  await get('/combined/features/collections/places/items?f=json', 404);
 });
 
 test('adding a provider persists its Compose service and serves Features through Caddy', async () => {
@@ -137,10 +138,11 @@ test('adding a provider persists its Compose service and serves Features through
   assert.ok(collection.links.some(({ href }) => href === gateway + '/features/collections/extra/items?f=json'));
   assert.equal((await (await get('/features/collections/extra/items?f=json')).json()).features.length, 3);
   const catalog = await (await get('/features/collections?f=json')).json();
-  assert.deepEqual(catalog.collections.map(({ id }) => id).sort(), ['extra', 'places']);
+  assert.deepEqual(catalog.collections.map(({ id }) => id), ['extra']);
   const api = await (await get('/features/openapi?f=json')).json();
   assert.ok(api.paths['/collections/extra/items']);
-  assert.ok(api.paths['/collections/places/items']);
+  assert.ok(!api.paths['/collections/places/items']);
+  assert.ok((await (await get(builtInFeatures + '/openapi?f=json')).json()).paths['/collections/places/items']);
   await get('/features/admin', 404);
 });
 
@@ -157,25 +159,29 @@ test('provider validation rejects unknown instances, unsupported APIs, and overl
     assert.match(result.data.message, message);
   };
   await validate({ ...config, publications: { places: { ...publication, provider: 'unknown' } } }, /unknown provider/);
-  await validate({ ...config, publications: { places: { ...publication, protocol: 'tiles' } } }, /protocol/);
+  await validate({ ...config, publications: { places: { ...publication, protocol: 'tiles' } } }, /Tiles requires/);
   await validate({ ...config, providers: { ...config.providers,
+    flat: managed,
     nested: { ...managed, api: { ...managed.api, public_root: '/features/collections' } } } }, /Ambiguous public root/);
 
   const { protocol, public_root, ...http } = managed.api;
-  const nested = { ...managed, api: { ...http, protocols: ['features', 'maps'], public_prefix: 'pygeoapi' } };
+  const nested = { ...managed, api: { ...http, protocols: ['features', 'maps'], public_prefix: 'combined' } };
   for (const [changes, message] of [
     [{ protocols: [] }, /protocols.*fewer than 1/],
     [{ protocols: ['features', 'features'] }, /protocols.*duplicate/],
     [{ protocols: ['mvt'] }, /unsupported by its pygeoapi adapter/],
     [{ protocol, public_root }, /must match exactly one schema/],
     [{ public_prefix: 'account' }, /reserved public prefix/],
+    [{ public_prefix: 'pygeoapi' }, /built-in pygeoapi/],
   ]) await validate({ ...config, providers: { ...config.providers, nested: { ...nested, api: { ...nested.api, ...changes } } } }, message);
   await validate({ ...config, publications: { places: { ...publication, provider: 'nested', protocol: 'tiles' } },
     providers: { ...config.providers, nested } }, /protocol unsupported by provider 'nested'/);
-  await validate({ ...config, providers: { ...config.providers, nested, pygeoapi: { ...nested,
+  await validate({ ...config, providers: { ...config.providers, nested, combined: { ...nested,
     api: { ...http, protocols: ['tiles'] } } } }, /Duplicate public prefix/);
   await validate({ ...config, providers: { ...config.providers, nested,
-    legacy: { ...managed, api: { ...managed.api, public_root: '/pygeoapi/old' } } } }, /overlaps an instance prefix/);
+    legacy: { ...managed, api: { ...managed.api, public_root: '/combined/old' } } } }, /overlaps an instance prefix/);
+  await validate({ ...config, providers: { ...config.providers,
+    legacy: { ...managed, api: { ...managed.api, public_root: '/pygeoapi/old' } } } }, /overlaps built-in pygeoapi/);
 });
 
 async function createRegistry(t) {
@@ -218,11 +224,11 @@ test('updating a provider pulls both a new tag and a new digest under one tag, t
   config.publications.places.provider = 'updatable';
   const moved = await applyConfig(config);
   assert.deepEqual(moved.publications.find(({ publicationId }) => publicationId === 'places'), {
-    publicationId: 'places', previousUrl: `${gateway}/features/collections/places`,
+    publicationId: 'places', previousUrl: `${gateway}${builtInFeatures}/collections/places`,
     newUrl: `${gateway}/new-features/collections/places`, previousAccess: 'public',
     newAccess: 'public', personalGrants: 'preserve',
   });
-  await get('/features/collections/places/items?f=json', 404);
+  await get(builtInFeatures + '/collections/places/items?f=json', 404);
   const path = '/new-features/collections/places/items?f=json';
   assert.equal((await (await get(path)).json()).features.length, 3);
   const firstDetails = await service('updatable');
@@ -303,6 +309,6 @@ test('updating a provider pulls both a new tag and a new digest under one tag, t
   assert.equal(await service('updatable'), null);
   assert.equal(parse(await readFile(file, 'utf8')).providers.updatable, undefined);
   assert.ok(await docker('volume', 'inspect', volume));
-  await get('/features/collections/places/items?f=json');
+  await get(builtInFeatures + '/collections/places/items?f=json');
   await get(path, 404);
 });

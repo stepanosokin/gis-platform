@@ -176,7 +176,7 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
         .filter(([id]) => canRead(publications, id, reader)).flatMap(([, classes]) => classes)])].sort();
     }
     if (representation === 'html') return res.send(page(`${title} conformance`,
-      `<ul>${conformsTo.map((uri) => `<li>${escapeHtml(uri)}</li>`).join('')}</ul>`));
+      `<ul>${conformsTo.map((uri) => `<li>${escapeHtml(uri)}</li>`).join('')}</ul>`, false, root));
     res.json({ conformsTo });
   });
   app.use([`${root}/openapi`, `${root}/collections`], (_req, res, next) => {
@@ -221,7 +221,7 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
       const rows = catalog.collections.map(({ id, title, description, status }) =>
         `<li><a href="${root}/collections/${encodeURIComponent(id)}?f=html">${escapeHtml(title)}</a>` +
         `${status === 'unavailable' ? ' <span>Unavailable</span>' : ''}${description ? `<p>${escapeHtml(description)}</p>` : ''}</li>`);
-      return res.send(page(`${title} collections`, rows.length ? `<ul>${rows.join('')}</ul>` : '<p>No collections available.</p>'));
+      return res.send(page(`${title} collections`, rows.length ? `<ul>${rows.join('')}</ul>` : '<p>No collections available.</p>', false, root));
     }
     res.json(catalog);
   });
@@ -234,7 +234,7 @@ function mountRoot(app: Express, modes: Record<string, Publication['access']>, c
     if (representation === 'yaml') return res.type('application/yaml').send(stringify(api));
     if (representation === 'html') {
       return res.send(page(`${title} OpenAPI`, `<p><a href="${root}/openapi?f=json">OpenAPI JSON</a></p>` +
-        `<pre>${escapeHtml(JSON.stringify(api, null, 2))}</pre>`));
+        `<pre>${escapeHtml(JSON.stringify(api, null, 2))}</pre>`, false, root));
     }
     res.type(`application/vnd.oai.openapi+json;version=${api.openapi?.startsWith('3.1.') ? '3.1' : '3.0'}`).json(api);
   });

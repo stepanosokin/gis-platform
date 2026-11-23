@@ -1,4 +1,5 @@
 import type { Express } from 'express';
+import { escapeHtml } from './platform-landing.js';
 
 const emailField = '<label>Email<input name="email" type="email" autocomplete="email" required></label>';
 const passwordField = (name: string, label: string, autocomplete: string) =>
@@ -9,7 +10,8 @@ function form(endpoint: string, fields: string, button: string) {
   return `<form method="post" action="/api/auth/${endpoint}">${fields}<button>${button}</button></form>`;
 }
 
-export function page(title: string, content: string, script = false) {
+export function page(title: string, content: string, script = false, serviceRoot = '/features') {
+  const serviceLabel = serviceRoot.endsWith('/features') ? 'Features' : 'Service';
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title} | GIS Platform</title>
@@ -22,12 +24,12 @@ export function page(title: string, content: string, script = false) {
   button{justify-self:start;color:white;background:#245344;border-color:#245344;cursor:pointer}
   [role=status]{min-height:1.5em}
 </style></head>
-<body><main><nav aria-label="Platform"><a href="/features">Features</a><a href="/account/login">Sign in</a><a href="/account/register">Register</a><a href="/account/profile">Profile</a></nav>
+<body><main><nav aria-label="Platform"><a href="${escapeHtml(serviceRoot)}">${serviceLabel}</a><a href="/account/login">Sign in</a><a href="/account/register">Register</a><a href="/account/profile">Profile</a></nav>
 <h1>${title}</h1>${content}${script ? '<p role="status" aria-live="polite"></p><noscript>Enable JavaScript to submit this form.</noscript><script type="module" src="/account/form.js"></script>' : ''}
 </main></body></html>`;
 }
 
-const formScript = `
+const formScript = (featuresRoot: string) => `
 const status = document.querySelector('[role=status]');
 const profile = document.querySelector('form[action="/api/auth/update-user"]');
 if (profile) {
@@ -55,7 +57,7 @@ for (const form of document.querySelectorAll('form')) form.addEventListener('sub
       status.textContent = error.message || 'Request failed. Try again.';
       return;
     }
-    if (form.action.endsWith('/sign-in/email')) location.assign('/features/collections');
+    if (form.action.endsWith('/sign-in/email')) location.assign(${JSON.stringify(`${featuresRoot}/collections`)});
     else if (form.action.endsWith('/update-user')) status.textContent = 'Display name updated.';
     else if (form.action.endsWith('/sign-out')) location.assign('/account/login');
     else if (form.action.endsWith('/change-password')) location.assign('/account/profile');
@@ -152,41 +154,42 @@ form.addEventListener('submit', async (event) => {
 refresh().catch((error) => { status.textContent = error.message; });
 `;
 
-export function mountAccountPages(app: Express) {
+export function mountAccountPages(app: Express, featuresRoot = '/features') {
+  const render = (title: string, content: string, script = false) => page(title, content, script, featuresRoot);
   app.use('/account', (_req, res, next) => {
     res.set('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
     res.set('Referrer-Policy', 'no-referrer');
     next();
   });
   app.get('/account', (_req, res) => res.redirect('/account/login'));
-  app.get('/account/register', (_req, res) => res.send(page('Register', form('sign-up/email',
+  app.get('/account/register', (_req, res) => res.send(render('Register', form('sign-up/email',
     nameField + emailField + passwordField('password', 'Password', 'new-password'), 'Create account'), true)));
-  app.get('/account/login', (_req, res) => res.send(page('Sign in', form('sign-in/email',
+  app.get('/account/login', (_req, res) => res.send(render('Sign in', form('sign-in/email',
     emailField + passwordField('password', 'Password', 'current-password'), 'Sign in') +
     '<p><a href="/account/forgot-password">Forgot password?</a></p>', true)));
-  app.get('/account/check-email', (_req, res) => res.send(page('Check your email',
+  app.get('/account/check-email', (_req, res) => res.send(render('Check your email',
     '<p>If the address is eligible, we sent a link to confirm it.</p>')));
   app.get('/account/verified', (req, res) => res.send(req.query.error
-    ? page('Verification failed', '<p>Sign in to request a fresh verification link.</p>')
-    : page('Email is verified', '<p><a href="/account/login">Sign in to continue</a>.</p>')));
-  app.get('/account/profile', (_req, res) => res.send(page('Profile',
+    ? render('Verification failed', '<p>Sign in to request a fresh verification link.</p>')
+    : render('Email is verified', '<p><a href="/account/login">Sign in to continue</a>.</p>')));
+  app.get('/account/profile', (_req, res) => res.send(render('Profile',
     '<p id="profile-email"></p>' + form('update-user', nameField, 'Save name') +
     '<p><a href="/account/change-password">Change password</a> · <a href="/account/tokens">Personal tokens</a></p>' +
     form('sign-out', '', 'Sign out'), true)));
-  app.get('/account/tokens', (_req, res) => res.send(page('Personal tokens',
+  app.get('/account/tokens', (_req, res) => res.send(render('Personal tokens',
     form('tokens/create', '<label>Token name<input name="name" maxlength="120" required></label>', 'Create token') +
     '<p id="issued-token" hidden>Copy this secret now. It is shown once. <label>Token secret<input readonly></label></p>' +
     '<p role="status" aria-live="polite"></p><ul id="token-list"></ul>' +
     '<script type="module" src="/account/tokens.js"></script>')));
   app.get('/account/tokens.js', (_req, res) => res.type('js').send(tokenScript));
-  app.get('/account/change-password', (_req, res) => res.send(page('Change password', form('change-password',
+  app.get('/account/change-password', (_req, res) => res.send(render('Change password', form('change-password',
     passwordField('currentPassword', 'Current password', 'current-password') +
     passwordField('newPassword', 'New password', 'new-password'), 'Change password'), true)));
-  app.get('/account/forgot-password', (_req, res) => res.send(page('Reset your password',
+  app.get('/account/forgot-password', (_req, res) => res.send(render('Reset your password',
     form('request-password-reset', emailField, 'Send reset link'), true)));
   app.get('/account/reset-password', (req, res) => res.send(typeof req.query.token === 'string' && req.query.token
-    ? page('Choose a new password', form('reset-password',
+    ? render('Choose a new password', form('reset-password',
       passwordField('newPassword', 'New password', 'new-password'), 'Save password'), true)
-    : page('Reset link required', '<p><a href="/account/forgot-password">Request a password reset link</a>.</p>')));
-  app.get('/account/form.js', (_req, res) => res.type('js').send(formScript));
+    : render('Reset link required', '<p><a href="/account/forgot-password">Request a password reset link</a>.</p>')));
+  app.get('/account/form.js', (_req, res) => res.type('js').send(formScript(featuresRoot)));
 }

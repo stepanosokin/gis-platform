@@ -11,7 +11,7 @@ import { setTimeout } from 'node:timers/promises';
 import { checkServerIdentity, createSecureContext, TLSSocket } from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { landingFor, landingPage, landingPolicy } from './platform-landing.js';
+import { landingFor, landingPage, landingPolicy, providerPage } from './platform-landing.js';
 import { parse, stringify } from 'yaml';
 import { mapBboxDescription, mapRelation, mapSize } from './maps-profile.js';
 import { checkTileJson, martinConfig, martinService, runMartin, tileArchivePath } from './martin-profile.js';
@@ -22,7 +22,7 @@ import { dggsConfig, dggsDataRoute, dggsFiles, dggsRelation, dggsRoutes, dggsSer
   dggsSnapshotPath, dggsZoneParameters, runDggs } from './dggs-profile.js';
 import { healthUrl, publicationChecks, publicationHealth } from './publication-health.js';
 import { GatewayTlsError, gatewayTlsFiles, gatewayTlsProbe, inspectGatewayTls } from './gateway-tls.js';
-import { builtInProviderId, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService, pinnedImage,
+import { builtInProviderId, builtInProviderRoot, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService, pinnedImage,
   postgisConnectionsForProvider, postgisSecretName, postgisSource,
   providerBasePath, providerProtocols, providerRoot, providerRouteOwner, providerRoutes, providerServiceName as serviceName, publicationEntries, publicationRoot, publicationsForProvider,
   publicationUrl, crs84, rasterFile, tileArchive, usedFileSources, vectorFile, type FeaturesConfig, type FileSource, type Publication } from './config.js';
@@ -270,6 +270,20 @@ http://:80 {
 		}
 	}
 ` : '';
+  const staticPage = (matcher: string, paths: string, filename: string) => `
+	@${matcher} {
+		method GET HEAD
+		path ${paths}
+	}
+	handle @${matcher} {
+		header Cache-Control no-store
+		header Content-Security-Policy "${landingPolicy}"
+		header X-Content-Type-Options nosniff
+		root /etc/caddy/gis
+		rewrite * /${filename}
+		file_server
+	}
+`;
   const home = `${config.auth ? `
 	@personalHome {
 		method GET HEAD
@@ -281,22 +295,12 @@ http://:80 {
 			import gis_public_headers
 		}
 	}
-` : ''}
-	@home {
-		method GET HEAD
-		path /
-	}
-	handle @home {
-		header Cache-Control no-store
-		header Content-Security-Policy "${landingPolicy}"
-		header X-Content-Type-Options nosniff
-		root /etc/caddy/gis
-		rewrite * /platform-landing.html
-		file_server
-	}
-`;
+` : ''}${staticPage('home', '/', 'platform-landing.html')}`;
+  const instanceRoot = builtInProviderRoot(config);
+  const instancePage = instanceRoot
+    ? staticPage('builtInProvider', `${instanceRoot} ${instanceRoot}/`, 'built-in-provider.html') : '';
   const managed = config.providers && managedGatewayRoutes(config, collectionRoute, featuresHtmlPolicy);
-  const routes = managed ? `${home}${accounts}\n${managed.routes}
+  const routes = managed ? `${home}${accounts}${instancePage}\n${managed.routes}
 	handle {
 		header Cache-Control no-store
 		respond 404
@@ -457,7 +461,7 @@ function managedGatewayRoutes(config: FeaturesConfig,
     for (const id of ids) {
       const providerEntries = entries.filter(([, entry]) => entry.provider === id);
       const instance = config.providers?.[id];
-      const api = instance?.image ? instance.api : undefined;
+      const api = instance?.api;
       const maps = protocol === 'maps';
       const mapPath = `${root}/collections/*/map`;
       const mapRequest = maps ? `forward_auth ${mapPath} metadata:3000 {
@@ -752,7 +756,8 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
       : { host: auth.smtp.host, port: auth.smtp.port, from: auth.smtp.from,
         secure: auth.smtp.secure, username: auth.smtp.username };
     await writeFile(join(revisionDirectory, 'access.json'), JSON.stringify({
-      origin: new URL(config.publicUrl).origin, production: auth.mode === 'production', smtp,
+      origin: new URL(config.publicUrl).origin, featuresRoot: new URL(config.publicUrl).pathname,
+      production: auth.mode === 'production', smtp,
       landing,
       publications: Object.fromEntries(publicationEntries(config).map(([id, { access }]) => [id, access])),
       publicationTitles: Object.fromEntries(publicationEntries(config).map(([id, { title }]) => [id, title])),
@@ -787,6 +792,8 @@ export async function prepareFeaturesStack({ config, directory: revisionDirector
   const providerConfig = JSON.stringify(pygeoapiConfig(config), null, 2);
   await writeFile(join(revisionDirectory, 'pygeoapi.yml'), providerConfig);
   await writeFile(join(revisionDirectory, 'platform-landing.html'), landingPage(landing));
+  const builtIn = landing.providers.find(({ url }) => url);
+  if (builtIn) await writeFile(join(revisionDirectory, 'built-in-provider.html'), providerPage(builtIn));
   await writeFile(join(revisionDirectory, 'Caddyfile'), caddyConfig(config));
   if (config.providers) {
     await reuseManagedArtifacts(config, revisionDirectory, previous,
@@ -895,7 +902,7 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
     }
     const protocols = providerProtocols(provider);
     const tiles = protocols.includes('tiles');
-    const nested = Boolean(provider.image && provider.api.protocols);
+    const nested = Boolean(provider.api?.protocols);
     const pluginEnvironment = connection || vectorFiles || tiles || nested ? {
       PYTHONPATH: '/etc/pygeoapi/gis' + (provider.image && provider.environment?.PYTHONPATH
         ? `:${escapeCompose(provider.environment.PYTHONPATH)}` : ''),
@@ -912,9 +919,18 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
     if (nested) {
       await copyFile(fileURLToPath(new URL('../src/gis_pygeoapi.py', import.meta.url)), join(native, 'gis_pygeoapi.py'));
     }
+    const profiles = nested ? Object.fromEntries(protocols.map((protocol) => [protocol, {
+      url: new URL(providerRoot(config, id, protocol), config.publicUrl).href,
+      name: apiNames[protocol],
+      collections: publicationEntries(config).filter(([, publication]) =>
+        publication.provider === id && publication.protocol === protocol).map(([key]) => key),
+    }])) : undefined;
+    const environment = { ...pluginEnvironment, ...(profiles && { GIS_PYGEOAPI_PROTOCOLS: JSON.stringify(profiles) }) };
+    const command = ['--workers', '1', '--worker-class', 'gevent', '--timeout', '6000',
+      '--bind', `0.0.0.0:${provider.api?.port ?? 80}`, nested ? 'gis_pygeoapi:APP' : 'pygeoapi.flask_app:APP'];
     if (!provider.image) {
-      if (connection || files.length) services[service] = {
-        environment: pluginEnvironment, volumes: fileMounts, secrets: connection,
+      if (connection || files.length || nested) services[service] = {
+        environment, volumes: fileMounts, secrets: connection, ...(nested && { command }),
         ...(files.some(([, file]) => file.type === 'geoparquet') && {
           image: parquetImage,
           build: { context: '.', dockerfile: 'Dockerfile.pygeoapi' },
@@ -924,12 +940,6 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
     }
     const { port, scheme, base_path: base, readiness } = provider.api;
     await writeFile(join(native, 'pygeoapi.yml'), JSON.stringify(pygeoapiConfig(config, id)));
-    const profiles = Object.fromEntries(protocols.map((protocol) => [protocol, {
-      url: new URL(providerRoot(config, id, protocol), config.publicUrl).href,
-      name: apiNames[protocol],
-      collections: publicationEntries(config).filter(([, publication]) =>
-        publication.provider === id && publication.protocol === protocol).map(([key]) => key),
-    }]));
     const namedVolumes = Object.entries(provider.volumes ?? {}).map(([name, target]) => {
       const volume = `provider-${id}_${name}`;
       volumes[volume] = {};
@@ -942,13 +952,11 @@ async function writeProviderCompose(config: FeaturesConfig, directory: string,
         ...Object.fromEntries(Object.entries(provider.environment ?? {}).map(([name, value]) => [name, escapeCompose(value)])),
         PYGEOAPI_CONFIG: '/etc/pygeoapi/gis/pygeoapi.yml',
         PYGEOAPI_OPENAPI: '/etc/pygeoapi/gis/openapi.json',
-        ...(nested && { GIS_PYGEOAPI_PROTOCOLS: JSON.stringify(profiles) }),
-        ...pluginEnvironment,
+        ...environment,
         ...(base !== '/' && { SCRIPT_NAME: base }),
       },
       entrypoint: ['/venv/bin/gunicorn'],
-      command: ['--workers', '1', '--worker-class', 'gevent', '--timeout', '6000',
-        '--bind', `0.0.0.0:${port}`, nested ? 'gis_pygeoapi:APP' : 'pygeoapi.flask_app:APP'],
+      command,
       volumes: [
         { type: 'bind', source: escapeCompose(await nativeProviderDirectory(directory, service)), target: '/etc/pygeoapi/gis', read_only: true,
           bind: { create_host_path: false } },
@@ -1254,7 +1262,7 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
     for (const protocol of protocols) {
       const publicRoot = providerRoot(config, id, protocol);
       const publicUrl = new URL(publicRoot, config.publicUrl).href;
-      const scoped = instance?.image && instance.api.protocols ? protocolOpenApi(api, publicUrl, protocol,
+      const scoped = instance?.api?.protocols ? protocolOpenApi(api, publicUrl, protocol,
         new Set(publications.filter(([, publication]) => publication.protocol === protocol).map(([key]) => key))) : api;
       const shared = documents[publicRoot];
       if (shared) {
@@ -1681,7 +1689,7 @@ export async function startFeaturesStack(revision: Revision, confirmed?: Revisio
         let tileJsonUrl = url;
         if (config.providers && access !== 'public') {
           const instance = config.providers[provider];
-          const api = instance?.image ? instance.api : undefined;
+          const api = instance?.api;
           const base = providerBasePath(config, provider);
           const nativeOrigin = `http://${serviceName(config, provider)}:${api?.port ?? 80}`;
           body = await internal(`${base}${mvt ? `/${id}` : `/collections/${id}${dggs ? '' : '?f=json'}`}`, 200, nativeOrigin,

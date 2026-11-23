@@ -570,7 +570,7 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
     cli('config', 'apply', remove.planId);
     assert.equal(martinContainer(), '');
     await request('/mvt/observations', 404);
-    await request('/features/collections/control?f=json');
+    await request('/pygeoapi/features/collections/control?f=json');
     const rollback = cli('config', 'plan', '--rollback-to', plan.planId);
     cli('config', 'apply', rollback.planId);
     assert.equal((await features('/mvt/observations/1/1/0', 'observations'))[0].properties.id, 'row-1');
@@ -673,7 +673,7 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
   await t.test('confirmed Martin routes recover after a cold start with PostGIS offline', async () => {
     const tile = '/mvt/observations/1/1/0';
     const file = '/mvt/file-tile/0/0/0';
-    const openapi = '/features/openapi?f=json';
+    const openapi = '/pygeoapi/features/openapi?f=json';
     const before = await (await request(openapi)).json();
     const containers = docker('ps', '-q', '--filter', `label=com.docker.compose.project=${project}`).split(/\s+/);
     assert.ok(containers.length > 1);
@@ -717,7 +717,7 @@ test('Martin publishes explicit PostGIS sources through canonical gateway URLs',
     }));
     const update = cli('config', 'plan', filename);
     cli('config', 'apply', update.planId);
-    const control = '/features/collections/control?f=json';
+    const control = '/pygeoapi/features/collections/control?f=json';
     const response = await request(control).catch(async (error) => {
       // Docker Desktop can reset the first connection after replacing Caddy.
       if (error.cause?.code !== 'ECONNRESET') throw error;

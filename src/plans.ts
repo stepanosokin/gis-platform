@@ -3,7 +3,7 @@ import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/
 import { createServer } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { builtInProviderId, configuredProviders, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService,
+import { builtInProviderId, builtInProviderRoot, configuredProviders, hasGeoJson, hasProtocolMetadata, managedProviderRuns, needsMetadataService,
   postgisConnectionsForProvider, postgisSource, publicationEntries, publicationUrl, providerRoutes, providerServiceName,
   fileSource, serializeFeaturesConfig, usedFileSources, vectorFile, type FeaturesConfig, type Publication } from './config.js';
 import { pinProviderImages } from './provider-images.js';
@@ -264,7 +264,9 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
   const previous = new Map(current ? publicationEntries(current) : []);
   const next = new Map(publicationEntries(config));
   const fileChanged = changedSource || current?.sourcePath !== config.sourcePath;
-  const platformChanged = current?.publicUrl !== config.publicUrl ||
+  const previousPublicUrl = current ? new URL(current.publicUrl).origin : null;
+  const publicUrl = new URL(config.publicUrl).origin;
+  const platformChanged = previousPublicUrl !== publicUrl ||
     JSON.stringify(current?.auth) !== JSON.stringify(config.auth) || JSON.stringify(current?.tls) !== JSON.stringify(config.tls) ||
     currentPlan?.tlsFingerprint !== tlsFingerprint ||
     JSON.stringify(current?.cors) !== JSON.stringify(config.cors);
@@ -280,6 +282,8 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
       personalGrants: !after ? 'delete' : before ? 'preserve' : 'none',
     };
   });
+  const changedUrls = new Set(outcomes.filter(({ previousUrl, newUrl }) => previousUrl !== newUrl)
+    .map(({ publicationId }) => publicationId));
   const changedProviders = new Set([...Object.keys(current?.providers ?? {}), ...Object.keys(config.providers ?? {})]
     .filter((id) => (current && providerServiceName(current, id) !== providerServiceName(config, id)) ||
       JSON.stringify(current?.providers?.[id]?.image ? current.providers[id] : null) !==
@@ -303,7 +307,7 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     targetVersion,
     added: [...next.keys()].filter((id) => !previous.has(id)),
     changed: [...next].filter(([id, publication]) => previous.has(id) &&
-      (platformChanged || mapLibreChanged(id, publication) || changedProviders.has(publication.provider) ||
+      (platformChanged || changedUrls.has(id) || mapLibreChanged(id, publication) || changedProviders.has(publication.provider) ||
        (publication.tile_provider !== undefined && changedProviders.has(publication.tile_provider)) ||
        changedFiles.has(publication.source) ||
        JSON.stringify(current && fileSource(current, publication.source)) !== JSON.stringify(fileSource(config, publication.source)) ||
@@ -313,8 +317,8 @@ export async function createPlan(config: FeaturesConfig, yaml?: string,
     removed: [...previous.keys()].filter((id) => !next.has(id)),
     previousUrl,
     newUrl,
-    previousPublicUrl: current ? new URL(current.publicUrl).origin : null,
-    publicUrl: new URL(config.publicUrl).origin,
+    previousPublicUrl,
+    publicUrl,
     publications: outcomes,
     postgisConnections: changesById(current?.postgisConnections, config.postgisConnections),
     providers: changesById(current ? configuredProviders(current) : {}, configuredProviders(config)),
@@ -415,16 +419,20 @@ async function restoreStack(state: ActiveState, candidate: Plan, current: Plan |
 
 function affectedRoutes(candidate: FeaturesConfig, current: FeaturesConfig | null) {
   const versions = current ? [current, candidate] : [candidate];
-  return [...new Set(versions.flatMap((config) => [
-    config.publicUrl,
-    `${config.publicUrl}/collections`,
-    `${config.publicUrl}/openapi`,
-    ...[...providerRoutes(config)].filter(([, route]) => hasProtocolMetadata(route))
-      .flatMap(([root, { protocol }]) => ['', protocol === 'mvt' ? '/catalog' : '/collections', '/openapi', '/conformance']
-        .map((suffix) => new URL(root + suffix, config.publicUrl).href)),
-    ...publicationEntries(config).map(([id, publication]) => publicationUrl(config, id, publication)),
-    ...(config.auth ? ['/account', '/api/auth'].map((path) => new URL(path, config.publicUrl).href) : []),
-  ]))];
+  return [...new Set(versions.flatMap((config) => {
+    const instanceRoot = builtInProviderRoot(config);
+    return [
+      ...(instanceRoot ? [new URL(instanceRoot, config.publicUrl).href] : []),
+      config.publicUrl,
+      `${config.publicUrl}/collections`,
+      `${config.publicUrl}/openapi`,
+      ...[...providerRoutes(config)].filter(([, route]) => hasProtocolMetadata(route))
+        .flatMap(([root, { protocol }]) => ['', protocol === 'mvt' ? '/catalog' : '/collections', '/openapi', '/conformance']
+          .map((suffix) => new URL(root + suffix, config.publicUrl).href)),
+      ...publicationEntries(config).map(([id, publication]) => publicationUrl(config, id, publication)),
+      ...(config.auth ? ['/account', '/api/auth'].map((path) => new URL(path, config.publicUrl).href) : []),
+    ];
+  }))];
 }
 
 async function openConfirmedVersion(state: ActiveState, candidate: Plan) {

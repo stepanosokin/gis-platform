@@ -98,7 +98,7 @@ test('prepared H3 observations use the standard Features and Martin gateway rout
   assert.equal(cli('validate', filename).code, 'OK');
   assert.equal(cli('apply', cli('plan', filename).data.planId).code, 'OK');
 
-  const collection = '/features/collections/h3-observations';
+  const collection = '/pygeoapi/features/collections/h3-observations';
   const items = `${collection}/items`;
   const data = async (query = '', options) => (await get(`${items}?f=json${query}`, 200, options)).json();
   const item = async (id) => (await get(`${items}/${id}?f=json`)).json();
@@ -142,7 +142,7 @@ test('prepared H3 observations use the standard Features and Martin gateway rout
   await t.test('Features advertises and serves CRS, linked metadata and filters', async () => {
     const crs84 = 'http://www.opengis.net/def/crs/OGC/1.3/CRS84';
     const epsg = (code) => `http://www.opengis.net/def/crs/EPSG/0/${code}`;
-    const catalog = await (await get('/features/collections?f=json')).json();
+    const catalog = await (await get('/pygeoapi/features/collections?f=json')).json();
     const metadataLink = catalog.collections.find(({ id }) => id === 'h3-observations').links
       .find(({ rel, type }) => rel === 'self' && type === 'application/json');
     const metadata = await (await get(metadataLink.href)).json();
@@ -153,7 +153,7 @@ test('prepared H3 observations use the standard Features and Martin gateway rout
     const queryables = await (await get(queryablesLink.href)).json();
     assert.equal(queryables.properties.h3_id.type, 'string');
     assert.equal(queryables.properties.measurement.type, 'integer');
-    const api = await (await get('/features/openapi?f=json')).json();
+    const api = await (await get('/pygeoapi/features/openapi?f=json')).json();
     const operation = api.paths['/collections/h3-observations/items'];
     assert.ok(operation.get.parameters.some(({ name }) => name === 'filter-lang'));
     assert.ok(operation.post.requestBody.content['application/json']);

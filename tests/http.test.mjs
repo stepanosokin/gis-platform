@@ -4,7 +4,8 @@ import { test } from 'node:test';
 
 const gateway = process.env.GIS_TEST_GATEWAY;
 const canonical = process.env.GIS_TEST_PUBLIC_URL;
-const collection = '/features/collections/places';
+const featuresRoot = '/pygeoapi/features';
+const collection = `${featuresRoot}/collections/places`;
 
 async function get(path) {
   const url = new URL(path, gateway);
@@ -35,20 +36,39 @@ test('the applied public deployment has a home page with active links and no sig
   assert.match(response.headers.get('content-type'), /^text\/html/);
   assert.equal(response.headers.get('cache-control'), 'no-store');
   const html = await response.text();
-  assert.ok(html.includes(`href="${canonical}/features/collections/places"`));
-  assert.ok(html.includes(`href="${canonical}/features?f=html"`));
+  assert.ok(html.includes(`href="${canonical}${collection}"`));
   assert.doesNotMatch(html, /\/account\/(login|register)/);
   assert.equal((await get('/platform-landing.html')).status, 404);
 });
 
+test('the applied built-in pygeoapi has an instance page and separate protocol roots', async () => {
+  const home = await get('/');
+  assert.equal(home.status, 200);
+  assert.ok((await home.text()).includes(`href="${canonical}/pygeoapi"`));
+
+  const instance = await get('/pygeoapi');
+  assert.equal(instance.status, 200);
+  assert.match(instance.headers.get('content-type'), /^text\/html/);
+  const html = await instance.text();
+  for (const protocol of ['features', 'maps', 'tiles']) {
+    const root = `/pygeoapi/${protocol}`;
+    assert.ok(html.includes(`href="${canonical}${root}?f=html"`), protocol);
+    const catalog = await getJson(`${root}/collections?f=json`);
+    assert.deepEqual(catalog.collections.map(({ id }) => id), protocol === 'features' ? ['places'] : []);
+  }
+  const feature = await getJson(`${collection}/items/central?f=json`);
+  assert.equal(feature.id, 'central');
+  assert.equal((await get('/features/collections/places/items/central?f=json')).status, 404);
+});
+
 test('the public catalog and OpenAPI 3.0 use the external Features URL', async () => {
-  const landing = await getJson('/features?f=json');
+  const landing = await getJson(`${featuresRoot}?f=json`);
   const advertised = landing.links.find(({ rel, type }) => rel === 'service-desc' && type.includes('json'));
   const openApi = new URL(advertised.href);
   assert.equal(openApi.origin, canonical);
-  assert.equal(openApi.pathname, '/features/openapi');
+  assert.equal(openApi.pathname, `${featuresRoot}/openapi`);
 
-  const catalog = await getJson('/features/collections?f=json');
+  const catalog = await getJson(`${featuresRoot}/collections?f=json`);
   assert.deepEqual(catalog.collections.map(({ id }) => id), ['places']);
   const details = await getJson(`${collection}?f=json`);
   const items = new URL(details.links.find(({ rel }) => rel === 'items').href);
@@ -64,7 +84,7 @@ test('the public catalog and OpenAPI 3.0 use the external Features URL', async (
 
   const api = await getJson(openApi.pathname + openApi.search);
   assert.match(api.openapi, /^3\.0\./);
-  assert.deepEqual(api.servers.map(({ url }) => url), [`${canonical}/features`]);
+  assert.deepEqual(api.servers.map(({ url }) => url), [`${canonical}${featuresRoot}`]);
   assert.ok(api.paths['/collections/places/items']);
 
   const html = new URL(details.links.find(({ rel, type }) => rel === 'items' && type === 'text/html').href);
@@ -108,10 +128,10 @@ test('a bbox query returns the feature that intersects the given bounds', async 
 
 test('Caddy closes undeclared collections and internal routes', async () => {
   for (const path of [
-    '/features/collections/unlisted/items',
+    `${featuresRoot}/collections/unlisted/items`,
     '/collections/places/items',
-    '/features/asyncapi',
-    '/features/admin',
+    `${featuresRoot}/asyncapi`,
+    `${featuresRoot}/admin`,
   ]) {
     const response = await get(path);
     assert.equal(response.status, 404, path);

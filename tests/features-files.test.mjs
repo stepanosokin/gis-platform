@@ -52,7 +52,7 @@ providers:`) + yaml().split('  places:\n')[1].replace('source: package', 'source
     .replace(/^    source:/, '  shape-places:\n    source:');
 }
 
-async function get(path, params = {}, status = 200, root = '/features') {
+async function get(path, params = {}, status = 200, root = '/pygeoapi/features') {
   const url = new URL(root + path, gateway);
   url.search = new URLSearchParams({ f: 'json', ...params });
   const response = await fetch(url, { headers: { Connection: 'close' }, signal: AbortSignal.timeout(10_000) });

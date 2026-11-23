@@ -178,7 +178,7 @@ auth:
   writeFileSync(join(dirname(filename), 'places.geojson'), readFileSync('examples/places.geojson'));
   const plan = apply(config);
   assert.ok(plan.services.includes('pygeoapi') && plan.services.includes('provider-maps'), JSON.stringify(plan));
-  await (await get('/features/collections/places/items', { f: 'json' })).json();
+  await (await get('/pygeoapi/features/collections/places/items', { f: 'json' })).json();
   const query = { bbox: '10.25,20.25,13.75,23.75', width: 128, height: 64 };
   const catalog = async (headers) => (await (await get('/maps/collections', { f: 'json' }, 200, headers)).json())
     .collections.map(({ id }) => id);
@@ -214,7 +214,7 @@ auth:
   assert.equal(revoke.status, 0, JSON.stringify(revoke.result));
   await get(privatePath + '/map', query, 403, bearer);
   measureGateway('maps-features', [
-    { path: '/features/collections/places/items?f=json', features: 3 },
+    { path: '/pygeoapi/features/collections/places/items?f=json', features: 3 },
     { path: `${mapPath}?bbox=10,20,14,24&width=500&height=300`, png: [500, 300] },
     { path: `${mapPath}?bbox=10,20,14,24&width=2048&height=2048`, png: [2048, 2048] },
   ], origin);

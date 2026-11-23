@@ -25,6 +25,7 @@ import { authorizePersonalToken, listPersonalTokens, preparePersonalTokens, publ
 
 interface Settings {
   origin: string;
+  featuresRoot?: string;
   production: boolean;
   smtp: { host: string; port: number; from: string; secure?: boolean; username?: string };
   publications: Record<string, Publication['access']>;
@@ -156,7 +157,7 @@ app.use((_req, res, next) => {
   res.set('X-Content-Type-Options', 'nosniff');
   next();
 });
-mountAccountPages(app);
+mountAccountPages(app, settings.featuresRoot);
 const authHandler = toNodeHandler(auth);
 async function readSession(req: Request) {
   return auth.api.getSession({ headers: fromNodeHeaders(req.headers), query: { disableRefresh: true } });

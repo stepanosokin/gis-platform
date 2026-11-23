@@ -21,11 +21,11 @@ node dist/cli.js config plan examples/features.yaml
 Передайте выведенный ID плана в `node dist/cli.js config apply <plan-id>`. После успешного применения проверьте ответы через шлюз.
 
 ```sh
-curl -fsS 'http://localhost:8080/features/collections?f=json'
-curl -fsS 'http://localhost:8080/features/openapi?f=json'
-curl -fsS 'http://localhost:8080/features/collections/places/items?f=json&limit=1'
-curl -fsS 'http://localhost:8080/features/collections/places/items/central?f=json'
-curl -fsS 'http://localhost:8080/features/collections/places/items?f=json&bbox=37,55,38,56'
+curl -fsS 'http://localhost:8080/pygeoapi/features/collections?f=json'
+curl -fsS 'http://localhost:8080/pygeoapi/features/openapi?f=json'
+curl -fsS 'http://localhost:8080/pygeoapi/features/collections/places/items?f=json&limit=1'
+curl -fsS 'http://localhost:8080/pygeoapi/features/collections/places/items/central?f=json'
+curl -fsS 'http://localhost:8080/pygeoapi/features/collections/places/items?f=json&bbox=37,55,38,56'
 ```
 
 Путь к GeoJSON задаётся относительно YAML или абсолютным путём. Используйте `FeatureCollection` хотя бы с одним объектом и уникальным строковым `id` у каждого объекта. Для локального примера Caddy слушает loopback, а pygeoapi читает только смонтированный файл. После редактирования YAML создайте и примените новый план. [GeoPackage, Shapefile, GeoParquet и настройка CRS](ADMIN.md#файлы-и-системы-координат-features)
@@ -65,7 +65,7 @@ server:
 
 ## Экземпляры сервис-провайдеров и адреса
 
-Для управляемого экземпляра укажите поддерживаемые протоколы в `api.protocols`. Шлюз создаёт отдельный корень для каждого протокола. Например, один экземпляр pygeoapi может обслуживать `/pygeoapi/features`, `/pygeoapi/maps` и `/pygeoapi/tiles`. По умолчанию публичный префикс совпадает с ID экземпляра, а `api.public_prefix` позволяет задать его отдельно. [Настройка экземпляров и переход на вложенные адреса](ADMIN.md#управление-сервис-провайдерами)
+Встроенный pygeoapi сразу предоставляет страницу `/pygeoapi` и корни `/pygeoapi/features`, `/pygeoapi/maps` и `/pygeoapi/tiles`. Для экземпляра с собственным образом перечислите протоколы в `api.protocols`. По умолчанию публичный префикс такого экземпляра совпадает с его ID. Поле `api.public_prefix` позволяет задать его отдельно. [Настройка экземпляров и переход на вложенные адреса](ADMIN.md#управление-сервис-провайдерами)
 
 ## Растровая публикация
 
@@ -98,7 +98,7 @@ openssl rand -hex 32 > .gis-platform/auth-secret
 openssl rand -hex 32 > .gis-platform/postgres-password
 ```
 
-Откройте `/account/register` по адресу платформы. Письма доступны в Mailpit на `http://localhost:8025`. После подтверждения email войдите через `/account/login`. Каталог `/features/collections` покажет доступные публикации. В `/account/profile` можно изменить отображаемое имя и перейти к смене пароля. Адреса email хранятся в нижнем регистре. Точки и `+` остаются частью адреса.
+Откройте `/account/register` по адресу платформы. Письма доступны в Mailpit на `http://localhost:8025`. После подтверждения email войдите через `/account/login`. Каталог `/pygeoapi/features/collections` покажет доступные публикации встроенного экземпляра. В `/account/profile` можно изменить отображаемое имя и перейти к смене пароля. Адреса email хранятся в нижнем регистре. Точки и `+` остаются частью адреса.
 
 Учётные записи, сеансы, персональные разрешения и хеши персональных токенов хранятся в именованном томе Compose `accounts`. При обновлении стека используйте прежние имя проекта и файлы секретов, чтобы сохранить эти данные.
 
@@ -118,7 +118,7 @@ openssl rand -hex 32 > .gis-platform/postgres-password
 ### Персональный токен для QGIS
 
 1. Войдите в платформу по паролю. В профиле откройте **Personal tokens** (`/account/tokens`), назовите токен, например `QGIS`, и создайте его. Скопируйте секрет, пока он показан на странице.
-2. В QGIS откройте подключение **WFS / OGC API – Features** и укажите корень протокола Features. В локальном примере это `http://localhost:8080/features`, а для экземпляра с публичным префиксом `pygeoapi` и вложенными адресами — `http://localhost:8080/pygeoapi/features`.
+2. В QGIS откройте подключение **WFS / OGC API – Features** и укажите корень протокола Features. Для встроенного pygeoapi в локальном примере это `http://localhost:8080/pygeoapi/features`.
 3. Создайте конфигурацию аутентификации **API Header**. Введите имя заголовка `Authorization` и значение `Bearer <секрет>` с пробелом после `Bearer`. Сохраните конфигурацию и выберите её в подключении. Нажмите **Подключиться** и выберите доступную публикацию.
 
 Токен использует текущие права вашей учётной записи. Допущенный запрос к публикации продлевает срок токена на 90 дней. Отдельный токен можно отозвать на той же странице. Смена или восстановление пароля отзывает все токены и прежние веб-сеансы. [Задача #17](https://github.com/stepanosokin/gis-platform/issues/17)

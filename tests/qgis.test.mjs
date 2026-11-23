@@ -19,7 +19,7 @@ async function checkDiscovery(header, getValue) {
 
   const file = join(process.env.GIS_TEST_RESULTS, 'qgis-session.json');
   const script = new URL('qgis-discovery.py', import.meta.url);
-  const fixture = { url: `${process.env.GIS_TEST_PUBLIC_URL}/features`, header, value: await getValue(await signIn(email, password)) };
+  const fixture = { url: `${process.env.GIS_TEST_PUBLIC_URL}/pygeoapi/features`, header, value: await getValue(await signIn(email, password)) };
   await writeFile(file, JSON.stringify(fixture), { mode: 0o600 });
   try {
     const source = JSON.stringify(fileURLToPath(script));

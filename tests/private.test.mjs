@@ -11,9 +11,9 @@ import { parse, stringify } from 'yaml';
 import { auth, cookieFrom, emailLink, register, request, session, signIn } from './access-client.mjs';
 
 const gateway = process.env.GIS_TEST_PUBLIC_URL;
-const privateCollection = '/features/collections/private-places';
+const privateCollection = '/pygeoapi/features/collections/private-places';
 const items = `${privateCollection}/items/central?f=json`;
-const publicItems = '/features/collections/places/items/central?f=json';
+const publicItems = '/pygeoapi/features/collections/places/items/central?f=json';
 const password = 'private-password-16';
 
 test('a signed-in user can create a named token and read a private publication with Bearer', async () => {
@@ -103,22 +103,22 @@ test('Bearer expiry moves on admission and current grants govern data and metada
   const extended = (await tokens(cookie)).find((token) => token.id === id).expiresAt;
   assert.ok(Date.parse(extended) > Date.parse(expiresAt));
   assert.ok(Math.abs(Date.parse(extended) - Date.now() - 90 * day) < 5000);
-  const catalog = await request('/features/collections?f=json', bearer(secret));
+  const catalog = await request('/pygeoapi/features/collections?f=json', bearer(secret));
   assert.deepEqual((await catalog.json()).collections.map(({ id }) => id),
     ['registered-places', 'places', 'private-places']);
-  const api = await request('/features/openapi?f=json', bearer(secret));
+  const api = await request('/pygeoapi/features/openapi?f=json', bearer(secret));
   const openapi = await api.json();
   assert.deepEqual(openapi.paths['/collections/private-places/items'].get.security, [{ session: [] }, { bearer: [] }]);
   assert.deepEqual(openapi.components.securitySchemes.bearer, { type: 'http', scheme: 'bearer' });
   assert.equal(openapi.paths['/collections/other-private/items'], undefined);
   // The linked catalog is filtered by the same rights as collection data.
-  const linkedCatalog = await request('/features/collections?f=jsonld', bearer(secret));
+  const linkedCatalog = await request('/pygeoapi/features/collections?f=jsonld', bearer(secret));
   assert.equal(linkedCatalog.status, 200);
   assert.deepEqual((await linkedCatalog.json()).dataset.map((entry) => new URL(entry['@id']).pathname),
-    ['/features/collections/registered-places', '/features/collections/places', privateCollection]);
+    ['/pygeoapi/features/collections/registered-places', '/pygeoapi/features/collections/places', privateCollection]);
   cli(['access', 'revoke', 'private-places', '--email', email]);
   assert.equal((await request(items, bearer(secret))).status, 403);
-  assert.equal((await request('/features/collections/registered-places/items?f=json', bearer(secret))).status, 200);
+  assert.equal((await request('/pygeoapi/features/collections/registered-places/items?f=json', bearer(secret))).status, 200);
   const beforePublic = (await tokens(cookie))[0].expiresAt;
   await setTimeout(20);
   assert.equal((await request(publicItems, bearer(secret))).status, 200);
@@ -199,7 +199,7 @@ test('password change and recovery invalidate all tokens and older web sessions'
   const email = 'token-recovery@example.test';
   const changed = 'next-password-17';
   const recovered = 'recovered-password-17';
-  const registered = '/features/collections/registered-places/items?f=json';
+  const registered = '/pygeoapi/features/collections/registered-places/items?f=json';
   await register(email, password);
   const current = await signIn(email, password);
   const other = await signIn(email, password);
@@ -236,7 +236,7 @@ test('publication request records correlate stable IDs without logging credentia
   const claims = 'caller-supplied-id';
   const admitted = await request(items, { headers: { Authorization: `Bearer ${secret}`, 'X-GIS-Request-Id': claims } });
   assert.equal(admitted.status, 200);
-  const rejected = await request('/features/collections/other-private?f=json', bearer(secret));
+  const rejected = await request('/pygeoapi/features/collections/other-private?f=json', bearer(secret));
   assert.equal(rejected.status, 403);
   const publicAccess = await request(publicItems, bearer(secret));
   assert.equal(publicAccess.status, 200);
@@ -274,10 +274,10 @@ test('anonymous visitors receive 401 for a private publication and cannot see it
   assert.equal(items.headers.get('cache-control'), 'no-store');
   assert.equal((await items.json()).code, 'Unauthorized');
 
-  const catalog = await fetch(`${gateway}/features/collections?f=json`);
+  const catalog = await fetch(`${gateway}/pygeoapi/features/collections?f=json`);
   assert.equal(catalog.status, 200);
   assert.deepEqual((await catalog.json()).collections.map(({ id }) => id), ['places']);
-  const openapi = await fetch(`${gateway}/features/openapi?f=json`);
+  const openapi = await fetch(`${gateway}/pygeoapi/features/openapi?f=json`);
   assert.equal(openapi.status, 200);
   assert.doesNotMatch(await openapi.text(), /private-places|other-private/);
 });
@@ -297,10 +297,10 @@ test('personal grants and revocations apply to the next request for exactly one 
   const guest = await landing();
   assert.match(guest, /\/account\/register/);
   assert.match(guest, /\/account\/login/);
-  assert.match(guest, /\/features\/collections\/places/);
+  assert.match(guest, /\/pygeoapi\/features\/collections\/places/);
   assert.doesNotMatch(guest, /registered-places|private-places|other-private/);
-  assert.match(await landing(options), /\/features\/collections\/registered-places/);
-  const other = '/features/collections/other-private/items/central?f=json';
+  assert.match(await landing(options), /\/pygeoapi\/features\/collections\/registered-places/);
+  const other = '/pygeoapi/features/collections/other-private/items/central?f=json';
   assert.equal((await request(items, options)).status, 403);
   const grant = cli(['access', 'grant', 'private-places', '--email', '-GRANTEE@EXAMPLE.TEST']);
   assert.ok(grant.userId);
@@ -323,11 +323,11 @@ test('personal grants and revocations apply to the next request for exactly one 
   const next = (await page.json()).links.find(({ rel }) => rel === 'next').href;
   assert.equal((await request(next, options)).status, 200);
 
-  const catalog = await request('/features/collections', { headers: { Cookie: cookie, Accept: 'application/ld+json' } });
+  const catalog = await request('/pygeoapi/features/collections', { headers: { Cookie: cookie, Accept: 'application/ld+json' } });
   assert.deepEqual((await catalog.json()).dataset.map((entry) => new URL(entry['@id']).pathname), [
-    '/features/collections/registered-places', '/features/collections/places', privateCollection,
+    '/pygeoapi/features/collections/registered-places', '/pygeoapi/features/collections/places', privateCollection,
   ]);
-  const api = await request('/features/openapi?f=json', options);
+  const api = await request('/pygeoapi/features/openapi?f=json', options);
   const openapi = await api.json();
   const operation = openapi.paths['/collections/private-places/items'].get;
   assert.deepEqual(operation.security, [{ session: [] }, { bearer: [] }]);
@@ -341,7 +341,7 @@ test('personal grants and revocations apply to the next request for exactly one 
   cli(['access', 'revoke', 'private-places', '--user-id', grant.userId], 'NO_CHANGE');
   assert.equal((await request(items, options)).status, 403);
   assert.equal((await request(next, options)).status, 403);
-  for (const path of ['/features/collections?f=html', '/features/openapi?f=yaml']) {
+  for (const path of ['/pygeoapi/features/collections?f=html', '/pygeoapi/features/openapi?f=yaml']) {
     const metadata = await request(path, options);
     assert.equal(metadata.status, 200);
     assert.doesNotMatch(await metadata.text(), /private-places|Closed places/);
@@ -362,10 +362,10 @@ test('a confirmed administrator can read all modes and an ordinary account lacks
   const allowed = await request(items, { headers: { Cookie: administrator } });
   assert.equal(allowed.status, 200);
   assert.equal((await allowed.json()).id, 'central');
-  const catalog = await request('/features/collections?f=json', { headers: { Cookie: administrator } });
+  const catalog = await request('/pygeoapi/features/collections?f=json', { headers: { Cookie: administrator } });
   assert.deepEqual((await catalog.json()).collections.map(({ id }) => id),
     ['registered-places', 'places', 'private-places', 'other-private']);
-  const api = await request('/features/openapi?f=json', { headers: { Cookie: administrator } });
+  const api = await request('/pygeoapi/features/openapi?f=json', { headers: { Cookie: administrator } });
   assert.ok((await api.json()).paths['/collections/other-private/items']);
   const head = await request(items, { method: 'HEAD', headers: { Cookie: administrator } });
   assert.equal(head.status, 200);
@@ -500,7 +500,7 @@ test('a grant survives access service recreation and dependency outages fail clo
     try {
       const deniedIds = [];
       for (const requestOptions of [options, undefined]) {
-        for (const path of [items, '/features/collections?f=json', '/features/openapi?f=json']) {
+        for (const path of [items, '/pygeoapi/features/collections?f=json', '/pygeoapi/features/openapi?f=json']) {
           const unavailable = await request(path, requestOptions);
           assert.equal(unavailable.status, 503, `${service}: ${path}`);
           assert.equal(unavailable.headers.get('cache-control'), 'no-store');
@@ -592,10 +592,10 @@ test('deleting and restoring a private publication drops its grants and keeps th
   for (const path of [items, privateCollection, `${privateCollection}/schema`, `${privateCollection}/queryables`]) {
     await freshGet(path, headers, 404);
   }
-  const catalog = await freshGet('/features/collections?f=json', headers, 200, true);
+  const catalog = await freshGet('/pygeoapi/features/collections?f=json', headers, 200, true);
   assert.ok(!catalog.collections.some(({ id }) => id === 'private-places'));
   assert.ok(catalog.collections.some(({ id }) => id === other));
-  const api = await freshGet('/features/openapi?f=json', headers, 200, true);
+  const api = await freshGet('/pygeoapi/features/openapi?f=json', headers, 200, true);
   assert.ok(!Object.keys(api.paths).some((path) => path.startsWith('/collections/private-places')));
   cli(['access', 'grant', 'private-places', '--email', email], 'NOT_FOUND', 3);
   await freshGet(publicItems, {}, 200);
@@ -626,7 +626,7 @@ test('a failed switch that would remove a publication keeps its data and grants'
   cli(['config', 'apply', removal.planId], 'APPLY_FAILED', 6);
   assert.equal(cli(['status']).currentVersion, currentVersion);
   await freshGet(items, headers, 200);
-  const catalog = await freshGet('/features/collections?f=json', headers, 200, true);
+  const catalog = await freshGet('/pygeoapi/features/collections?f=json', headers, 200, true);
   assert.ok(catalog.collections.some(({ id }) => id === 'private-places'));
   cli(['access', 'revoke', 'private-places', '--email', email]);
 });
@@ -683,7 +683,7 @@ test('a removed publication ID stays reserved for its source and protocol', asyn
   const publication = renamed.publications.find(({ publicationId }) => publicationId === 'places');
   assert.equal(publication.newUrl, publication.previousUrl);
   cli(['config', 'apply', renamed.planId]);
-  const collection = await freshGet('/features/collections/places?f=json', {}, 200, true);
+  const collection = await freshGet('/pygeoapi/features/collections/places?f=json', {}, 200, true);
   assert.equal(collection.id, 'places');
   assert.equal(collection.title, 'Renamed public places');
   cli(['config', 'apply', cli(['config', 'plan', '--rollback-to', currentVersion]).planId]);
@@ -702,7 +702,7 @@ test('all publications can be removed together with auth and restored without th
   assert.deepEqual(removeAll.removed, ['registered-places', 'places', 'private-places', 'other-private']);
   assert.equal(removeAll.newUrl, null);
   cli(['config', 'apply', removeAll.planId]);
-  assert.deepEqual((await freshGet('/features/collections?f=json', {}, 200, true)).collections, []);
+  assert.deepEqual((await freshGet('/pygeoapi/features/collections?f=json', {}, 200, true)).collections, []);
   await freshGet(publicItems, {}, 404);
   await freshGet(items, headers, 404);
 
@@ -762,7 +762,7 @@ test('an unavailable unchanged source does not block an access-only change or th
     assert.ok(plan.services.includes('access'));
     assert.ok(!plan.services.includes('pygeoapi'));
     cli(['config', 'apply', plan.planId]);
-    const api = await freshGet('/features/openapi?f=json', {}, 200, true);
+    const api = await freshGet('/pygeoapi/features/openapi?f=json', {}, 200, true);
     assert.ok(api.paths['/collections/places/items']);
     await freshGet(items, {}, 401);
   } finally {
@@ -776,12 +776,15 @@ test('moving a private publication between provider instances preserves its URL,
   const draft = parse(await readFile(filename, 'utf8'));
   const platform = join(dirname(filename), 'provider-transfer.yaml');
   const integration = join(dirname(filename), 'provider-transfer-integration.yaml');
-  await writeFile(platform, stringify(draft));
-  await writeFile(integration, stringify({
+  const features = {
     type: 'pygeoapi',
-    api: { protocol: 'features', scheme: 'http', port: 8082, base_path: '/', public_root: '/features',
+    api: { protocol: 'features', scheme: 'http', port: 8082, base_path: '/', public_root: '/pygeoapi/features',
       links: 'canonical', readiness: '/openapi?f=json' },
-  }));
+  };
+  const image = 'geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a';
+  draft.providers[draft.publications['private-places'].provider] = { ...features, image };
+  await writeFile(platform, stringify(draft));
+  await writeFile(integration, stringify(features));
   cli(['config', 'apply', cli(['config', 'plan', platform]).planId]);
   const email = 'provider-transfer@example.test';
   await register(email, password);
@@ -792,9 +795,7 @@ test('moving a private publication between provider instances preserves its URL,
   assert.equal((await freshGet(items, headers, 200, true)).id, 'central');
   const { currentVersion: original } = cli(['status']);
 
-  cli(['provider', 'add', 'dedicated',
-    'geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a',
-    integration, platform]);
+  cli(['provider', 'add', 'dedicated', image, integration, platform]);
   const updated = parse(await readFile(platform, 'utf8'));
   updated.publications['private-places'].provider = 'dedicated';
   await writeFile(platform, stringify(updated));
@@ -812,14 +813,14 @@ test('moving a private publication between provider instances preserves its URL,
   assert.equal((await freshGet(items, headers, 200, true)).id, 'central');
   for (const authorized of [false, true]) {
     const authHeaders = authorized ? headers : {};
-    const catalog = await freshGet('/features/collections?f=json', authHeaders, 200, true);
+    const catalog = await freshGet('/pygeoapi/features/collections?f=json', authHeaders, 200, true);
     assert.equal(catalog.collections.some(({ id }) => id === 'private-places'), authorized);
     assert.ok(catalog.collections.some(({ id }) => id === 'places'));
-    const api = await freshGet('/features/openapi?f=json', authHeaders, 200, true);
+    const api = await freshGet('/pygeoapi/features/openapi?f=json', authHeaders, 200, true);
     assert.equal(Boolean(api.paths['/collections/private-places/items']), authorized);
     assert.ok(api.paths['/collections/places/items']);
   }
-  await freshGet('/features/admin', headers, 404);
+  await freshGet('/pygeoapi/features/admin', headers, 404);
   cli(['provider', 'update', 'dedicated', platform,
     'docker.io/geopython/pygeoapi:0.24.0@sha256:a62895f2585ef1fcd1fc97ec35bf13177becc1334a622172a2c5c4d2145b8f0a']);
   assert.equal((await freshGet(items, headers, 200, true)).id, 'central');

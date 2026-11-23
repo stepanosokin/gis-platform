@@ -47,7 +47,14 @@ export interface ManagedProvider {
   volumes?: Record<string, string>;
 }
 
-export type Provider = { type: 'pygeoapi'; image?: undefined } | ManagedProvider;
+type BuiltInPygeoapiApi = Extract<ManagedProvider['api'], { protocols: Publication['protocol'][] }> & { public_prefix: string };
+
+const builtInPygeoapiApi: BuiltInPygeoapiApi = {
+  protocols: ['features', 'maps', 'tiles'], public_prefix: 'pygeoapi',
+  scheme: 'http', port: 80, base_path: '/', links: 'canonical', readiness: '/openapi?f=json',
+};
+
+export type Provider = { type: 'pygeoapi'; image?: undefined; api?: BuiltInPygeoapiApi } | ManagedProvider;
 
 export interface PostgisSource {
   type: 'postgis';
@@ -237,8 +244,8 @@ const adapterProtocols: Record<ManagedProvider['type'], Publication['protocol'][
 };
 
 export function providerProtocols(provider: Provider | undefined): Publication['protocol'][] {
-  if (!provider?.image) return ['features'];
-  return provider.api.protocols ?? [provider.api.protocol];
+  const api = provider?.api;
+  return api ? api.protocols ?? [api.protocol] : ['features'];
 }
 
 export function providerServiceName(config: FeaturesConfig, id: string) {
@@ -248,9 +255,15 @@ export function providerServiceName(config: FeaturesConfig, id: string) {
 }
 
 export function providerRoot(config: FeaturesConfig, id: string, protocol: Publication['protocol']) {
-  const provider = config.providers?.[id];
-  if (!provider?.image) return '/features';
-  return provider.api.public_root ?? `/${provider.api.public_prefix ?? id}/${protocol}`;
+  const api = config.providers?.[id]?.api;
+  if (!api) return '/features';
+  return api.public_root ?? `/${api.public_prefix ?? id}/${protocol}`;
+}
+
+export function builtInProviderRoot(config: FeaturesConfig) {
+  const id = builtInProviderId(config);
+  const provider = id && config.providers?.[id];
+  return provider && !provider.image && provider.api ? `/${provider.api.public_prefix}` : undefined;
 }
 
 export function providerBasePath(config: FeaturesConfig, id: string) {
@@ -271,7 +284,7 @@ export function providerRoutes(config: FeaturesConfig) {
       const root = providerRoot(config, id, protocol);
       const route = routes.get(root);
       if (route) route.ids.push(id);
-      else routes.set(root, { protocol, ids: [id], nested: Boolean(provider.image && provider.api.protocols) });
+      else routes.set(root, { protocol, ids: [id], nested: Boolean(provider.api?.protocols) });
     }
   }
   if (!routes.size) routes.set('/features', { protocol: 'features', ids: [], nested: false });
@@ -331,7 +344,8 @@ export function serializeFeaturesConfig(config: FeaturesConfig) {
       ...config.tileArchives,
       ...config.dggsSources,
     },
-    providers: config.providers ?? { [builtInProviderId(config)!]: { type: 'pygeoapi' } },
+    providers: Object.fromEntries(Object.entries(configuredProviders(config)).map(([id, provider]) =>
+      [id, provider.image ? provider : { type: 'pygeoapi' as const }])),
     publications: Object.fromEntries(publicationEntries(config)),
     auth: config.auth,
     cors: config.cors,
@@ -418,6 +432,8 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     throw new Error('Only one provider can use the built-in image. Configure an image and API for each additional instance.');
   }
   const roots = new Map<string, Publication['protocol']>();
+  const builtIn = providers.find(([, provider]) => !Object.hasOwn(provider, 'image'));
+  const builtInRoot = `/${builtInPygeoapiApi.public_prefix}`;
   const prefixes = new Set<string>();
   const reservedRoots = ['/account', '/api', '/internal'];
   const postgisReaders = new Map<string, Set<string>>();
@@ -436,7 +452,8 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       throw new Error(`pydggsapi provider '${id}' requires an image and API.`);
     }
     if (!provider.image && !Object.hasOwn(provider, 'image')) {
-      roots.set('/features', 'features');
+      // Only newly parsed YAML receives these defaults. Saved plans keep their layout for rollback.
+      provider.api = builtInPygeoapiApi;
       continue;
     }
     if (!provider.image || id.length > 54) throw new Error(`Invalid managed provider '${id}'.`);
@@ -448,6 +465,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     }
     if (protocols) {
       const path = `/${prefix}`;
+      if (builtIn && path === builtInRoot) {
+        throw new Error(`Provider '${id}' uses '${builtInRoot}', the public prefix of built-in pygeoapi.`);
+      }
       if (prefixes.has(path)) throw new Error(`Duplicate public prefix '${path}'.`);
       if ([...reservedRoots, '/features', '/maps', '/tiles', '/mvt', dggsRoot].includes(path)) {
         throw new Error(`Provider '${id}' uses a reserved public prefix '${path}'.`);
@@ -480,6 +500,9 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       provider.digest ??= pydggsapiDigest;
     }
     if (root) {
+      if (builtIn && (root === builtInRoot || root.startsWith(builtInRoot + '/'))) {
+        throw new Error(`Provider '${id}' uses '${root}', which overlaps built-in pygeoapi at '${builtInRoot}'.`);
+      }
       if (reservedRoots.some((reserved) => root === reserved || root.startsWith(reserved + '/'))) {
         throw new Error(`Provider '${id}' uses a reserved public root.`);
       }
@@ -620,14 +643,13 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
       auth.smtp.password_file = resolve(directory, auth.smtp.password_file);
     }
   }
-  const fileSources = postgisSources.length || vectorFiles.length || rasterFiles.length || tileArchives.length || dggsSources.length;
   // Confirmed plans without these names retain their previous Compose service keys.
   const servicePrefix = 'provider-';
   const serviceNames = providers.filter(([id, provider]) => provider.image && id.startsWith(servicePrefix) &&
     !config.providers[id.slice(servicePrefix.length)]?.image);
   return {
     port,
-    publicUrl: new URL('/features', publicAddress ?? gatewayAddress).href,
+    publicUrl: new URL(builtIn ? `${builtInRoot}/features` : '/features', publicAddress ?? gatewayAddress).href,
     ...(publicAddress && { publicOrigin: publicAddress.origin }),
     sourcePath: geojson ? resolve(directory, geojson[1].path) : '',
     ...(config.postgis_connections && { postgisConnections }),
@@ -636,10 +658,8 @@ export function parseFeaturesConfig(yaml: string, directory: string): FeaturesCo
     ...(rasterFiles.length && { rasterFiles: Object.fromEntries(rasterFiles) }),
     ...(tileArchives.length && { tileArchives: Object.fromEntries(tileArchives) }),
     ...(dggsSources.length && { dggsSources: Object.fromEntries(dggsSources) }),
-    ...(fileSources && geojson && { geojsonSourceId: geojson[0] }),
-    ...(fileSources || entries.some(([, pub]) => pub.crs) ||
-      providers.length !== 1 || providers.some(([, provider]) => provider.image)
-      ? { providers: config.providers } : {}),
+    ...(geojson && { geojsonSourceId: geojson[0] }),
+    providers: config.providers,
     ...(serviceNames.length && { providerServiceNames: Object.fromEntries(serviceNames.map(([id]) => [id, id])) }),
     ...(first ? { publicationId: first[0], publication: first[1],
       ...(others.length > 0 && { additionalPublications: Object.fromEntries(others) }) }

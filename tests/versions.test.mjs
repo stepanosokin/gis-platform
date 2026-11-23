@@ -26,7 +26,7 @@ async function cli(...args) {
 }
 
 async function collection() {
-  const response = await fetch(`${gateway}/features/collections/places?f=json`, { signal: AbortSignal.timeout(5000) });
+  const response = await fetch(`${gateway}/pygeoapi/features/collections/places?f=json`, { signal: AbortSignal.timeout(5000) });
   assert.equal(response.status, 200);
   return response.json();
 }
@@ -62,7 +62,7 @@ test('a confirmed draft updates the platform inventory and diagram through the o
     assert.equal(published.data.currentVersion, candidate.data.planId);
     const entry = published.data.publications.find(({ id }) => id === 'operator-places');
     assert.deepEqual([entry.title, entry.url, entry.protocol, entry.provider],
-      ['Operator & map <collection>', `${gateway}/features/collections/operator-places`, 'features', 'file-features']);
+      ['Operator & map <collection>', `${gateway}/pygeoapi/features/collections/operator-places`, 'features', 'file-features']);
 
     const providers = await cli('providers', 'list');
     assert.equal(providers.code, 'OK', providers.data.message);
@@ -109,7 +109,7 @@ test('a rollback plan restores the previous publication and OpenAPI', async () =
     assert.equal(rollback.data.baseVersion, plan.data.planId);
     assert.equal((await cli('config', 'apply', rollback.data.planId)).code, 'OK');
     assert.equal((await collection()).title, 'Example places');
-    const api = await fetch(`${gateway}/features/openapi?f=json`, { signal: AbortSignal.timeout(5000) });
+    const api = await fetch(`${gateway}/pygeoapi/features/openapi?f=json`, { signal: AbortSignal.timeout(5000) });
     assert.equal(api.status, 200);
     assert.ok((await api.json()).paths['/collections/places/items']);
   } finally {
@@ -158,7 +158,7 @@ test('a replacement of the source at the same path is included in the plan', asy
     assert.deepEqual(plan.changed, ['places']);
     assert.ok(plan.services.includes('pygeoapi'));
     assert.equal((await cli('config', 'apply', plan.planId)).code, 'OK');
-    const reply = await fetch(`${gateway}/features/collections/places/items/central?f=json`);
+    const reply = await fetch(`${gateway}/pygeoapi/features/collections/places/items/central?f=json`);
     assert.equal(reply.status, 200);
     assert.equal((await reply.json()).properties.name, 'Changed in place');
   } finally {
@@ -226,8 +226,8 @@ test('the gateway closes sibling routes during apply, and applying survives a di
     while (Date.now() < deadline && !observedClosed) {
       const state = await cli('status');
       if (state.data.phase === 'switch') {
-        assert.ok(state.data.closedRoutes.includes(`${gateway}/features/collections/places`));
-        const reply = await fetch(`${gateway}/features/collections/places/items?f=json`, {
+        assert.ok(state.data.closedRoutes.includes(`${gateway}/pygeoapi/features/collections/places`));
+        const reply = await fetch(`${gateway}/pygeoapi/features/collections/places/items?f=json`, {
           signal: AbortSignal.timeout(1000),
         }).catch(() => null);
         observedClosed = reply?.status === 503;
@@ -250,7 +250,7 @@ test('the gateway closes sibling routes during apply, and applying survives a di
     }
     assert.equal(replay.code, 'OK');
     assert.equal(replay.data.currentVersion, next.planId);
-    const response = await fetch(`${gateway}/features/collections/sibling/items?f=json`);
+    const response = await fetch(`${gateway}/pygeoapi/features/collections/sibling/items?f=json`);
     assert.equal(response.status, 200);
     await response.body?.cancel();
   } finally {
@@ -280,7 +280,7 @@ test('a startup failure restores the previous routes and saves exit code 6', asy
   await withOccupiedPort(async (yaml) => {
     const candidate = await planYaml(yaml);
     assert.equal(candidate.publications.find(({ publicationId }) => publicationId === 'places').previousUrl,
-      `${gateway}/features/collections/places`);
+      `${gateway}/pygeoapi/features/collections/places`);
     const failed = await cli('config', 'apply', candidate.planId);
     assert.equal(failed.code, 'APPLY_FAILED');
     assert.equal(failed.exitCode, 6);
@@ -303,7 +303,7 @@ test('an incomplete recovery reports the last confirmed version and keeps routes
   const certificatePath = join(process.env.GIS_STATE_DIR, 'tls', https.planId, 'cert.pem');
   const certificateBackup = `${certificatePath}.test-backup`;
   const status = () => new Promise((resolve) => {
-    const req = get(`https://localhost:${port}/features/collections/places?f=json`, {
+    const req = get(`https://localhost:${port}/pygeoapi/features/collections/places?f=json`, {
       ca: certificate, signal: AbortSignal.timeout(2000),
     }, (res) => { res.resume(); resolve(res.statusCode); });
     req.on('error', () => resolve(undefined));
@@ -338,7 +338,7 @@ test('an incomplete recovery reports the last confirmed version and keeps routes
       const reported = await cli('status');
       assert.equal(reported.exitCode, 7);
       assert.equal(reported.data.currentVersion, https.planId);
-      assert.ok(reported.data.closedRoutes.includes(`https://localhost:${port}/features/collections/places`));
+      assert.ok(reported.data.closedRoutes.includes(`https://localhost:${port}/pygeoapi/features/collections/places`));
       assert.ok([undefined, 503].includes(await status()));
       assert.equal((await cli('config', 'apply', candidate.planId)).code, 'RECOVERY_INCOMPLETE');
     });
