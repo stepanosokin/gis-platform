@@ -16,8 +16,8 @@ def validate_snapshot(database, source, level):
     types = {name: dtype for name, dtype, *_ in columns}
     if set(types) != {identifier, *indicators} or types[identifier] != "VARCHAR":
         raise ValueError("expected a string H3 ID and the declared indicator columns")
-    if any(types[name] not in {"BIGINT", "DOUBLE"} for name in indicators):
-        raise ValueError("indicator columns must use BIGINT or DOUBLE to preserve their precision")
+    if any(types[name] not in {"TINYINT", "BIGINT", "DOUBLE"} for name in indicators):
+        raise ValueError("indicator columns must use TINYINT, BIGINT, or DOUBLE to preserve their precision")
     # The stock Parquet provider reads an unquoted projection.
     projection = [identifier, *indicators]
     result = database.execute(

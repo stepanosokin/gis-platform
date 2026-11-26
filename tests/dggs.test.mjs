@@ -297,7 +297,7 @@ test('pydggsapi serves H3 snapshots through the configured gateway', async (t) =
     platform.sources.sparse.path = 'sparse-duplicate.parquet';
     await rejectCandidate(/Invalid DGGS snapshot 'sparse'/);
     platform.sources.sparse.path = 'sparse-int32.parquet';
-    await rejectCandidate(/BIGINT or DOUBLE indicators/);
+    await rejectCandidate(/indicator types \(TINYINT, BIGINT, or DOUBLE\)/);
     platform.sources.sparse.path = 'sparse-reserved-column.parquet';
     platform.sources.sparse.properties = ['select', 'metric'];
     await rejectCandidate(/Invalid DGGS snapshot 'sparse'/);

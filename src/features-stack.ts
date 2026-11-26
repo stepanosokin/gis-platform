@@ -1122,7 +1122,7 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
           const failure = error instanceof Error && 'stderr' in error && typeof error.stderr === 'string'
             ? /^GIS_INVALID_DGGS_SNAPSHOT ([a-z][a-z0-9-]*)\r?$/m.exec(error.stderr) : null;
           throw new FeaturesPreflightError(failure
-            ? `Invalid DGGS snapshot '${failure[1]}'. Check the H3 IDs, resolution, column names and BIGINT or DOUBLE indicators.`
+            ? `Invalid DGGS snapshot '${failure[1]}'. Check the H3 IDs, resolution, column names and indicator types (TINYINT, BIGINT, or DOUBLE).`
             : `pydggsapi provider '${id}' failed to initialize. Check the pinned image and its DuckDB extension.`);
         });
       api = dggsOpenApi(output, root, url, publications);
