@@ -5,6 +5,10 @@ export const dggsRelation = '[ogc-rel:dggrs-list]';
 export const dggsDataRoute = '/dggs/h3/zones';
 export const dggsFiles = '/etc/pydggsapi/gis';
 
+const depthOrRange = '[0-9]{1,2}(-[0-9]{1,2})?';
+export const dggsDepthPattern = `^${depthOrRange}(,${depthOrRange})*$`;
+export const dggsDepthQueryPattern = `^(zone-depth=${depthOrRange}((,|%2[cC])${depthOrRange})*)?$`;
+
 const coordinate = '([+-]|%2[bB])?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE]([+-]|%2[bB])?[0-9]+)?';
 export const dggsZoneParameters = [
   { name: 'bbox', pattern: `${coordinate}((,|%2[cC])${coordinate}){3}`, required: true,

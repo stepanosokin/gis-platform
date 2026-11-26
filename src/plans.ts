@@ -37,7 +37,7 @@ const stateDirectory = resolve(process.env.GIS_STATE_DIR ??
 const legacyActiveFile = join(stateDirectory, 'active.json');
 const activeFile = join(stateDirectory, 'status', 'active.json');
 const planDirectory = (planId: string) => join(stateDirectory, 'plans', planId);
-const gatewayRevision = 1;
+const gatewayRevision = 2;
 
 function missing(error: unknown) {
   return error instanceof Error && 'code' in error && error.code === 'ENOENT';

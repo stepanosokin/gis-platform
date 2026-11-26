@@ -214,7 +214,9 @@ test('pydggsapi serves H3 snapshots through the configured gateway', async (t) =
         assert.deepEqual(params.geometry.schema.enum, ['zone-region']);
         assert.deepEqual(params.f.schema.enum, ['geojson']);
         const depth = api.paths[base + '/{zoneId}/data'].get.parameters.find(({ name }) => name === 'zone-depth');
-        assert.deepEqual(depth.schema.enum, [0]);
+        assert.deepEqual(depth.schema, {
+          type: 'string', pattern: '^[0-9]{1,2}(-[0-9]{1,2})?(,[0-9]{1,2}(-[0-9]{1,2})?)*$', default: '0',
+        });
       }
     };
     const expectAccess = async (id, status, headers) => {

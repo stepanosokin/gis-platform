@@ -18,7 +18,7 @@ import { checkTileJson, martinConfig, martinService, runMartin, tileArchivePath 
 import { matrixSet, tilesRoutes, tilesRelation, tilesSource, vectorTileType } from './tiles-profile.js';
 import { mapLibreAssetRoute } from './maplibre-style.js';
 import { featuresConformance, protocolConformance } from './protocol-conformance.js';
-import { dggsConfig, dggsDataRoute, dggsFiles, dggsRelation, dggsRoutes, dggsService,
+import { dggsConfig, dggsDataRoute, dggsDepthPattern, dggsDepthQueryPattern, dggsFiles, dggsRelation, dggsRoutes, dggsService,
   dggsSnapshotPath, dggsZoneParameters, runDggs } from './dggs-profile.js';
 import { healthUrl, publicationChecks, publicationHealth } from './publication-health.js';
 import { GatewayTlsError, gatewayTlsFiles, gatewayTlsProbe, inspectGatewayTls } from './gateway-tls.js';
@@ -621,7 +621,7 @@ const dggsRequest = (root: string) => `
 			}
 			@dggsZoneDataInvalid {
 				path_regexp ^${root}/collections/[^/]+${dggsDataRoute}/[^/]+/data$
-				expression \`!{http.request.uri.query}.matches('^(zone-depth=0)?$')\`
+				expression \`!${rawQuery}.matches('${dggsDepthQueryPattern}')\`
 			}
 			respond @dggsZoneListInvalid 400
 			respond @dggsZoneDataInvalid 400
@@ -1152,6 +1152,20 @@ async function prepareManagedFeatures(config: FeaturesConfig, directory: string,
       });
       api = checkOpenApi(output, url, publications);
     }
+    if (instance?.type === 'pydggsapi') {
+      // A reused provider's stored OpenAPI may describe the previous gateway.
+      for (const [publicationId] of publications) {
+        const data = api.paths?.[`/collections/${publicationId}${dggsDataRoute}/{zoneId}/data`]?.get;
+        if (!data) throw new FeaturesPreflightError(`pydggsapi is missing the data operation for '${publicationId}'.`);
+        data.parameters = (data.parameters ?? []).filter(({ name, in: location }) =>
+          name !== 'zone-depth' || location !== 'query');
+        data.parameters.push({
+          name: 'zone-depth', in: 'query',
+          description: 'Relative zone depths as a single depth, a range, or a comma-separated list of depths or ranges.',
+          schema: { type: 'string', pattern: dggsDepthPattern, default: '0' },
+        });
+      }
+    }
     await writeFile(join(native, 'openapi.json'), JSON.stringify(api));
     if (protocols.includes('tiles')) {
       api.paths!['/TileMatrixSets'] = { get: {
@@ -1543,9 +1557,7 @@ function dggsOpenApi(body: string, root: string, publicUrl: string, publications
         tags: [id],
         parameters: [
           ...(operation.parameters ?? []).filter(({ in: location, name }) => location === 'path' && name === 'zoneId'),
-          ...(suffix === dggsDataRoute ? queryParameters : suffix.endsWith('/data') ? [{
-            name: 'zone-depth', in: 'query', schema: { type: 'integer', enum: [0], default: 0 },
-          }] : []),
+          ...(suffix === dggsDataRoute ? queryParameters : []),
         ],
       } };
     }
